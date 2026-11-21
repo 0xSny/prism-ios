@@ -1,0 +1,81 @@
+[
+  {
+    "trigger": {
+      "url-filter": ".*",
+      "if-domain": [
+        "*doubleclick.net",
+        "*googlesyndication.com",
+        "*googleadservices.com",
+        "*google-analytics.com",
+        "*googletagmanager.com",
+        "*adservice.google.com",
+        "*pos.baidu.com",
+        "*cpro.baidu.com",
+        "*hm.baidu.com",
+        "*dup.baidustatic.com",
+        "*cbjs.baidu.com",
+        "*eclick.baidu.com",
+        "*tanx.com",
+        "*mmstat.com",
+        "*alimama.com",
+        "*cnzz.com",
+        "*51.la",
+        "*umeng.com",
+        "*gdt.qq.com",
+        "*l.qq.com",
+        "*beacon.qq.com",
+        "*tdid.m.qq.com",
+        "*pangolin-sdk-toutiao.com",
+        "*ad.toutiao.com",
+        "*ads.tiktok.com",
+        "*openinstall.io",
+        "*adnxs.com",
+        "*criteo.com",
+        "*outbrain.com",
+        "*taboola.com",
+        "*pubmatic.com",
+        "*rubiconproject.com",
+        "*openx.net",
+        "*scorecardresearch.com",
+        "*quantserve.com",
+        "*hotjar.com",
+        "*mixpanel.com",
+        "*branch.io",
+        "*appsflyer.com",
+        "*adjust.com",
+        "*amplitude.com",
+        "*sentry-cdn.com"
+      ]
+    },
+    "action": { "type": "block" }
+  },
+  {
+    "trigger": {
+      "url-filter": "^https?://([^/]+\\.)?youtube\\.com/api/stats/ads"
+    },
+    "action": { "type": "block" }
+  },
+  {
+    "trigger": {
+      "url-filter": "^https?://([^/]+\\.)?youtube\\.com/pagead/"
+    },
+    "action": { "type": "block" }
+  },
+  {
+    "trigger": {
+      "url-filter": ".*",
+      "if-domain": ["*youtube.com", "*m.youtube.com"]
+    },
+    "action": {
+      "type": "css-display-none",
+      "selector": "ytd-ad-slot-renderer, ytd-banner-promo-renderer, .ytd-in-feed-ad-layout-renderer, #player-ads, ytm-promoted-sparkles-web-renderer"
+    }
+  },
+  {
+    "trigger": { "url-filter": ".*" },
+    "action": {
+      "type": "css-display-none",
+      "selector": ".adsbygoogle, ins.adsbygoogle, [id^='div-gpt-ad'], .ad-banner, .ad-slot, .open-in-app-banner, .smartbanner, #smart-app-banner"
+    }
+  }
+]
