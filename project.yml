@@ -19,7 +19,6 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: Sources
-    resources:
       - path: Resources/Assets.xcassets
       - path: Resources/easylist_adguard_cn.json
     settings:

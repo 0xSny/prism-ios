@@ -50,6 +50,7 @@ jobs:
           ls -lh "$APP_DIR"
           test -f "$APP_DIR/Assets.car" || { echo "Missing Assets.car"; exit 1; }
           test -f "$APP_DIR/AppIcon60x60@2x.png" || { echo "Missing AppIcon60x60@2x.png"; exit 1; }
+          test -f "$APP_DIR/easylist_adguard_cn.json" || { echo "Missing easylist_adguard_cn.json"; exit 1; }
 
       - name: Package IPA & Generate Self-Sign repo.json
         run: |
