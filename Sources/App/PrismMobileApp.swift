@@ -133,6 +133,7 @@ final class PrismSceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     func sceneDidBecomeActive(_ scene: UIScene) {
         let state = PrismAppStateContainer.shared
+        state.tabManager.syncAppearanceOnForegroundResume(window: window)
         state.handoffService.handleForegroundResume(syncEngine: state.syncEngine)
         state.tabManager.checkClipboardForURL()
     }

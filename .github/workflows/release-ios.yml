@@ -13,8 +13,8 @@ jobs:
   build-ios:
     runs-on: macos-15
     env:
-      APP_VERSION: "1.0.1"
-      BUILD_NUMBER: "1001"
+      APP_VERSION: "1.0.4"
+      BUILD_NUMBER: "1004"
       BUNDLE_ID: "com.zzaoo.prism.mobile"
     steps:
       - name: Checkout repository
@@ -107,13 +107,13 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.1
-          name: Prism v1.0.1 (Unsigned IPA)
+          tag_name: v${{ env.APP_VERSION }}
+          name: Prism v${{ env.APP_VERSION }} (Unsigned IPA)
           body: |
-            Prism v1.0.1 无签名原生 `.ipa` 与 AltStore / ESign / OmniSign / Feather 软件源。
-            - 修复切换 iOS 深浅色时顶部状态栏 250ms 滞后与上下背景色差，实装 Safari 级同帧吸色引擎与智能网页深色模式。
+            Prism v${{ env.APP_VERSION }} 无签名原生 `.ipa` 与 AltStore / ESign / OmniSign / Feather 软件源。
+            - 修复滑回桌面再打开偶发触发网页深色模式的问题，精简底部视频栏仅留桌面续播（画中画与倍速移入更多菜单），并全面加入丝滑弹簧交互动效。
             - 无受限权限（No restricted entitlements），完整实心 AppIcon，个人证书 / 自签工具直接安装。
             - 官方自签源 URL：`https://prism.zzaoo.com/ios/repo.json`
           files: |
-            dist/Prism-1.0.1.ipa
+            dist/Prism-${{ env.APP_VERSION }}.ipa
             dist/repo.json

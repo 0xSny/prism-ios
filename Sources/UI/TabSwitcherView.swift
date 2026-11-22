@@ -20,11 +20,15 @@ struct TabSwitcherView: View {
                             profile: syncEngine.profiles.first(where: { $0.id == tab.profileId }) ?? .defaultProfile,
                             isActive: tab.id == tabManager.activeTabId,
                             onSelect: {
-                                tabManager.activeTabId = tab.id
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                                    tabManager.activeTabId = tab.id
+                                }
                                 dismiss()
                             },
                             onClose: {
-                                tabManager.closeTab(tab.id)
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                                    tabManager.closeTab(tab.id)
+                                }
                             }
                         )
                     }

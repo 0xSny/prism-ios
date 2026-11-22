@@ -402,6 +402,10 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         webView: WKWebView?,
         trait: UITraitCollection
     ) {
+        guard UIApplication.shared.applicationState != .background else { return }
+        if let ws = webView?.window?.windowScene, ws.activationState == .background {
+            return
+        }
         systemIsDark = isDarkNow
         guard let webView else { return }
         if let tab = tabs.first(where: { $0.webView === webView }) {
@@ -424,6 +428,36 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             "window.__prismOnTraitChanged && window.__prismOnTraitChanged();",
             completionHandler: nil
         )
+    }
+
+    func syncAppearanceOnForegroundResume(window: UIWindow?) {
+        let effectiveTrait = window?.traitCollection ?? UITraitCollection.current
+        let actualDark = effectiveTrait.userInterfaceStyle == .dark
+        let changed = (systemIsDark != actualDark)
+        systemIsDark = actualDark
+
+        let whitelistJSON: String = {
+            guard let data = try? JSONEncoder().encode(Array(webDarkModeWhitelistHosts).sorted()),
+                  let str = String(data: data, encoding: .utf8) else {
+                return "[]"
+            }
+            return str
+        }()
+        let followStr = webDarkModeFollowTheme ? "true" : "false"
+
+        for tab in tabs {
+            if changed {
+                tab.topBackdropColor = nil
+            }
+            guard let webView = tab.webView else { continue }
+            let targetURL = webView.url ?? URL(string: tab.urlString)
+            applyWebDarkAppearance(to: webView, url: targetURL, trait: effectiveTrait)
+            let enabled = effectiveWebDarkEnabled(for: targetURL)
+            webView.evaluateJavaScript(
+                "window.__prismSyncConfig && window.__prismSyncConfig(\"\(appTheme.rawValue)\", \(followStr), \(whitelistJSON)); window.__prismSetWebDark && window.__prismSetWebDark(\(enabled ? "true" : "false")); window.__prismOnTraitChanged && window.__prismOnTraitChanged();",
+                completionHandler: nil
+            )
+        }
     }
 
     func applyWebDarkModeToAllTabs() {

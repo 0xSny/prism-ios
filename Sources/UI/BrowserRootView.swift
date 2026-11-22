@@ -43,7 +43,9 @@ struct BrowserRootView: View {
                                     .frame(width: 44)
                                     .contentShape(Rectangle())
                                     .onLongPressGesture(minimumDuration: 0.35, pressing: { pressing in
-                                        isSpeed2x = pressing
+                                        withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                                            isSpeed2x = pressing
+                                        }
                                         let rate = pressing ? 2.0 : 1.0
                                         tab.webView?.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('rate', \(rate));", completionHandler: nil)
                                     }, perform: {})
@@ -74,7 +76,7 @@ struct BrowserRootView: View {
                         .padding(.top, 16)
                         Spacer()
                     }
-                    .transition(.opacity)
+                    .transition(.scale(scale: 0.88).combined(with: .opacity))
                 }
 
                 // Horizontal scrub feedback pill
@@ -86,6 +88,7 @@ struct BrowserRootView: View {
                         .padding(.vertical, 8)
                         .background(.black.opacity(0.75), in: Capsule())
                         .frame(maxHeight: .infinity)
+                        .transition(.scale(scale: 0.88).combined(with: .opacity))
                 }
             }
 
@@ -143,11 +146,12 @@ struct BrowserRootView: View {
                     }
                 }
 
-                // Video Quick Control Strip when video detected on page
+                // Video Quick Control Strip (Desktop Handoff only; PiP & Speed moved into More menu)
                 if let tab = currentTab, tab.hasVideo && !tab.isNewTab {
                     VideoMiniStrip(tab: tab, handoffService: handoffService, syncEngine: syncEngine, tabManager: tabManager) {
-                        activeSheet = .sniffer
+                        activeSheet = .account
                     }
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
                 // Single-Hand 52pt Bottom Thumb Dock
@@ -164,18 +168,26 @@ struct BrowserRootView: View {
                     onHorizontalScrub: { deltaX, ended in
                         if tabManager.activeTab?.hasVideo == true && !(tabManager.activeTab?.isNewTab ?? true) {
                             if !ended {
-                                isScrubbingVideo = true
+                                withAnimation(.spring(response: 0.22, dampingFraction: 0.85)) {
+                                    isScrubbingVideo = true
+                                }
                                 scrubOffsetSec = Double(deltaX / 8.0)
                             } else {
-                                isScrubbingVideo = false
+                                withAnimation(.easeOut(duration: 0.18)) {
+                                    isScrubbingVideo = false
+                                }
                                 let sec = scrubOffsetSec
                                 tabManager.activeTab?.webView?.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('seekBy', \(sec));", completionHandler: nil)
                             }
                         } else if ended {
                             if deltaX < -55 {
-                                tabManager.switchTab(byOffset: 1)
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) {
+                                    tabManager.switchTab(byOffset: 1)
+                                }
                             } else if deltaX > 55 {
-                                tabManager.switchTab(byOffset: -1)
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) {
+                                    tabManager.switchTab(byOffset: -1)
+                                }
                             }
                         }
                     },
@@ -186,6 +198,11 @@ struct BrowserRootView: View {
             }
             .padding(.horizontal, 12)
             .padding(.bottom, 8)
+            .animation(.spring(response: 0.32, dampingFraction: 0.84), value: currentTab?.hasVideo)
+            .animation(.spring(response: 0.32, dampingFraction: 0.84), value: handoffService.latestIncoming != nil)
+            .animation(.spring(response: 0.32, dampingFraction: 0.84), value: tabManager.activeToast?.id)
+            .animation(.spring(response: 0.32, dampingFraction: 0.84), value: currentTab?.showAutofillBar)
+            .animation(.spring(response: 0.32, dampingFraction: 0.84), value: currentTab?.pendingPasswordSave != nil)
 
             // Top Capsule Toast Overlay for Instant Handoff & Clipboard Sync
             VStack {
@@ -476,6 +493,8 @@ final class PrismWebContainerView: UIView, PrismTopColorHost {
 
     override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
         super.traitCollectionDidChange(previousTraitCollection)
+        guard UIApplication.shared.applicationState != .background else { return }
+        if let ws = window?.windowScene, ws.activationState == .background { return }
         guard traitCollection.hasDifferentColorAppearance(comparedTo: previousTraitCollection) else { return }
         tabManager?.handleNativeTraitAppearanceChange(
             isDarkNow: traitCollection.userInterfaceStyle == .dark,
@@ -614,54 +633,51 @@ private struct OmniboxEditorSheet: View {
     }
 }
 
+private struct PrismTactileButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.94 : 1.0)
+            .opacity(configuration.isPressed ? 0.82 : 1.0)
+            .animation(.spring(response: 0.22, dampingFraction: 0.72), value: configuration.isPressed)
+    }
+}
+
 private struct VideoMiniStrip: View {
     @ObservedObject var tab: BrowserTab
     @ObservedObject var handoffService: HandoffService
     @ObservedObject var syncEngine: SyncEngine
     @ObservedObject var tabManager: TabManager
-    let onOpenSniffer: () -> Void
+    let onRequireAccount: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Button {
-                tab.webView?.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('pip');", completionHandler: nil)
-            } label: {
-                Label(L10n.t("画中画", "PiP"), systemImage: "pip.enter")
+        Button {
+            guard syncEngine.loggedIn else {
+                tabManager.showToast(L10n.t("请先登录 Prism Account 使用桌面续播", "Sign in to Prism Account to continue on desktop"))
+                onRequireAccount()
+                return
             }
-
-            Menu {
-                ForEach([1.0, 1.25, 1.5, 2.0, 3.0], id: \.self) { rate in
-                    Button("\(String(format: "%.2gx", rate))") {
-                        tab.playbackRate = rate
-                        tab.webView?.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('rate', \(rate));", completionHandler: nil)
-                    }
-                }
-            } label: {
-                Text("\(String(format: "%.2gx", tab.playbackRate))")
+            Task {
+                let ok = await handoffService.push(
+                    kind: "video",
+                    title: tab.title,
+                    url: tab.urlString,
+                    videoSeconds: tab.videoSeconds,
+                    syncEngine: syncEngine
+                )
+                tabManager.showToast(ok ? L10n.t("已带进度接力至桌面端", "Sent video to desktop") : L10n.t("发送失败", "Failed"))
             }
-
-            if !tab.sniffedMedia.isEmpty {
-                Button(action: onOpenSniffer) {
-                    Label(L10n.t("保存(\(tab.sniffedMedia.count))", "Save(\(tab.sniffedMedia.count))"), systemImage: "arrow.down.circle.fill")
-                }
-            }
-
-            if syncEngine.loggedIn {
-                Button {
-                    Task {
-                        let ok = await handoffService.push(kind: "video", title: tab.title, url: tab.urlString, videoSeconds: tab.videoSeconds, syncEngine: syncEngine)
-                        tabManager.showToast(ok ? L10n.t("已带进度接力至桌面端", "Sent video to desktop") : L10n.t("发送失败", "Failed"))
-                    }
-                } label: {
-                    Label(L10n.t("桌面续播", "Desktop"), systemImage: "laptopcomputer")
-                }
-            }
+        } label: {
+            Label(L10n.t("桌面续播", "Continue on Desktop"), systemImage: "laptopcomputer")
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(.ultraThinMaterial, in: Capsule())
+                .overlay(
+                    Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                )
+                .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
         }
-        .font(.caption.weight(.semibold))
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(.ultraThinMaterial, in: Capsule())
-        .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+        .buttonStyle(PrismTactileButtonStyle())
     }
 }
 

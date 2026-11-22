@@ -74,6 +74,31 @@ struct MenuSheetView: View {
                     }
                 }
 
+                if let tab = tabManager.activeTab, tab.hasVideo && !tab.isNewTab {
+                    Section(L10n.t("视频控制", "Video Controls")) {
+                        Button {
+                            tab.webView?.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('pip');", completionHandler: nil)
+                            dismiss()
+                        } label: {
+                            Label(L10n.t("开启 / 退出画中画", "Toggle Picture-in-Picture"), systemImage: "pip.enter")
+                        }
+
+                        Picker(selection: Binding(
+                            get: { tab.playbackRate },
+                            set: { rate in
+                                tab.playbackRate = rate
+                                tab.webView?.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('rate', \(rate));", completionHandler: nil)
+                            }
+                        )) {
+                            ForEach([1.0, 1.25, 1.5, 2.0, 3.0], id: \.self) { rate in
+                                Text("\(String(format: "%.2gx", rate))").tag(rate)
+                            }
+                        } label: {
+                            Label(L10n.t("播放倍速", "Playback Speed"), systemImage: "gauge.with.dots.needle.67percent")
+                        }
+                    }
+                }
+
                 if syncEngine.loggedIn, let tab = tabManager.activeTab, !tab.isNewTab {
                     Section {
                         Button {
@@ -174,7 +199,7 @@ struct MenuSheetView: View {
                     }
                 }
             }
-            .navigationTitle("Prism v1.0.1")
+            .navigationTitle("Prism v1.0.4")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -206,7 +231,16 @@ private struct QuickMenuTile: View {
             }
             .frame(maxWidth: .infinity)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(MenuTilePressStyle())
+    }
+}
+
+private struct MenuTilePressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.93 : 1.0)
+            .opacity(configuration.isPressed ? 0.8 : 1.0)
+            .animation(.spring(response: 0.2, dampingFraction: 0.72), value: configuration.isPressed)
     }
 }
 

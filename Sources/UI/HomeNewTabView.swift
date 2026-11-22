@@ -463,11 +463,14 @@ private struct HomeTraitStatusBarSyncView: UIViewRepresentable {
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
+            guard UIApplication.shared.applicationState != .background else { return }
             syncAppearance()
         }
 
         override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
             super.traitCollectionDidChange(previousTraitCollection)
+            guard UIApplication.shared.applicationState != .background else { return }
+            if let ws = window?.windowScene, ws.activationState == .background { return }
             guard traitCollection.hasDifferentColorAppearance(comparedTo: previousTraitCollection) else { return }
             syncAppearance()
         }
