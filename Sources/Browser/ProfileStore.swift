@@ -60,7 +60,7 @@ final class ProfileDataStoreRegistry {
         let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(parts[0]), port: port)
         let config = isSocks
             ? ProxyConfiguration(socksv5Proxy: endpoint)
-            : ProxyConfiguration(httpConnectProxy: endpoint)
+            : ProxyConfiguration(httpCONNECTProxy: endpoint)
         store.proxyConfigurations = [config]
     }
 
