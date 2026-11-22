@@ -18,8 +18,14 @@ struct HomeNewTabView: View {
 
     var body: some View {
         let isDark = colorScheme == .dark
-        let bg = isDark ? Color(hex: "#202124")! : Color.white
         let loc = syncEngine.homeConfig.weatherLocation ?? WeatherLocationConfig()
+        let resolvedBg: Color = {
+            switch tabManager.appTheme {
+            case .dark: return Color(uiColor: TabManager.standardDarkBackdropColor)
+            case .light: return Color(uiColor: TabManager.standardLightBackdropColor)
+            case .system: return Color(uiColor: TabManager.dynamicSystemBackdropColor)
+            }
+        }()
 
         ScrollView {
             VStack(spacing: 24) {
@@ -172,7 +178,14 @@ struct HomeNewTabView: View {
         .task(id: weatherReloadToken) {
             await loadWeather(forceRefresh: false)
         }
-        .background(bg.ignoresSafeArea())
+        .background(
+            ZStack {
+                resolvedBg
+                HomeTraitStatusBarSyncView(appTheme: tabManager.appTheme)
+            }
+            .ignoresSafeArea()
+        )
+        .transaction { $0.animation = nil }
         .sheet(isPresented: $showWeatherPicker) {
             WeatherCityPickerSheet(
                 currentLocation: syncEngine.homeConfig.weatherLocation ?? WeatherLocationConfig(),
@@ -419,5 +432,63 @@ struct ShortcutFavicon: View {
         Text(String(title.prefix(1)).uppercased())
             .font(.system(size: 16, weight: .bold))
             .foregroundStyle(Color(hex: colorHex ?? "#4285F4") ?? .blue)
+    }
+}
+
+private struct HomeTraitStatusBarSyncView: UIViewRepresentable {
+    let appTheme: AppTheme
+
+    func makeUIView(context: Context) -> HomeTraitBackdropUIView {
+        let v = HomeTraitBackdropUIView()
+        v.appTheme = appTheme
+        return v
+    }
+
+    func updateUIView(_ uiView: HomeTraitBackdropUIView, context: Context) {
+        uiView.appTheme = appTheme
+        uiView.syncAppearance()
+    }
+
+    final class HomeTraitBackdropUIView: UIView {
+        var appTheme: AppTheme = .system
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            isUserInteractionEnabled = false
+        }
+
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            syncAppearance()
+        }
+
+        override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+            super.traitCollectionDidChange(previousTraitCollection)
+            guard traitCollection.hasDifferentColorAppearance(comparedTo: previousTraitCollection) else { return }
+            syncAppearance()
+        }
+
+        @MainActor
+        func syncAppearance() {
+            let color: UIColor = {
+                switch appTheme {
+                case .dark: return TabManager.standardDarkBackdropColor
+                case .light: return TabManager.standardLightBackdropColor
+                case .system:
+                    return traitCollection.userInterfaceStyle == .dark
+                        ? TabManager.standardDarkBackdropColor
+                        : TabManager.standardLightBackdropColor
+                }
+            }()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            backgroundColor = color
+            CATransaction.commit()
+            StatusBarStyleManager.shared.applyStyle(for: color, fallbackTrait: traitCollection)
+        }
     }
 }

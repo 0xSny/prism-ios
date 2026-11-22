@@ -13,8 +13,8 @@ jobs:
   build-ios:
     runs-on: macos-15
     env:
-      APP_VERSION: "1.0.0"
-      BUILD_NUMBER: "1000"
+      APP_VERSION: "1.0.1"
+      BUILD_NUMBER: "1001"
       BUNDLE_ID: "com.zzaoo.prism.mobile"
     steps:
       - name: Checkout repository
@@ -107,13 +107,13 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0
-          name: Prism v1.0.0 (Unsigned IPA)
+          tag_name: v1.0.1
+          name: Prism v1.0.1 (Unsigned IPA)
           body: |
-            Prism v1.0.0 无签名原生 `.ipa` 与 AltStore / ESign / OmniSign / Feather 软件源。
-            - 微信输入法默认中文键盘修复、5,000+ 去广告规则、双向 3 秒极速接力。
+            Prism v1.0.1 无签名原生 `.ipa` 与 AltStore / ESign / OmniSign / Feather 软件源。
+            - 修复切换 iOS 深浅色时顶部状态栏 250ms 滞后与上下背景色差，实装 Safari 级同帧吸色引擎与智能网页深色模式。
             - 无受限权限（No restricted entitlements），完整实心 AppIcon，个人证书 / 自签工具直接安装。
             - 官方自签源 URL：`https://prism.zzaoo.com/ios/repo.json`
           files: |
-            dist/Prism-1.0.0.ipa
+            dist/Prism-1.0.1.ipa
             dist/repo.json

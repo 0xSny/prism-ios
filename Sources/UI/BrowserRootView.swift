@@ -6,7 +6,6 @@ struct BrowserRootView: View {
     @ObservedObject var syncEngine: SyncEngine
     @ObservedObject var tabManager: TabManager
     @ObservedObject var handoffService: HandoffService
-    @Environment(\.colorScheme) private var colorScheme
 
     @State private var showOmniboxEditor = false
     @State private var omniboxInput = ""
@@ -27,7 +26,32 @@ struct BrowserRootView: View {
     var body: some View {
         let currentTab = tabManager.activeTab
         ZStack(alignment: .bottom) {
-            VStack(spacing: 0) {
+            ZStack(alignment: .top) {
+                if let tab = currentTab {
+                    if tab.isNewTab {
+                        HomeNewTabView(syncEngine: syncEngine, tabManager: tabManager)
+                    } else {
+                        WebViewRepresentable(tab: tab, tabManager: tabManager)
+                            .ignoresSafeArea(.container, edges: [.top, .bottom])
+                            .transaction { $0.animation = nil }
+
+                        // Right-edge Long Press 2.0x Gesture Strip (unobtrusive 28pt edge)
+                        if tab.hasVideo {
+                            HStack {
+                                Spacer()
+                                Color.clear
+                                    .frame(width: 44)
+                                    .contentShape(Rectangle())
+                                    .onLongPressGesture(minimumDuration: 0.35, pressing: { pressing in
+                                        isSpeed2x = pressing
+                                        let rate = pressing ? 2.0 : 1.0
+                                        tab.webView?.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('rate', \(rate));", completionHandler: nil)
+                                    }, perform: {})
+                            }
+                        }
+                    }
+                }
+
                 // Slim Loading Bar
                 if let tab = currentTab, tab.isLoading && !tab.isNewTab {
                     ProgressView(value: tab.estimatedProgress)
@@ -35,65 +59,33 @@ struct BrowserRootView: View {
                         .tint(.blue)
                 }
 
-                // Main Content (New Tab or WebView + Video Touch Overlays)
-                ZStack {
-                    if let tab = currentTab {
-                        if tab.isNewTab {
-                            HomeNewTabView(syncEngine: syncEngine, tabManager: tabManager)
-                        } else {
-                            ZStack {
-                                if tabManager.effectiveWebDarkEnabled(for: URL(string: tab.urlString)) {
-                                    Color(red: 0.08, green: 0.09, blue: 0.10)
-                                        .ignoresSafeArea()
-                                }
-                                WebViewRepresentable(tab: tab, tabManager: tabManager)
-                                    .ignoresSafeArea(.container, edges: .bottom)
-                            }
-
-                            // Right-edge Long Press 2.0x Gesture Strip (unobtrusive 28pt edge)
-                            if tab.hasVideo {
-                                HStack {
-                                    Spacer()
-                                    Color.clear
-                                        .frame(width: 44)
-                                        .contentShape(Rectangle())
-                                        .onLongPressGesture(minimumDuration: 0.35, pressing: { pressing in
-                                            isSpeed2x = pressing
-                                            let rate = pressing ? 2.0 : 1.0
-                                            tab.webView?.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('rate', \(rate));", completionHandler: nil)
-                                        }, perform: {})
-                                }
-                            }
+                // 2.0x Pill Indicator
+                if isSpeed2x {
+                    VStack {
+                        HStack(spacing: 6) {
+                            Image(systemName: "forward.fill")
+                            Text(L10n.t("2.0x 倍速播放中", "2.0x Speed"))
                         }
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .background(.black.opacity(0.72), in: Capsule())
+                        .padding(.top, 16)
+                        Spacer()
                     }
+                    .transition(.opacity)
+                }
 
-                    // 2.0x Pill Indicator
-                    if isSpeed2x {
-                        VStack {
-                            HStack(spacing: 6) {
-                                Image(systemName: "forward.fill")
-                                Text(L10n.t("2.0x 倍速播放中", "2.0x Speed"))
-                            }
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 7)
-                            .background(.black.opacity(0.72), in: Capsule())
-                            .padding(.top, 16)
-                            Spacer()
-                        }
-                        .transition(.opacity)
-                    }
-
-                    // Horizontal scrub feedback pill
-                    if isScrubbingVideo {
-                        Text(String(format: "%+.0fs", scrubOffsetSec))
-                            .font(.title3.monospacedDigit().weight(.bold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 8)
-                            .background(.black.opacity(0.75), in: Capsule())
-                    }
+                // Horizontal scrub feedback pill
+                if isScrubbingVideo {
+                    Text(String(format: "%+.0fs", scrubOffsetSec))
+                        .font(.title3.monospacedDigit().weight(.bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(.black.opacity(0.75), in: Capsule())
+                        .frame(maxHeight: .infinity)
                 }
             }
 
@@ -221,11 +213,7 @@ struct BrowserRootView: View {
             .allowsHitTesting(topCapsuleToast != nil)
         }
         .onAppear {
-            tabManager.updateSystemDark(colorScheme == .dark)
             handleIncomingHandoff(handoffService.latestIncoming)
-        }
-        .onChange(of: colorScheme) { _, newScheme in
-            tabManager.updateSystemDark(newScheme == .dark)
         }
         .onChange(of: handoffService.latestIncoming) { _, incoming in
             handleIncomingHandoff(incoming)
@@ -435,6 +423,68 @@ private struct BottomThumbDock: View {
     }
 }
 
+@MainActor
+final class PrismWebContainerView: UIView, PrismTopColorHost {
+    let topSafeAreaBackdropView = UIView()
+    weak var tabManager: TabManager?
+    private(set) weak var hostedWebView: WKWebView?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = TabManager.dynamicSystemBackdropColor
+        topSafeAreaBackdropView.translatesAutoresizingMaskIntoConstraints = false
+        topSafeAreaBackdropView.backgroundColor = TabManager.dynamicSystemBackdropColor
+        addSubview(topSafeAreaBackdropView)
+        NSLayoutConstraint.activate([
+            topSafeAreaBackdropView.topAnchor.constraint(equalTo: topAnchor),
+            topSafeAreaBackdropView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            topSafeAreaBackdropView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            topSafeAreaBackdropView.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func attachWebView(_ webView: WKWebView, tabManager: TabManager, targetURL: URL?) {
+        self.tabManager = tabManager
+        if hostedWebView !== webView {
+            hostedWebView?.removeFromSuperview()
+            hostedWebView = webView
+            webView.translatesAutoresizingMaskIntoConstraints = false
+            insertSubview(webView, belowSubview: topSafeAreaBackdropView)
+            NSLayoutConstraint.activate([
+                webView.topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor),
+                webView.leadingAnchor.constraint(equalTo: leadingAnchor),
+                webView.trailingAnchor.constraint(equalTo: trailingAnchor),
+                webView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            ])
+        }
+        tabManager.applyWebDarkAppearance(to: webView, url: targetURL, trait: traitCollection)
+    }
+
+    func applyTopColor(_ color: UIColor, from traitCollection: UITraitCollection?) {
+        let tc = traitCollection ?? self.traitCollection
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let resolved = color.resolvedColor(with: tc)
+        topSafeAreaBackdropView.backgroundColor = resolved
+        backgroundColor = resolved
+        CATransaction.commit()
+    }
+
+    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        super.traitCollectionDidChange(previousTraitCollection)
+        guard traitCollection.hasDifferentColorAppearance(comparedTo: previousTraitCollection) else { return }
+        tabManager?.handleNativeTraitAppearanceChange(
+            isDarkNow: traitCollection.userInterfaceStyle == .dark,
+            webView: hostedWebView,
+            trait: traitCollection
+        )
+    }
+}
+
 struct WebViewRepresentable: UIViewRepresentable {
     @ObservedObject var tab: BrowserTab
     @ObservedObject var tabManager: TabManager
@@ -443,22 +493,18 @@ struct WebViewRepresentable: UIViewRepresentable {
         Coordinator()
     }
 
-    func makeUIView(context: Context) -> WKWebView {
+    func makeUIView(context: Context) -> PrismWebContainerView {
+        let container = PrismWebContainerView(frame: .zero)
         let wv = tabManager.ensureWebView(for: tab)
-        tabManager.applyWebDarkAppearance(to: wv, url: wv.url ?? URL(string: tab.urlString))
+        container.attachWebView(wv, tabManager: tabManager, targetURL: wv.url ?? URL(string: tab.urlString))
         attachRefreshControl(to: wv, coordinator: context.coordinator)
-        return wv
+        return container
     }
 
-    func updateUIView(_ uiView: WKWebView, context: Context) {
+    func updateUIView(_ uiView: PrismWebContainerView, context: Context) {
         let target = tabManager.ensureWebView(for: tab)
-        tabManager.applyWebDarkAppearance(to: target, url: target.url ?? URL(string: tab.urlString))
+        uiView.attachWebView(target, tabManager: tabManager, targetURL: target.url ?? URL(string: tab.urlString))
         attachRefreshControl(to: target, coordinator: context.coordinator)
-        if uiView !== target, let superview = uiView.superview {
-            target.frame = uiView.frame
-            superview.insertSubview(target, aboveSubview: uiView)
-            uiView.removeFromSuperview()
-        }
     }
 
     private func attachRefreshControl(to webView: WKWebView, coordinator: Coordinator) {
