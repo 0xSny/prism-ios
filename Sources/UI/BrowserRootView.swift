@@ -1114,7 +1114,10 @@ private struct OmniboxEditorSheet: View {
                 ))
             }
         }
-        scoredSites.sort { ($0.score, $0.visitedAt) > ($1.score, $1.visitedAt) }
+        scoredSites.sort {
+            if $0.score != $1.score { return $0.score > $1.score }
+            return $0.visitedAt > $1.visitedAt
+        }
 
         var topHit: OmniboxCandidateEntry? = nil
         if let best = scoredSites.first, best.score >= 70 {
