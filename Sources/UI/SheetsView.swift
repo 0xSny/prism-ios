@@ -50,6 +50,30 @@ struct MenuSheetView: View {
                     .padding(.vertical, 4)
                 }
 
+                if tabManager.isEffectiveAppDark && tabManager.webDarkModeFollowTheme,
+                   let host = tabManager.activeTabHTTPHost {
+                    Section {
+                        Button {
+                            tabManager.toggleWebDarkWhitelistForActiveTab()
+                            dismiss()
+                        } label: {
+                            HStack {
+                                Label(
+                                    tabManager.isActiveTabWebDarkWhitelisted
+                                        ? L10n.t("🌙 恢复此网站网页深色", "🌙 Enable Web Dark Mode")
+                                        : L10n.t("🌙 在此网站关闭网页深色", "🌙 Disable Web Dark Mode"),
+                                    systemImage: tabManager.isActiveTabWebDarkWhitelisted ? "moon.fill" : "moon.zzz"
+                                )
+                                Spacer()
+                                Text(host)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                }
+
                 if syncEngine.loggedIn, let tab = tabManager.activeTab, !tab.isNewTab {
                     Section {
                         Button {
@@ -118,6 +142,20 @@ struct MenuSheetView: View {
                 Section(L10n.t("防护与偏好", "Protection & Preferences")) {
                     Toggle(L10n.t("屏蔽追踪与广告", "Ad & Tracker Blocker"), isOn: $tabManager.adblockEnabled)
                     Toggle(L10n.t("拦截强跳 App Store / 外部App", "Block Rogue App Jumps"), isOn: $tabManager.blockRogueAppJumps)
+                    Toggle(L10n.t("深色模式下自动将网页变暗", "Auto-Darken Webpages in Dark Mode"), isOn: $tabManager.webDarkModeFollowTheme)
+                    if !tabManager.webDarkModeWhitelistHosts.isEmpty {
+                        Button(role: .destructive) {
+                            tabManager.clearWebDarkWhitelist()
+                        } label: {
+                            Label(
+                                L10n.t(
+                                    "清空网页深色豁免域名 (\(tabManager.webDarkModeWhitelistHosts.count))",
+                                    "Clear Web Dark Exceptions (\(tabManager.webDarkModeWhitelistHosts.count))"
+                                ),
+                                systemImage: "moon.circle"
+                            )
+                        }
+                    }
                     Picker(L10n.t("搜索引擎", "Search Engine"), selection: $tabManager.searchEngine) {
                         ForEach(SearchEngineOption.allCases, id: \.self) { eng in
                             Text(eng.title).tag(eng)

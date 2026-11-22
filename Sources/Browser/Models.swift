@@ -169,6 +169,8 @@ struct PortableSettings: Codable, Equatable {
     var autoSyncIntervalMinutes: Int?
     var builtInAdblockEnabled: Bool?
     var blockRogueAppJumps: Bool?
+    var webDarkModeFollowTheme: Bool?
+    var webDarkModeWhitelistHosts: [String]?
 }
 
 struct SyncItemPayload: Codable {

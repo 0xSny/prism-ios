@@ -46,11 +46,30 @@ final class BrowserTab: ObservableObject, Identifiable {
 
 @MainActor
 final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+    private static let darkWebBackdropColor = UIColor(red: 0.08, green: 0.09, blue: 0.10, alpha: 1.0)
+
     @Published var tabs: [BrowserTab] = []
     @Published var activeTabId: UUID?
     @Published var activeToast: ToastNotice?
     @Published var searchEngine: SearchEngineOption = .google
-    @Published var appTheme: AppTheme = .system
+    @Published var appTheme: AppTheme = .system {
+        didSet {
+            UserDefaults.standard.set(appTheme.rawValue, forKey: "prism.theme")
+            applyWebDarkModeToAllTabs()
+        }
+    }
+    @Published var webDarkModeFollowTheme: Bool = true {
+        didSet {
+            UserDefaults.standard.set(webDarkModeFollowTheme, forKey: "prism.webDarkModeFollowTheme")
+            applyWebDarkModeToAllTabs()
+        }
+    }
+    @Published var webDarkModeWhitelistHosts: Set<String> = [] {
+        didSet {
+            UserDefaults.standard.set(Array(webDarkModeWhitelistHosts).sorted(), forKey: "prism.webDarkModeWhitelistHosts")
+            applyWebDarkModeToAllTabs()
+        }
+    }
     @Published var adblockEnabled: Bool = true
     @Published var blockRogueAppJumps: Bool = true
     @Published var desktopMode: Bool = false
@@ -61,6 +80,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     private var lastClipboardChangeCount: Int = UIPasteboard.general.changeCount
     private var lastPromptedClipboard: String = ""
     private var allowedOnceJumpURL: URL?
+    private var systemIsDark: Bool = UITraitCollection.current.userInterfaceStyle == .dark
 
     override init() {
         super.init()
@@ -72,8 +92,78 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
            let theme = AppTheme(rawValue: rawTheme) {
             self.appTheme = theme
         }
+        if UserDefaults.standard.object(forKey: "prism.webDarkModeFollowTheme") != nil {
+            self.webDarkModeFollowTheme = UserDefaults.standard.bool(forKey: "prism.webDarkModeFollowTheme")
+        }
+        if let savedHosts = UserDefaults.standard.stringArray(forKey: "prism.webDarkModeWhitelistHosts") {
+            let cleaned = savedHosts
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+            self.webDarkModeWhitelistHosts = Set(cleaned)
+        }
         BackgroundMediaController.shared.configureAudioSession()
         createTab(url: nil, activate: true)
+    }
+
+    var isEffectiveAppDark: Bool {
+        switch appTheme {
+        case .dark:
+            return true
+        case .light:
+            return false
+        case .system:
+            return systemIsDark
+        }
+    }
+
+    func updateSystemDark(_ isDark: Bool) {
+        guard systemIsDark != isDark else { return }
+        systemIsDark = isDark
+        applyWebDarkModeToAllTabs()
+    }
+
+    func normalizedHTTPHost(from url: URL?) -> String? {
+        guard let url,
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !host.isEmpty else {
+            return nil
+        }
+        return host
+    }
+
+    var activeTabHTTPHost: String? {
+        guard let tab = activeTab, !tab.isNewTab else { return nil }
+        return normalizedHTTPHost(from: URL(string: tab.urlString))
+    }
+
+    var isActiveTabWebDarkWhitelisted: Bool {
+        guard let host = activeTabHTTPHost else { return false }
+        return webDarkModeWhitelistHosts.contains(host)
+    }
+
+    func effectiveWebDarkEnabled(for url: URL?) -> Bool {
+        guard isEffectiveAppDark && webDarkModeFollowTheme else { return false }
+        if let host = normalizedHTTPHost(from: url), webDarkModeWhitelistHosts.contains(host) {
+            return false
+        }
+        return true
+    }
+
+    func toggleWebDarkWhitelistForActiveTab() {
+        guard let host = activeTabHTTPHost else { return }
+        if webDarkModeWhitelistHosts.contains(host) {
+            webDarkModeWhitelistHosts.remove(host)
+            showToast(L10n.t("已恢复此网站网页深色", "Web dark mode restored for this site"))
+        } else {
+            webDarkModeWhitelistHosts.insert(host)
+            showToast(L10n.t("已在此网站关闭网页深色", "Web dark mode disabled for this site"))
+        }
+    }
+
+    func clearWebDarkWhitelist() {
+        webDarkModeWhitelistHosts.removeAll()
     }
 
     var activeTab: BrowserTab? {
@@ -161,10 +251,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
 
         let ucc = config.userContentController
         ucc.add(self, name: "prismBridge")
-        ucc.addUserScript(WKUserScript(source: MediaSnifferScripts.injectScriptSource, injectionTime: .atDocumentStart, forMainFrameOnly: false))
-        if let fpScript = ProfileDataStoreRegistry.shared.fingerprintUserScript(for: profile) {
-            ucc.addUserScript(fpScript)
-        }
+        configureUserScripts(on: ucc, profile: profile, initialURL: URL(string: tab.urlString))
         AdBlockManager.shared.apply(to: ucc, enabled: adblockEnabled && profile.fingerprint.blockTrackers)
 
         let webView = WKWebView(frame: .zero, configuration: config)
@@ -176,8 +263,89 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         } else if let customUA = profile.fingerprint.userAgent, !customUA.isEmpty {
             webView.customUserAgent = customUA
         }
+        applyWebDarkAppearance(to: webView, url: URL(string: tab.urlString))
         tab.webView = webView
         return webView
+    }
+
+    private func configureUserScripts(on ucc: WKUserContentController, profile: BrowserProfile, initialURL: URL?) {
+        ucc.removeAllUserScripts()
+        ucc.addUserScript(WKUserScript(source: MediaSnifferScripts.injectScriptSource, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        if let fpScript = ProfileDataStoreRegistry.shared.fingerprintUserScript(for: profile) {
+            ucc.addUserScript(fpScript)
+        }
+        let followThemeDark = isEffectiveAppDark && webDarkModeFollowTheme
+        let initialEnabled = effectiveWebDarkEnabled(for: initialURL)
+        let startScript = WebDarkModeScripts.documentStartSource(
+            initialEnabled: initialEnabled,
+            followThemeDark: followThemeDark,
+            whitelistHosts: webDarkModeWhitelistHosts
+        )
+        let endScript = WebDarkModeScripts.documentEndSource()
+        ucc.addUserScript(WKUserScript(source: startScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        ucc.addUserScript(WKUserScript(source: endScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+    }
+
+    func applyWebDarkAppearance(to webView: WKWebView, url: URL? = nil) {
+        let targetURL = url ?? webView.url
+        let enabled = effectiveWebDarkEnabled(for: targetURL)
+        if enabled {
+            if webView.overrideUserInterfaceStyle != .dark {
+                webView.overrideUserInterfaceStyle = .dark
+            }
+            if webView.isOpaque {
+                webView.isOpaque = false
+            }
+            if webView.backgroundColor != Self.darkWebBackdropColor {
+                webView.backgroundColor = Self.darkWebBackdropColor
+            }
+            if webView.scrollView.backgroundColor != Self.darkWebBackdropColor {
+                webView.scrollView.backgroundColor = Self.darkWebBackdropColor
+            }
+            if #available(iOS 15.0, *), webView.underPageBackgroundColor != Self.darkWebBackdropColor {
+                webView.underPageBackgroundColor = Self.darkWebBackdropColor
+            }
+        } else {
+            let isWhitelisted: Bool = {
+                guard let host = normalizedHTTPHost(from: targetURL) else { return false }
+                return webDarkModeWhitelistHosts.contains(host)
+            }()
+            let targetStyle: UIUserInterfaceStyle =
+                (isEffectiveAppDark && (!webDarkModeFollowTheme || isWhitelisted))
+                    ? .light
+                    : (appTheme == .system ? .unspecified : .light)
+            if webView.overrideUserInterfaceStyle != targetStyle {
+                webView.overrideUserInterfaceStyle = targetStyle
+            }
+            if !webView.isOpaque {
+                webView.isOpaque = true
+            }
+            if webView.backgroundColor != .systemBackground {
+                webView.backgroundColor = .systemBackground
+            }
+            if webView.scrollView.backgroundColor != .systemBackground {
+                webView.scrollView.backgroundColor = .systemBackground
+            }
+            if #available(iOS 15.0, *), webView.underPageBackgroundColor != .systemBackground {
+                webView.underPageBackgroundColor = .systemBackground
+            }
+        }
+    }
+
+    func applyWebDarkModeToAllTabs() {
+        let profiles = syncEngine?.profiles ?? [.defaultProfile]
+        for tab in tabs {
+            guard let webView = tab.webView else { continue }
+            let targetURL = webView.url ?? URL(string: tab.urlString)
+            applyWebDarkAppearance(to: webView, url: targetURL)
+            let profile = profiles.first(where: { $0.id == tab.profileId }) ?? .defaultProfile
+            configureUserScripts(on: webView.configuration.userContentController, profile: profile, initialURL: targetURL)
+            let enabled = effectiveWebDarkEnabled(for: targetURL)
+            webView.evaluateJavaScript(
+                "window.__prismSetWebDark && window.__prismSetWebDark(\(enabled ? "true" : "false"));",
+                completionHandler: nil
+            )
+        }
     }
 
     func switchProfileForActiveTab(_ profileId: String) {
@@ -373,6 +541,9 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             decisionHandler(.cancel)
             return
         }
+        if navigationAction.targetFrame?.isMainFrame == true {
+            applyWebDarkAppearance(to: webView, url: url)
+        }
         decisionHandler(.allow)
     }
 
@@ -388,11 +559,27 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        applyWebDarkAppearance(to: webView, url: webView.url)
         syncWebViewState(webView)
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        applyWebDarkAppearance(to: webView, url: webView.url)
+        let enabled = effectiveWebDarkEnabled(for: webView.url)
+        webView.evaluateJavaScript(
+            "window.__prismSetWebDark && window.__prismSetWebDark(\(enabled ? "true" : "false"));",
+            completionHandler: nil
+        )
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         webView.scrollView.refreshControl?.endRefreshing()
+        applyWebDarkAppearance(to: webView, url: webView.url)
+        let enabled = effectiveWebDarkEnabled(for: webView.url)
+        webView.evaluateJavaScript(
+            "window.__prismSetWebDark && window.__prismSetWebDark(\(enabled ? "true" : "false"));",
+            completionHandler: nil
+        )
         syncWebViewState(webView)
         guard let tab = tabs.first(where: { $0.webView === webView }),
               let urlStr = webView.url?.absoluteString,
@@ -522,5 +709,254 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             }
         }
         return nil
+    }
+}
+
+private enum WebDarkModeScripts {
+    static func documentStartSource(
+        initialEnabled: Bool,
+        followThemeDark: Bool,
+        whitelistHosts: Set<String>
+    ) -> String {
+        let whitelistArray = Array(whitelistHosts).sorted()
+        let whitelistJSON: String = {
+            guard let data = try? JSONEncoder().encode(whitelistArray),
+                  let str = String(data: data, encoding: .utf8) else {
+                return "[]"
+            }
+            return str
+        }()
+        let initialBool = initialEnabled ? "true" : "false"
+        let followBool = followThemeDark ? "true" : "false"
+
+        return """
+        (function() {
+          if (window.__prismWebDarkStartInstalled) return;
+          window.__prismWebDarkStartInstalled = true;
+
+          const whitelist = new Set(\(whitelistJSON));
+          const globalFollowDark = \(followBool);
+          const host = (location.hostname || '').toLowerCase();
+          const isHttp = location.protocol === 'http:' || location.protocol === 'https:';
+          const enabled = isHttp ? (globalFollowDark && !whitelist.has(host)) : \(initialBool);
+          window.__prismWebDarkEnabled = enabled;
+
+          function ensureColorSchemeMeta(on) {
+            const ownMeta = document.querySelector('meta[data-prism-cs="1"]');
+            if (!on) {
+              if (ownMeta) ownMeta.remove();
+              return;
+            }
+            const nativeMeta = document.querySelector('meta[name="color-scheme"]:not([data-prism-cs])');
+            if (!nativeMeta && !ownMeta) {
+              const target = document.head || document.documentElement;
+              if (!target) return;
+              const m = document.createElement('meta');
+              m.setAttribute('name', 'color-scheme');
+              m.setAttribute('content', 'dark light');
+              m.setAttribute('data-prism-cs', '1');
+              target.appendChild(m);
+            }
+          }
+
+          function ensureDarkStyle() {
+            if (document.getElementById('prism-dark-style')) return;
+            const target = document.head || document.documentElement;
+            if (!target) return;
+            const style = document.createElement('style');
+            style.id = 'prism-dark-style';
+            style.textContent = `
+              html[data-prism-dark="1"] {
+                background-color: #ffffff !important;
+                filter: invert(0.92) hue-rotate(180deg) contrast(0.96) !important;
+              }
+              html[data-prism-dark="1"] img,
+              html[data-prism-dark="1"] video,
+              html[data-prism-dark="1"] picture,
+              html[data-prism-dark="1"] canvas,
+              html[data-prism-dark="1"] iframe,
+              html[data-prism-dark="1"] [style*="background-image"]:not(body):not(html) {
+                filter: invert(1) hue-rotate(180deg) contrast(1.04) !important;
+              }
+              html[data-prism-dark="1"]:has(:fullscreen),
+              html[data-prism-dark="1"]:has(:-webkit-full-screen) {
+                filter: none !important;
+              }
+            `;
+            target.appendChild(style);
+          }
+
+          function removePrepStyle() {
+            const prep = document.getElementById('prism-dark-prep');
+            if (prep) prep.remove();
+          }
+
+          if (enabled && document.documentElement) {
+            ensureColorSchemeMeta(true);
+            ensureDarkStyle();
+            if (!document.getElementById('prism-dark-prep')) {
+              const prep = document.createElement('style');
+              prep.id = 'prism-dark-prep';
+              prep.textContent = 'html, body { transition: background-color 0.12s ease !important; } html:not([data-prism-dark]) { background-color: #14171a !important; }';
+              document.documentElement.appendChild(prep);
+            }
+          }
+
+          window.__prismWebDarkEnsure = {
+            ensureColorSchemeMeta,
+            ensureDarkStyle,
+            removePrepStyle
+          };
+        })();
+        """
+    }
+
+    static func documentEndSource() -> String {
+        return """
+        (function() {
+          if (window.__prismWebDarkEndInstalled) return;
+          window.__prismWebDarkEndInstalled = true;
+
+          const helper = window.__prismWebDarkEnsure || {
+            ensureColorSchemeMeta: function() {},
+            ensureDarkStyle: function() {},
+            removePrepStyle: function() {}
+          };
+
+          function parseCssRgb(raw) {
+            if (!raw || typeof raw !== 'string') return null;
+            let m = raw.match(/rgba?\\(\\s*([\\d.]+)\\s*,\\s*([\\d.]+)\\s*,\\s*([\\d.]+)(?:\\s*,\\s*([\\d.]+))?\\s*\\)/i);
+            if (!m) {
+              m = raw.match(/rgba?\\(\\s*([\\d.]+)\\s+([\\d.]+)\\s+([\\d.]+)(?:\\s*\\/\\s*([\\d.]+%?))?\\s*\\)/i);
+            }
+            if (!m) return null;
+            const r = Number(m[1]);
+            const g = Number(m[2]);
+            const b = Number(m[3]);
+            let a = 1;
+            if (m[4] !== undefined) {
+              a = String(m[4]).endsWith('%') ? parseFloat(m[4]) / 100 : Number(m[4]);
+            }
+            if (!Number.isFinite(r) || !Number.isFinite(g) || !Number.isFinite(b) || !Number.isFinite(a)) return null;
+            if (a < 0.18) return null;
+            const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+            return { r, g, b, a, luminance };
+          }
+
+          function isAlreadyDarkPage() {
+            const root = document.documentElement;
+            if (!root) return false;
+
+            const prevAttr = root.getAttribute('data-prism-dark');
+            if (prevAttr === '1') {
+              root.removeAttribute('data-prism-dark');
+            }
+
+            let foundDarkBg = false;
+            let foundLightBg = false;
+
+            try {
+              const candidates = [];
+              if (document.body) candidates.push(document.body);
+              candidates.push(root);
+              const mainEl = document.querySelector('main, #app, #root, #__next, #content, ytd-app');
+              if (mainEl) candidates.push(mainEl);
+              if (typeof document.elementFromPoint === 'function' && window.innerWidth > 20 && window.innerHeight > 20) {
+                let ptEl = document.elementFromPoint(Math.floor(window.innerWidth * 0.5), Math.min(180, Math.floor(window.innerHeight * 0.35)));
+                while (ptEl && ptEl !== document.body && ptEl !== root && candidates.length < 10) {
+                  candidates.push(ptEl);
+                  ptEl = ptEl.parentElement;
+                }
+              }
+
+              for (let i = 0; i < candidates.length; i += 1) {
+                const el = candidates[i];
+                if (!el) continue;
+                const parsed = parseCssRgb(getComputedStyle(el).backgroundColor);
+                if (!parsed) continue;
+                if (parsed.luminance < 0.38) {
+                  foundDarkBg = true;
+                } else {
+                  foundLightBg = true;
+                }
+                break;
+              }
+
+              if (foundDarkBg) return true;
+              if (foundLightBg) return false;
+
+              const nativeMeta = document.querySelector('meta[name="color-scheme"]:not([data-prism-cs])');
+              const metaCS = nativeMeta ? (nativeMeta.getAttribute('content') || '').toLowerCase() : '';
+              const rootCS = (getComputedStyle(root).colorScheme || '').toLowerCase();
+              return metaCS.includes('dark') || rootCS.includes('dark');
+            } finally {
+              if (prevAttr === '1' && window.__prismWebDarkEnabled) {
+                root.setAttribute('data-prism-dark', '1');
+              }
+            }
+          }
+
+          function evaluateAndApply() {
+            const root = document.documentElement;
+            if (!root) return;
+            helper.removePrepStyle();
+
+            if (!window.__prismWebDarkEnabled) {
+              helper.ensureColorSchemeMeta(false);
+              root.removeAttribute('data-prism-dark');
+              return;
+            }
+
+            helper.ensureColorSchemeMeta(true);
+            helper.ensureDarkStyle();
+            if (isAlreadyDarkPage()) {
+              root.setAttribute('data-prism-dark', '0');
+            } else {
+              root.setAttribute('data-prism-dark', '1');
+            }
+          }
+
+          window.__prismSetWebDark = function(enabled) {
+            window.__prismWebDarkEnabled = Boolean(enabled);
+            evaluateAndApply();
+          };
+
+          evaluateAndApply();
+          if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(evaluateAndApply);
+          }
+          setTimeout(evaluateAndApply, 250);
+          setTimeout(evaluateAndApply, 950);
+
+          let debounceTimer = null;
+          const scheduleReeval = () => {
+            if (!window.__prismWebDarkEnabled) return;
+            if (debounceTimer) clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(evaluateAndApply, 180);
+          };
+
+          if (typeof MutationObserver === 'function' && document.documentElement) {
+            const mo = new MutationObserver((mutations) => {
+              if (!window.__prismWebDarkEnabled) return;
+              for (let i = 0; i < mutations.length; i += 1) {
+                const m = mutations[i];
+                if (m.attributeName === 'data-prism-dark') continue;
+                scheduleReeval();
+                break;
+              }
+            });
+            mo.observe(document.documentElement, {
+              attributes: true,
+              attributeFilter: ['class', 'style', 'data-color-mode', 'data-theme']
+            });
+            if (document.body) {
+              mo.observe(document.body, {
+                attributes: true,
+                attributeFilter: ['class', 'style', 'data-theme']
+              });
+            }
+          }
+        })();
+        """
     }
 }

@@ -6,6 +6,7 @@ struct BrowserRootView: View {
     @ObservedObject var syncEngine: SyncEngine
     @ObservedObject var tabManager: TabManager
     @ObservedObject var handoffService: HandoffService
+    @Environment(\.colorScheme) private var colorScheme
 
     @State private var showOmniboxEditor = false
     @State private var omniboxInput = ""
@@ -40,8 +41,14 @@ struct BrowserRootView: View {
                         if tab.isNewTab {
                             HomeNewTabView(syncEngine: syncEngine, tabManager: tabManager)
                         } else {
-                            WebViewRepresentable(tab: tab, tabManager: tabManager)
-                                .ignoresSafeArea(.container, edges: .bottom)
+                            ZStack {
+                                if tabManager.effectiveWebDarkEnabled(for: URL(string: tab.urlString)) {
+                                    Color(red: 0.08, green: 0.09, blue: 0.10)
+                                        .ignoresSafeArea()
+                                }
+                                WebViewRepresentable(tab: tab, tabManager: tabManager)
+                                    .ignoresSafeArea(.container, edges: .bottom)
+                            }
 
                             // Right-edge Long Press 2.0x Gesture Strip (unobtrusive 28pt edge)
                             if tab.hasVideo {
@@ -214,7 +221,11 @@ struct BrowserRootView: View {
             .allowsHitTesting(topCapsuleToast != nil)
         }
         .onAppear {
+            tabManager.updateSystemDark(colorScheme == .dark)
             handleIncomingHandoff(handoffService.latestIncoming)
+        }
+        .onChange(of: colorScheme) { _, newScheme in
+            tabManager.updateSystemDark(newScheme == .dark)
         }
         .onChange(of: handoffService.latestIncoming) { _, incoming in
             handleIncomingHandoff(incoming)
@@ -434,12 +445,14 @@ struct WebViewRepresentable: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let wv = tabManager.ensureWebView(for: tab)
+        tabManager.applyWebDarkAppearance(to: wv, url: wv.url ?? URL(string: tab.urlString))
         attachRefreshControl(to: wv, coordinator: context.coordinator)
         return wv
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
         let target = tabManager.ensureWebView(for: tab)
+        tabManager.applyWebDarkAppearance(to: target, url: target.url ?? URL(string: tab.urlString))
         attachRefreshControl(to: target, coordinator: context.coordinator)
         if uiView !== target, let superview = uiView.superview {
             target.frame = uiView.frame
