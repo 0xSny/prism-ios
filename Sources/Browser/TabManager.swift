@@ -227,6 +227,21 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         activeTabId = tabs[nextIdx].id
     }
 
+    func activateTab(id: String) {
+        guard tabs.contains(where: { $0.id == id }) else { return }
+        activeTabId = id
+    }
+
+    func findInActivePage(_ query: String) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let tab = activeTab, !tab.isNewTab, let webView = tab.webView else { return }
+        webView.isFindInteractionEnabled = true
+        if !trimmed.isEmpty {
+            webView.findInteraction?.searchText = trimmed
+        }
+        webView.findInteraction?.presentFindNavigator(showingReplace: false)
+    }
+
     func navigateActive(_ input: String) {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let tab = activeTab else { return }
@@ -275,6 +290,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
+        webView.isFindInteractionEnabled = true
         if desktopMode {
             webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
         } else if let customUA = profile.fingerprint.userAgent, !customUA.isEmpty {

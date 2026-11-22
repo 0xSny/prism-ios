@@ -239,11 +239,27 @@ struct BrowserRootView: View {
             OmniboxEditorSheet(
                 text: $omniboxInput,
                 bookmarks: syncEngine.bookmarks,
-                history: syncEngine.history
-            ) { target in
-                tabManager.navigateActive(target)
-                showOmniboxEditor = false
-            }
+                history: syncEngine.history,
+                tabs: tabManager.tabs,
+                activeTabId: tabManager.activeTabId,
+                shortcuts: syncEngine.homeConfig.shortcuts,
+                searchEngine: tabManager.searchEngine,
+                canFindInPage: !(currentTab?.isNewTab ?? true),
+                onSubmit: { target in
+                    tabManager.navigateActive(target)
+                    showOmniboxEditor = false
+                },
+                onSelectTab: { tabId in
+                    tabManager.activateTab(id: tabId)
+                    showOmniboxEditor = false
+                },
+                onFindInPage: { query in
+                    showOmniboxEditor = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+                        tabManager.findInActivePage(query)
+                    }
+                }
+            )
         }
         .sheet(isPresented: $showTabSwitcher) {
             TabSwitcherView(tabManager: tabManager, syncEngine: syncEngine)
@@ -551,16 +567,128 @@ struct WebViewRepresentable: UIViewRepresentable {
     }
 }
 
+@MainActor
+private final class OmniboxRemoteSuggester: ObservableObject {
+    @Published var suggestions: [String] = []
+    private var fetchTask: Task<Void, Never>?
+    private var lastQuery = ""
+
+    func update(query: String, engine: SearchEngineOption) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !trimmed.contains("://"),
+              !trimmed.hasPrefix("localhost"),
+              !trimmed.hasPrefix("127.0.0.1") else {
+            fetchTask?.cancel()
+            lastQuery = ""
+            if !suggestions.isEmpty { suggestions = [] }
+            return
+        }
+        if trimmed == lastQuery { return }
+        lastQuery = trimmed
+        fetchTask?.cancel()
+        fetchTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 110_000_000)
+            guard !Task.isCancelled else { return }
+            let items = await Self.fetchRemote(query: trimmed, engine: engine)
+            guard !Task.isCancelled else { return }
+            self?.suggestions = items
+        }
+    }
+
+    private static func fetchRemote(query: String, engine: SearchEngineOption) async -> [String] {
+        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+            return []
+        }
+        let endpointStr: String
+        switch engine {
+        case .bing:
+            endpointStr = "https://api.bing.com/osjson.aspx?query=\(encoded)"
+        case .duckduckgo:
+            endpointStr = "https://duckduckgo.com/ac/?q=\(encoded)"
+        case .baidu:
+            endpointStr = "https://suggestion.baidu.com/su?wd=\(encoded)&action=opensearch"
+        case .google:
+            endpointStr = "https://suggestqueries.google.com/complete/search?client=firefox&q=\(encoded)"
+        }
+        guard let url = URL(string: endpointStr) else { return [] }
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 1.5)
+        req.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return []
+            }
+            if engine == .duckduckgo {
+                if let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                    return arr.compactMap { ($0["phrase"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                }
+                return []
+            }
+            let parsedObj: Any?
+            if let direct = try? JSONSerialization.jsonObject(with: data) {
+                parsedObj = direct
+            } else if engine == .baidu {
+                let cfEnc = CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue))
+                if let gbkStr = String(data: data, encoding: String.Encoding(rawValue: cfEnc)),
+                   let utf8Data = gbkStr.data(using: .utf8) {
+                    parsedObj = try? JSONSerialization.jsonObject(with: utf8Data)
+                } else {
+                    parsedObj = nil
+                }
+            } else {
+                parsedObj = nil
+            }
+            if let root = parsedObj as? [Any], root.count > 1, let list = root[1] as? [String] {
+                return list.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            }
+        } catch {
+            return []
+        }
+        return []
+    }
+}
+
+private struct OmniboxCandidateEntry: Identifiable {
+    let id: String
+    let title: String
+    let url: String
+    let subtitle: String
+    let isBookmark: Bool
+    let tabId: String?
+    let score: Int
+    let visitedAt: Double
+}
+
 private struct OmniboxEditorSheet: View {
     @Binding var text: String
     let bookmarks: [BookmarkItem]
     let history: [HistoryItem]
+    let tabs: [BrowserTab]
+    let activeTabId: String?
+    let shortcuts: [HomeShortcut]
+    let searchEngine: SearchEngineOption
+    let canFindInPage: Bool
     let onSubmit: (String) -> Void
+    let onSelectTab: (String) -> Void
+    let onFindInPage: (String) -> Void
+
     @Environment(\.dismiss) private var dismiss
+    @StateObject private var remoteSuggester = OmniboxRemoteSuggester()
 
     var body: some View {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let q = trimmed.lowercased()
+        let tokens = q.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        let ranked = buildLocalCandidates(queryLower: q, tokens: tokens)
+        let topHit = !q.isEmpty ? ranked.topHit : nil
+        let matchedTabs = ranked.tabs
+        let libraryItems = ranked.library
+        let remoteList = buildRemoteSearchList(trimmed: trimmed, rawLower: q, remote: remoteSuggester.suggestions)
+
         NavigationStack {
-            VStack(spacing: 12) {
+            VStack(spacing: 10) {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass")
                         .foregroundStyle(.secondary)
@@ -575,6 +703,15 @@ private struct OmniboxEditorSheet: View {
                         }
                     )
                     .frame(height: 24)
+                    if !text.isEmpty {
+                        Button {
+                            text = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
@@ -582,46 +719,176 @@ private struct OmniboxEditorSheet: View {
                 .padding(.horizontal)
 
                 List {
-                    let q = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                    let matchedBM = bookmarks.filter { $0.type != "folder" && (q.isEmpty || $0.title.lowercased().contains(q) || $0.url.lowercased().contains(q)) }.prefix(5)
-                    let matchedHist = history.filter { q.isEmpty || $0.title.lowercased().contains(q) || $0.url.lowercased().contains(q) }.prefix(8)
+                    if let hit = topHit {
+                        Section {
+                            Button {
+                                if let tid = hit.tabId {
+                                    onSelectTab(tid)
+                                } else {
+                                    onSubmit(hit.url)
+                                }
+                            } label: {
+                                HStack(spacing: 12) {
+                                    ZStack {
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .fill(Color.indigo.opacity(0.14))
+                                            .frame(width: 32, height: 32)
+                                        Image(systemName: hit.tabId != nil ? "macwindow" : (hit.isBookmark ? "bookmark.fill" : "globe"))
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundStyle(.indigo)
+                                    }
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(hit.title)
+                                            .font(.body.weight(.semibold))
+                                            .foregroundStyle(.primary)
+                                            .lineLimit(1)
+                                        Text(hit.subtitle)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer()
+                                    Text(L10n.t("最佳匹配", "Top Hit"))
+                                        .font(.caption2.weight(.medium))
+                                        .foregroundStyle(.indigo)
+                                        .padding(.horizontal, 7)
+                                        .padding(.vertical, 3)
+                                        .background(Color.indigo.opacity(0.12), in: Capsule())
+                                }
+                            }
+                            .listRowBackground(Color(.secondarySystemGroupedBackground))
+                        }
+                    }
 
-                    if !matchedBM.isEmpty {
-                        Section(L10n.t("云端书签", "Bookmarks")) {
-                            ForEach(Array(matchedBM)) { bm in
-                                Button { onSubmit(bm.url) } label: {
-                                    Label {
-                                        VStack(alignment: .leading) {
-                                            Text(bm.title).lineLimit(1)
-                                            Text(bm.url).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    if !matchedTabs.isEmpty {
+                        Section(q.isEmpty ? L10n.t("打开的标签页", "Open Tabs") : "") {
+                            ForEach(matchedTabs) { item in
+                                Button {
+                                    if let tid = item.tabId {
+                                        onSelectTab(tid)
+                                    } else {
+                                        onSubmit(item.url)
+                                    }
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        ZStack {
+                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                .fill(Color(.tertiarySystemFill))
+                                                .frame(width: 30, height: 30)
+                                            Image(systemName: "macwindow")
+                                                .font(.system(size: 13))
+                                                .foregroundStyle(.secondary)
                                         }
-                                    } icon: {
-                                        Image(systemName: "bookmark.fill").foregroundStyle(.blue)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(item.title)
+                                                .foregroundStyle(.primary)
+                                                .lineLimit(1)
+                                            Text(item.subtitle)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(1)
+                                        }
                                     }
                                 }
                             }
                         }
                     }
 
-                    if !matchedHist.isEmpty {
-                        Section(L10n.t("最近浏览", "History")) {
-                            ForEach(Array(matchedHist)) { h in
-                                Button { onSubmit(h.url) } label: {
-                                    Label {
-                                        VStack(alignment: .leading) {
-                                            Text(h.title).lineLimit(1)
-                                            Text(h.url).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    if !remoteList.isEmpty {
+                        Section("\(searchEngine.title)\(L10n.t(" 建议", " Suggestions"))") {
+                            ForEach(remoteList, id: \.self) { term in
+                                HStack(spacing: 10) {
+                                    Button {
+                                        onSubmit(term)
+                                    } label: {
+                                        HStack(spacing: 12) {
+                                            ZStack {
+                                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                    .fill(Color(.tertiarySystemFill))
+                                                    .frame(width: 30, height: 30)
+                                                Image(systemName: "magnifyingglass")
+                                                    .font(.system(size: 13))
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                            Text(highlightedSuggestion(term: term, query: trimmed))
+                                                .lineLimit(1)
+                                            Spacer(minLength: 0)
                                         }
-                                    } icon: {
-                                        Image(systemName: "clock").foregroundStyle(.secondary)
+                                        .contentShape(Rectangle())
                                     }
+                                    .buttonStyle(.plain)
+
+                                    if term.lowercased() != q {
+                                        Button {
+                                            text = term
+                                        } label: {
+                                            Image(systemName: "arrow.up.left")
+                                                .font(.system(size: 12, weight: .semibold))
+                                                .foregroundStyle(.secondary)
+                                                .frame(width: 28, height: 28)
+                                                .background(Color(.tertiarySystemFill), in: Circle())
+                                        }
+                                        .buttonStyle(.borderless)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !libraryItems.isEmpty {
+                        Section(L10n.t("书签、历史记录和标签页", "Bookmarks & History")) {
+                            ForEach(libraryItems) { item in
+                                Button {
+                                    onSubmit(item.url)
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        ZStack {
+                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                .fill(Color(.tertiarySystemFill))
+                                                .frame(width: 30, height: 30)
+                                            Image(systemName: item.isBookmark ? "bookmark.fill" : "clock")
+                                                .font(.system(size: 13))
+                                                .foregroundStyle(item.isBookmark ? .blue : .secondary)
+                                        }
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(item.title)
+                                                .foregroundStyle(.primary)
+                                                .lineLimit(1)
+                                            Text(item.subtitle)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(1)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if canFindInPage && !trimmed.isEmpty {
+                        Section(L10n.t("此页", "On This Page")) {
+                            Button {
+                                onFindInPage(trimmed)
+                            } label: {
+                                HStack(spacing: 12) {
+                                    ZStack {
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .fill(Color(.tertiarySystemFill))
+                                            .frame(width: 30, height: 30)
+                                        Image(systemName: "doc.text.magnifyingglass")
+                                            .font(.system(size: 13))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Text(L10n.t("查找“\(trimmed)”", "Find “\(trimmed)”"))
+                                        .foregroundStyle(.primary)
                                 }
                             }
                         }
                     }
                 }
+                .listStyle(.insetGrouped)
             }
-            .padding(.top, 12)
+            .padding(.top, 10)
             .navigationTitle(L10n.t("地址与搜索", "Navigate"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -629,7 +896,276 @@ private struct OmniboxEditorSheet: View {
                     Button(L10n.t("取消", "Cancel")) { dismiss() }
                 }
             }
+            .onAppear {
+                remoteSuggester.update(query: text, engine: searchEngine)
+            }
+            .onChange(of: text) { _, newValue in
+                remoteSuggester.update(query: newValue, engine: searchEngine)
+            }
         }
+    }
+
+    private func buildRemoteSearchList(trimmed: String, rawLower: String, remote: [String]) -> [String] {
+        guard !trimmed.isEmpty else { return [] }
+        var out: [String] = [trimmed]
+        var seen: Set<String> = [rawLower]
+        for term in remote {
+            let low = term.lowercased()
+            if seen.contains(low) { continue }
+            seen.insert(low)
+            out.append(term)
+            if out.count >= 6 { break }
+        }
+        return out
+    }
+
+    private func highlightedSuggestion(term: String, query: String) -> AttributedString {
+        var attr = AttributedString(term)
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else {
+            attr.foregroundColor = .primary
+            return attr
+        }
+        if term.lowercased().hasPrefix(q.lowercased()), let endIdx = attr.index(attr.startIndex, offsetByCharacters: min(q.count, term.count)) as AttributedString.Index? {
+            attr.foregroundColor = .secondary
+            attr[attr.startIndex..<endIdx].foregroundColor = .primary
+            attr[attr.startIndex..<endIdx].font = .body.weight(.semibold)
+            return attr
+        }
+        if let range = attr.range(of: q, options: [.caseInsensitive]) {
+            attr.foregroundColor = .secondary
+            attr[range].foregroundColor = .primary
+            attr[range].font = .body.weight(.semibold)
+            return attr
+        }
+        attr.foregroundColor = .primary
+        return attr
+    }
+
+    private func normalizeKey(_ raw: String) -> String {
+        guard let u = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return raw.lowercased()
+        }
+        let host = (u.host ?? "").lowercased()
+        let path = (u.path == "/" || u.path.isEmpty) && u.query == nil ? "" : u.path
+        return "\(host)\(path)\(u.query.map { "?\($0)" } ?? "")"
+    }
+
+    private func hostOnly(_ raw: String) -> String {
+        if let host = URL(string: raw)?.host?.lowercased() {
+            return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        }
+        return raw
+    }
+
+    private func relativeTime(_ visitedAtMs: Double) -> String {
+        let sec = max(0, Date().timeIntervalSince1970 - visitedAtMs / 1000.0)
+        if sec < 60 { return L10n.t("刚刚曾访问", "Visited just now") }
+        let mins = Int(sec / 60)
+        if mins < 60 { return L10n.t("\(mins)分钟前曾访问", "Visited \(mins)m ago") }
+        let hours = Int(sec / 3600)
+        if hours < 24 { return L10n.t("\(hours)小时前曾访问", "Visited \(hours)h ago") }
+        let days = Int(sec / 86400)
+        if days < 14 { return L10n.t("\(days)天前曾访问", "Visited \(days)d ago") }
+        let weeks = Int(days / 7)
+        return L10n.t("\(weeks)周前曾访问", "Visited \(weeks)w ago")
+    }
+
+    private func scoreMatch(queryLower: String, tokens: [String], title: String, url: String) -> Int {
+        let titleLow = title.lowercased()
+        let urlLow = url.lowercased()
+        let hostLow = hostOnly(url)
+        for tok in tokens {
+            if !titleLow.contains(tok) && !urlLow.contains(tok) {
+                return 0
+            }
+        }
+        var score = 15
+        if titleLow == queryLower || hostLow == queryLower { score += 120 }
+        else if hostLow.hasPrefix(queryLower) || titleLow.hasPrefix(queryLower) { score += 80 }
+        else if urlLow.contains("://\(queryLower)") || urlLow.contains(".\(queryLower)") { score += 55 }
+        else if titleLow.contains(queryLower) { score += 35 }
+        else if urlLow.contains(queryLower) { score += 25 }
+        return score
+    }
+
+    private func buildLocalCandidates(queryLower: String, tokens: [String]) -> (topHit: OmniboxCandidateEntry?, tabs: [OmniboxCandidateEntry], library: [OmniboxCandidateEntry]) {
+        var seen = Set<String>()
+
+        if queryLower.isEmpty {
+            var tabEntries: [OmniboxCandidateEntry] = []
+            for t in tabs where !t.isNewTab && t.id != activeTabId {
+                let k = normalizeKey(t.urlString)
+                if seen.contains(k) { continue }
+                seen.insert(k)
+                let host = hostOnly(t.urlString)
+                tabEntries.append(OmniboxCandidateEntry(
+                    id: "tab-\(t.id)",
+                    title: t.title.isEmpty ? host : t.title,
+                    url: t.urlString,
+                    subtitle: "\(host) · \(L10n.t("打开的标签页", "Open Tab"))",
+                    isBookmark: false,
+                    tabId: t.id,
+                    score: 50,
+                    visitedAt: 0
+                ))
+                if tabEntries.count >= 3 { break }
+            }
+            var libEntries: [OmniboxCandidateEntry] = []
+            for h in history {
+                let k = normalizeKey(h.url)
+                if seen.contains(k) { continue }
+                seen.insert(k)
+                let host = hostOnly(h.url)
+                libEntries.append(OmniboxCandidateEntry(
+                    id: "hist-\(h.id)",
+                    title: h.title.isEmpty ? host : h.title,
+                    url: h.url,
+                    subtitle: "\(host) · \(relativeTime(h.visitedAt))",
+                    isBookmark: false,
+                    tabId: nil,
+                    score: 20,
+                    visitedAt: h.visitedAt
+                ))
+                if libEntries.count >= 8 { break }
+            }
+            for bm in bookmarks where bm.type != "folder" {
+                if libEntries.count >= 10 { break }
+                let k = normalizeKey(bm.url)
+                if seen.contains(k) { continue }
+                seen.insert(k)
+                let host = hostOnly(bm.url)
+                libEntries.append(OmniboxCandidateEntry(
+                    id: "bm-\(bm.id)",
+                    title: bm.title.isEmpty ? host : bm.title,
+                    url: bm.url,
+                    subtitle: "\(host) · \(L10n.t("书签", "Bookmark"))",
+                    isBookmark: true,
+                    tabId: nil,
+                    score: 20,
+                    visitedAt: bm.createdAt
+                ))
+            }
+            return (nil, tabEntries, libEntries)
+        }
+
+        // Non-empty query: rank Top Hit + matching Open Tabs + Bookmarks & History
+        var scoredSites: [OmniboxCandidateEntry] = []
+        var tabMatches: [OmniboxCandidateEntry] = []
+
+        for t in tabs where !t.isNewTab {
+            let s = scoreMatch(queryLower: queryLower, tokens: tokens, title: t.title, url: t.urlString)
+            if s > 0 {
+                let host = hostOnly(t.urlString)
+                tabMatches.append(OmniboxCandidateEntry(
+                    id: "tab-\(t.id)",
+                    title: t.title.isEmpty ? host : t.title,
+                    url: t.urlString,
+                    subtitle: "\(host) · \(L10n.t("打开的标签页", "Open Tab"))",
+                    isBookmark: false,
+                    tabId: t.id,
+                    score: s + 8,
+                    visitedAt: Date().timeIntervalSince1970 * 1000
+                ))
+            }
+        }
+        tabMatches.sort { $0.score > $1.score }
+
+        for bm in bookmarks where bm.type != "folder" {
+            let s = scoreMatch(queryLower: queryLower, tokens: tokens, title: bm.title, url: bm.url)
+            if s > 0 {
+                let host = hostOnly(bm.url)
+                scoredSites.append(OmniboxCandidateEntry(
+                    id: "bm-\(bm.id)",
+                    title: bm.title.isEmpty ? host : bm.title,
+                    url: bm.url,
+                    subtitle: host,
+                    isBookmark: true,
+                    tabId: nil,
+                    score: s + 12,
+                    visitedAt: bm.createdAt
+                ))
+            }
+        }
+        for sc in shortcuts {
+            let s = scoreMatch(queryLower: queryLower, tokens: tokens, title: sc.title, url: sc.url)
+            if s > 0 {
+                let host = hostOnly(sc.url)
+                scoredSites.append(OmniboxCandidateEntry(
+                    id: "sc-\(sc.id)",
+                    title: sc.title.isEmpty ? host : sc.title,
+                    url: sc.url,
+                    subtitle: host,
+                    isBookmark: true,
+                    tabId: nil,
+                    score: s + 10,
+                    visitedAt: 0
+                ))
+            }
+        }
+        for h in history {
+            let s = scoreMatch(queryLower: queryLower, tokens: tokens, title: h.title, url: h.url)
+            if s > 0 {
+                let host = hostOnly(h.url)
+                scoredSites.append(OmniboxCandidateEntry(
+                    id: "hist-\(h.id)",
+                    title: h.title.isEmpty ? host : h.title,
+                    url: h.url,
+                    subtitle: "\(host) · \(relativeTime(h.visitedAt))",
+                    isBookmark: false,
+                    tabId: nil,
+                    score: s,
+                    visitedAt: h.visitedAt
+                ))
+            }
+        }
+        scoredSites.sort { ($0.score, $0.visitedAt) > ($1.score, $1.visitedAt) }
+
+        var topHit: OmniboxCandidateEntry? = nil
+        if let best = scoredSites.first, best.score >= 70 {
+            let host = hostOnly(best.url)
+            topHit = OmniboxCandidateEntry(
+                id: "top-\(best.id)",
+                title: best.title,
+                url: best.url,
+                subtitle: host,
+                isBookmark: best.isBookmark,
+                tabId: nil,
+                score: best.score,
+                visitedAt: best.visitedAt
+            )
+            seen.insert(normalizeKey(best.url))
+        }
+
+        var outTabs: [OmniboxCandidateEntry] = []
+        for t in tabMatches where t.tabId != activeTabId {
+            let k = normalizeKey(t.url)
+            if seen.contains(k) && topHit?.title.lowercased() == t.title.lowercased() { continue }
+            outTabs.append(t)
+            seen.insert(k)
+            if outTabs.count >= 2 { break }
+        }
+
+        var outLib: [OmniboxCandidateEntry] = []
+        for item in scoredSites {
+            let k = normalizeKey(item.url)
+            if seen.contains(k) { continue }
+            seen.insert(k)
+            let subtitle = item.isBookmark ? "\(hostOnly(item.url)) · \(L10n.t("书签", "Bookmark"))" : item.subtitle
+            outLib.append(OmniboxCandidateEntry(
+                id: item.id,
+                title: item.title,
+                url: item.url,
+                subtitle: subtitle,
+                isBookmark: item.isBookmark,
+                tabId: nil,
+                score: item.score,
+                visitedAt: item.visitedAt
+            ))
+            if outLib.count >= 6 { break }
+        }
+
+        return (topHit, outTabs, outLib)
     }
 }
 
