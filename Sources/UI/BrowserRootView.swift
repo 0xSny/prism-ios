@@ -126,9 +126,9 @@ struct BrowserRootView: View {
                     }
                 }
 
-                if let tab = currentTab, tab.pendingPasswordSave != nil {
-                    SavePasswordBanner {
-                        tabManager.savePendingPassword()
+                if let tab = currentTab, let pending = tab.pendingPasswordSave {
+                    SavePasswordBanner(initialUsername: pending.username) { editedUser in
+                        tabManager.savePendingPassword(usernameOverride: editedUser)
                     } onDismiss: {
                         tab.pendingPasswordSave = nil
                     }
@@ -346,16 +346,47 @@ struct WebViewRepresentable: UIViewRepresentable {
     @ObservedObject var tab: BrowserTab
     @ObservedObject var tabManager: TabManager
 
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
     func makeUIView(context: Context) -> WKWebView {
-        tabManager.ensureWebView(for: tab)
+        let wv = tabManager.ensureWebView(for: tab)
+        attachRefreshControl(to: wv, coordinator: context.coordinator)
+        return wv
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
         let target = tabManager.ensureWebView(for: tab)
+        attachRefreshControl(to: target, coordinator: context.coordinator)
         if uiView !== target, let superview = uiView.superview {
             target.frame = uiView.frame
             superview.insertSubview(target, aboveSubview: uiView)
             uiView.removeFromSuperview()
+        }
+    }
+
+    private func attachRefreshControl(to webView: WKWebView, coordinator: Coordinator) {
+        coordinator.webView = webView
+        webView.scrollView.bounces = true
+        if webView.scrollView.refreshControl == nil {
+            let rc = UIRefreshControl()
+            rc.addTarget(coordinator, action: #selector(Coordinator.handlePullToRefresh(_:)), for: .valueChanged)
+            webView.scrollView.refreshControl = rc
+        }
+    }
+
+    final class Coordinator: NSObject {
+        weak var webView: WKWebView?
+
+        @objc func handlePullToRefresh(_ sender: UIRefreshControl) {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            webView?.reload()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) {
+                if sender.isRefreshing {
+                    sender.endRefreshing()
+                }
+            }
         }
     }
 }
@@ -366,7 +397,6 @@ private struct OmniboxEditorSheet: View {
     let history: [HistoryItem]
     let onSubmit: (String) -> Void
     @Environment(\.dismiss) private var dismiss
-    @FocusState private var isFocused: Bool
 
     var body: some View {
         NavigationStack {
@@ -374,22 +404,20 @@ private struct OmniboxEditorSheet: View {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass")
                         .foregroundStyle(.secondary)
-                    TextField(L10n.t("输入网址或搜索词", "Search or type a URL"), text: $text)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                        .submitLabel(.go)
-                        .focused($isFocused)
-                        .onSubmit {
-                            onSubmit(text)
+                    SelectableAddressBar(
+                        text: $text,
+                        placeholder: L10n.t("输入网址或搜索词", "Search or type a URL"),
+                        onSubmit: { target in
+                            onSubmit(target)
+                        },
+                        onPasteAndGo: { target in
+                            onSubmit(target)
                         }
-                    if !text.isEmpty {
-                        Button { text = "" } label: {
-                            Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                        }
-                    }
+                    )
+                    .frame(height: 24)
                 }
-                .padding(12)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
                 .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .padding(.horizontal)
 
@@ -441,7 +469,6 @@ private struct OmniboxEditorSheet: View {
                     Button(L10n.t("取消", "Cancel")) { dismiss() }
                 }
             }
-            .onAppear { isFocused = true }
         }
     }
 }
@@ -525,19 +552,30 @@ private struct AutofillBar: View {
 }
 
 private struct SavePasswordBanner: View {
-    let onSave: () -> Void
+    let initialUsername: String
+    let onSave: (String) -> Void
     let onDismiss: () -> Void
+    @State private var editedUsername: String = ""
 
     var body: some View {
-        HStack {
+        HStack(spacing: 8) {
             Image(systemName: "key.fill").foregroundStyle(.indigo)
-            Text(L10n.t("保存密码并零知识云同步？", "Save & sync password?"))
-                .font(.caption.weight(.medium))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(L10n.t("保存密码并云同步？", "Save & sync password?"))
+                    .font(.caption.weight(.semibold))
+                TextField(L10n.t("账号/邮箱", "Username"), text: $editedUsername)
+                    .font(.caption2)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .onAppear { editedUsername = initialUsername }
+            }
             Spacer()
-            Button(L10n.t("保存", "Save"), action: onSave)
-                .font(.caption.weight(.bold))
-                .buttonStyle(.borderedProminent)
-                .controlSize(.mini)
+            Button(L10n.t("保存", "Save")) {
+                onSave(editedUsername)
+            }
+            .font(.caption.weight(.bold))
+            .buttonStyle(.borderedProminent)
+            .controlSize(.mini)
             Button(action: onDismiss) {
                 Image(systemName: "xmark").font(.caption)
             }

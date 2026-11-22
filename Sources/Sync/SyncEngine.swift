@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import UIKit
 
@@ -159,7 +160,7 @@ final class SyncEngine: ObservableObject {
                 "authKey": derived.authKey,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "0.6.0",
+                "appVersion": "0.7.0",
             ])
 
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -224,7 +225,7 @@ final class SyncEngine: ObservableObject {
                 "authKey": derived.authKey,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "0.6.0",
+                "appVersion": "0.7.0",
             ])
 
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -279,6 +280,190 @@ final class SyncEngine: ObservableObject {
         token = nil
         kdfSalt = nil
         encKey = nil
+    }
+
+    func sendResetCode(email rawEmail: String) async -> (Bool, String?) {
+        let cleanEmail = rawEmail.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let lang = L10n.isEnglish ? "en" : "zh"
+        guard let url = URL(string: "\(serverUrl)/api/auth/send-code") else { return (false, "Invalid URL") }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "email": cleanEmail,
+            "purpose": "reset",
+            "lang": lang,
+        ])
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let json = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+            if let http = resp as? HTTPURLResponse, http.statusCode >= 200 && http.statusCode < 300,
+               (json["ok"] as? Bool) == true {
+                return (true, nil)
+            }
+            return (false, (json["message"] as? String) ?? (json["error"] as? String) ?? L10n.t("发送重置验证码失败", "Failed to send reset code"))
+        } catch {
+            return (false, error.localizedDescription)
+        }
+    }
+
+    func generateRecoveryKey() async -> (Bool, String?) {
+        guard loggedIn, unlocked, let token, let encKey,
+              let url = URL(string: "\(serverUrl)/api/auth/recovery-backup") else {
+            return (false, L10n.t("需先登录并解锁", "Sign in first"))
+        }
+        let formattedKey = CryptoVault.generateRecoveryKey24()
+        let wrapKey = CryptoVault.deriveRecoveryWrapKey(recoveryKey: formattedKey, email: email)
+        struct EncWrap: Encodable {
+            let encKeyB64: String
+            let v: Int
+        }
+        guard let blob = try? CryptoVault.encryptJSON(EncWrap(encKeyB64: encKey.base64EncodedString(), v: 1), encKey: wrapKey) else {
+            return (false, "Encrypt recovery blob failed")
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "recoveryBlob": [
+                "iv": blob.iv,
+                "ciphertext": blob.ciphertext,
+                "tag": blob.tag,
+            ]
+        ])
+        do {
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+                return (true, formattedKey)
+            }
+            return (false, "HTTP error")
+        } catch {
+            return (false, error.localizedDescription)
+        }
+    }
+
+    func resetPassword(email rawEmail: String, code: String, newPassword: String, recoveryKey: String) async -> Bool {
+        lastError = nil
+        let cleanEmail = rawEmail.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let cleanCode = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newSalt = CryptoVault.generateSaltBase64Url()
+        do {
+            let newDerived = try await Task.detached(priority: .userInitiated) {
+                try CryptoVault.deriveKeys(masterPassword: newPassword, kdfSalt: newSalt)
+            }.value
+
+            var bodyDict: [String: Any] = [
+                "email": cleanEmail,
+                "verificationCode": cleanCode,
+                "newKdfSalt": newSalt,
+                "newAuthKey": newDerived.authKey,
+                "wipeOldCiphertext": true,
+                "deviceName": UIDevice.current.name,
+                "platform": "ios",
+                "appVersion": "0.7.0",
+            ]
+
+            let cleanRec = recoveryKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleanRec.isEmpty, let prepUrl = URL(string: "\(serverUrl)/api/auth/reset-prepare") {
+                var prepReq = URLRequest(url: prepUrl)
+                prepReq.httpMethod = "POST"
+                prepReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                prepReq.httpBody = try JSONSerialization.data(withJSONObject: [
+                    "email": cleanEmail,
+                    "verificationCode": cleanCode,
+                ])
+                let (pData, pResp) = try await URLSession.shared.data(for: prepReq)
+                struct PrepItem: Decodable {
+                    let scope: String
+                    let itemId: String
+                    let iv: String
+                    let ciphertext: String
+                    let tag: String
+                    let deleted: Bool
+                    let updatedAt: Double
+                }
+                struct PrepResp: Decodable {
+                    let ok: Bool
+                    let recoveryBlob: EncryptedEnvelope?
+                    let items: [PrepItem]?
+                }
+                if let pHttp = pResp as? HTTPURLResponse, pHttp.statusCode == 200,
+                   let prep = try? JSONDecoder().decode(PrepResp.self, from: pData),
+                   let blob = prep.recoveryBlob {
+                    struct DecWrap: Decodable { let encKeyB64: String }
+                    struct EncWrap: Encodable { let encKeyB64: String; let v: Int }
+                    let wrapKey = CryptoVault.deriveRecoveryWrapKey(recoveryKey: cleanRec, email: cleanEmail)
+                    let dec = try CryptoVault.decryptJSON(DecWrap.self, encKey: wrapKey, ivB64: blob.iv, ciphertextB64: blob.ciphertext, tagB64: blob.tag)
+                    if let oldKey = Data(base64Encoded: dec.encKeyB64), oldKey.count == 32 {
+                        // Migrate encrypted sync items locally cleanly via AES-256-GCM
+                        var migrated: [[String: Any]] = []
+                        let nKey = SymmetricKey(data: newDerived.encKey)
+                        let oKey = SymmetricKey(data: oldKey)
+                        for it in (prep.items ?? []) {
+                            if let ivD = Data(base64Encoded: it.iv), let ctD = Data(base64Encoded: it.ciphertext), let tagD = Data(base64Encoded: it.tag),
+                               let nonce = try? AES.GCM.Nonce(data: ivD),
+                               let box = try? AES.GCM.SealedBox(nonce: nonce, ciphertext: ctD, tag: tagD),
+                               let plain = try? AES.GCM.open(box, using: oKey),
+                               let resealed = try? AES.GCM.seal(plain, using: nKey) {
+                                migrated.append([
+                                    "scope": it.scope,
+                                    "itemId": it.itemId,
+                                    "iv": resealed.nonce.withUnsafeBytes { Data($0) }.base64EncodedString(),
+                                    "ciphertext": resealed.ciphertext.base64EncodedString(),
+                                    "tag": resealed.tag.base64EncodedString(),
+                                    "deleted": it.deleted,
+                                    "updatedAt": it.updatedAt,
+                                ])
+                            }
+                        }
+                        if let newBlob = try? CryptoVault.encryptJSON(EncWrap(encKeyB64: newDerived.encKey.base64EncodedString(), v: 1), encKey: wrapKey) {
+                            bodyDict["newRecoveryBlob"] = ["iv": newBlob.iv, "ciphertext": newBlob.ciphertext, "tag": newBlob.tag]
+                        }
+                        bodyDict["migratedItems"] = migrated
+                        bodyDict["wipeOldCiphertext"] = false
+                    }
+                }
+            }
+
+            guard let resetUrl = URL(string: "\(serverUrl)/api/auth/reset-password") else { return false }
+            var req = URLRequest(url: resetUrl)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict)
+
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let json = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let token = json["token"] as? String,
+                  let user = json["user"] as? [String: Any] else {
+                lastError = (json["error"] as? String) ?? L10n.t("重置失败", "Reset failed")
+                return false
+            }
+
+            let device = json["device"] as? [String: Any]
+            let devId = (device?["id"] as? String) ?? UUID().uuidString
+            let uid = (user["id"] as? String) ?? ""
+            let session = AccountSessionDisk(
+                serverUrl: serverUrl,
+                token: token,
+                email: cleanEmail,
+                userId: uid,
+                kdfSalt: newSalt,
+                deviceId: devId,
+                deviceName: UIDevice.current.name,
+                lastSyncedAt: nil,
+                lastPulledAt: 0,
+                encKeyB64: newDerived.encKey.base64EncodedString()
+            )
+            applyAuthenticatedSession(session, encKey: newDerived.encKey)
+            dirtyScopes.formUnion(["passwords", "bookmarks", "home_shortcuts", "profiles", "settings"])
+            await syncNow(forceFullPull: true)
+            return true
+        } catch {
+            lastError = error.localizedDescription
+            return false
+        }
     }
 
     private func verifySession() async {

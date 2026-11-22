@@ -136,7 +136,7 @@ struct MenuSheetView: View {
                     }
                 }
             }
-            .navigationTitle("Prism v0.6.0")
+            .navigationTitle("Prism v0.7.0")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -177,9 +177,12 @@ private struct QuickMenuTile: View {
 struct AccountSheetView: View {
     @ObservedObject var syncEngine: SyncEngine
     @State private var isRegister = false
+    @State private var isResetMode = false
     @State private var email = ""
     @State private var password = ""
     @State private var otpCode = ""
+    @State private var recoveryKeyInput = ""
+    @State private var generatedRecoveryKey: String?
     @State private var codeCountdown = 0
     @State private var customMinutes = "10"
     @State private var busy = false
@@ -247,30 +250,54 @@ struct AccountSheetView: View {
                     }
 
                     Section {
+                        Button(L10n.t("🗝️ 生成 / 备份 24 位恢复密钥", "🗝️ Generate 24-Char Recovery Key")) {
+                            Task {
+                                let (ok, res) = await syncEngine.generateRecoveryKey()
+                                if ok, let key = res {
+                                    generatedRecoveryKey = key
+                                    UIPasteboard.general.string = key
+                                    statusMessage = L10n.t("已复制 24 位恢复密钥到剪贴板，请妥善保存！", "Recovery key copied!")
+                                } else {
+                                    statusMessage = res
+                                }
+                            }
+                        }
+                        if let rec = generatedRecoveryKey {
+                            Text(rec)
+                                .font(.caption.monospaced().bold())
+                                .textSelection(.enabled)
+                        }
+                        if let msg = statusMessage {
+                            Text(msg).font(.caption).foregroundStyle(.blue)
+                        }
                         Button(L10n.t("退出登录", "Sign Out"), role: .destructive) {
                             syncEngine.logout()
                         }
                     }
                 } else {
-                    Section {
-                        Picker("", selection: $isRegister) {
-                            Text(L10n.t("登录", "Sign In")).tag(false)
-                            Text(L10n.t("注册账号", "Create Account")).tag(true)
+                    if !isResetMode {
+                        Section {
+                            Picker("", selection: $isRegister) {
+                                Text(L10n.t("登录", "Sign In")).tag(false)
+                                Text(L10n.t("注册账号", "Create Account")).tag(true)
+                            }
+                            .pickerStyle(.segmented)
                         }
-                        .pickerStyle(.segmented)
                     }
                     Section {
                         TextField(L10n.t("邮箱地址", "Email"), text: $email)
                             .keyboardType(.emailAddress)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
-                        if isRegister {
+                        if isRegister || isResetMode {
                             HStack {
                                 TextField(L10n.t("6 位邮箱验证码", "6-digit code"), text: $otpCode)
                                     .keyboardType(.numberPad)
                                 Button(codeCountdown > 0 ? "\(codeCountdown)s" : L10n.t("发送验证码", "Send Code")) {
                                     Task {
-                                        let (ok, err) = await syncEngine.sendVerificationCode(email: email)
+                                        let (ok, err) = isResetMode
+                                            ? await syncEngine.sendResetCode(email: email)
+                                            : await syncEngine.sendVerificationCode(email: email)
                                         statusMessage = ok ? L10n.t("验证码已发送至邮箱", "Code sent") : err
                                         if ok { startCountdown() }
                                     }
@@ -278,9 +305,22 @@ struct AccountSheetView: View {
                                 .disabled(codeCountdown > 0 || email.isEmpty)
                             }
                         }
-                        SecureField(L10n.t("主密码 (零知识端到端密钥)", "Master Password"), text: $password)
+                        SecureField(
+                            isResetMode ? L10n.t("设置新主密码", "New Master Password") : L10n.t("主密码 (零知识端到端密钥)", "Master Password"),
+                            text: $password
+                        )
+                        if isResetMode {
+                            TextField(L10n.t("24 位恢复密钥（选填）", "24-char recovery key (optional)"), text: $recoveryKeyInput)
+                                .font(.caption.monospaced())
+                                .textInputAutocapitalization(.characters)
+                                .autocorrectionDisabled()
+                        }
                     } footer: {
-                        Text(L10n.t("PBKDF2 600,000 次 + HKDF + AES-256-GCM 本地加密，与桌面端密钥完全互通。", "PBKDF2 600k + HKDF + AES-256-GCM zero-knowledge sync compatible with Windows."))
+                        Text(
+                            isResetMode
+                                ? L10n.t("未填恢复密钥将重置云端旧密文；若填写可无损迁移云端数据。", "Leave recovery key blank to reset cloud vault; provide key for lossless migration.")
+                                : L10n.t("PBKDF2 600,000 次 + HKDF + AES-256-GCM 本地加密，与桌面端密钥完全互通。", "PBKDF2 600k + HKDF + AES-256-GCM zero-knowledge sync compatible with Windows.")
+                        )
                     }
                     if let msg = syncEngine.lastError ?? statusMessage {
                         Text(msg).font(.caption).foregroundStyle(.red)
@@ -288,9 +328,14 @@ struct AccountSheetView: View {
                     Button {
                         Task {
                             busy = true
-                            let ok = isRegister
-                                ? await syncEngine.register(email: email, password: password, code: otpCode)
-                                : await syncEngine.login(email: email, password: password)
+                            let ok: Bool
+                            if isResetMode {
+                                ok = await syncEngine.resetPassword(email: email, code: otpCode, newPassword: password, recoveryKey: recoveryKeyInput)
+                            } else if isRegister {
+                                ok = await syncEngine.register(email: email, password: password, code: otpCode)
+                            } else {
+                                ok = await syncEngine.login(email: email, password: password)
+                            }
                             busy = false
                             if ok { dismiss() }
                         }
@@ -298,12 +343,24 @@ struct AccountSheetView: View {
                         HStack {
                             Spacer()
                             if busy { ProgressView() }
-                            Text(isRegister ? L10n.t("创建零知识账户", "Create Account") : L10n.t("登录并解锁同步", "Sign In & Sync"))
-                                .fontWeight(.semibold)
+                            Text(
+                                isResetMode
+                                    ? L10n.t("验证并重置主密码", "Verify & Reset Password")
+                                    : (isRegister ? L10n.t("创建零知识账户", "Create Account") : L10n.t("登录并解锁同步", "Sign In & Sync"))
+                            )
+                            .fontWeight(.semibold)
                             Spacer()
                         }
                     }
                     .disabled(busy || email.isEmpty || password.count < 6)
+
+                    if !isRegister {
+                        Button(isResetMode ? L10n.t("返回登录", "Back to Sign In") : L10n.t("忘记主密码？", "Forgot master password?")) {
+                            isResetMode.toggle()
+                            statusMessage = nil
+                        }
+                        .font(.caption)
+                    }
                 }
             }
             .navigationTitle("Prism Account")

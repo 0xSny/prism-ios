@@ -281,10 +281,13 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         }
     }
 
-    func savePendingPassword() {
+    func savePendingPassword(usernameOverride: String? = nil) {
         guard let tab = activeTab, let pending = tab.pendingPasswordSave, let syncEngine else { return }
+        let finalUser = (usernameOverride?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? (usernameOverride ?? pending.username)
+            : pending.username
         let now = Date().timeIntervalSince1970 * 1000
-        if let idx = syncEngine.passwords.firstIndex(where: { $0.origin == pending.origin && $0.username == pending.username }) {
+        if let idx = syncEngine.passwords.firstIndex(where: { $0.origin == pending.origin && $0.username == finalUser }) {
             syncEngine.passwords[idx].password = pending.password
             syncEngine.passwords[idx].updatedAt = now
         } else {
@@ -292,7 +295,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
                 PasswordEntry(
                     id: UUID().uuidString,
                     origin: pending.origin,
-                    username: pending.username,
+                    username: finalUser,
                     password: pending.password,
                     note: nil,
                     createdAt: now,
@@ -389,6 +392,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        webView.scrollView.refreshControl?.endRefreshing()
         syncWebViewState(webView)
         guard let tab = tabs.first(where: { $0.webView === webView }),
               let urlStr = webView.url?.absoluteString,
@@ -408,6 +412,16 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             }
             syncEngine.notifyScopeDirty("history")
         }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        webView.scrollView.refreshControl?.endRefreshing()
+        syncWebViewState(webView)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        webView.scrollView.refreshControl?.endRefreshing()
+        syncWebViewState(webView)
     }
 
     func syncWebViewState(_ webView: WKWebView) {

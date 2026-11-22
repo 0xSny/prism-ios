@@ -119,6 +119,30 @@ enum CryptoVault {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
+    static func generateRecoveryKey24() -> String {
+        let alphabet = Array("ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
+        var bytes = [UInt8](repeating: 0, count: 24)
+        _ = SecRandomCopyBytes(kSecRandomDefault, 24, &bytes)
+        let raw = bytes.map { alphabet[Int($0) % alphabet.count] }
+        return stride(from: 0, to: 24, by: 4)
+            .map { String(raw[$0..<min($0 + 4, 24)]) }
+            .joined(separator: "-")
+    }
+
+    static func deriveRecoveryWrapKey(recoveryKey: String, email: String) -> Data {
+        let cleaned = recoveryKey
+            .uppercased()
+            .filter { $0.isLetter || $0.isNumber }
+        let sha = Data(SHA256.hash(data: Data(cleaned.utf8)))
+        let sym = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: sha),
+            salt: Data("prism-recovery-wrap-v1".utf8),
+            info: Data(email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().utf8),
+            outputByteCount: keyLengthBytes
+        )
+        return sym.withUnsafeBytes { Data($0) }
+    }
+
     static func base64UrlEncode(_ data: Data) -> String {
         data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")

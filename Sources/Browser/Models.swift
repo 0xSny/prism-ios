@@ -93,6 +93,14 @@ struct HomeShortcut: Identifiable, Codable, Equatable {
     var order: Int
 }
 
+struct WeatherLocationConfig: Codable, Equatable {
+    var name: String = "北京"
+    var latitude: Double = 39.9042
+    var longitude: Double = 116.4074
+    var autoLocate: Bool = true
+    var unit: String = "C" // "C" | "F"
+}
+
 struct HomeConfig: Codable, Equatable {
     var showGreeting: Bool = false
     var showShortcuts: Bool = true
@@ -100,6 +108,7 @@ struct HomeConfig: Codable, Equatable {
     var backgroundMode: String = "solid"
     var backgroundImageDataUrl: String?
     var themeAccentColor: String? = "#ffffff"
+    var weatherLocation: WeatherLocationConfig? = WeatherLocationConfig()
     var shortcuts: [HomeShortcut] = HomeConfig.defaultShortcuts
 
     static let defaultShortcuts: [HomeShortcut] = [

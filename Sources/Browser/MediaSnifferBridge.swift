@@ -134,26 +134,91 @@ enum MediaSnifferScripts {
         return false;
       };
 
-      // Password field focus & form submission detection
+      // Bulletproof Password field focus, input tracking & capture (eye-toggle & multi-step friendly)
+      const knownPwInputs = new WeakSet();
+      let liveCred = { origin: location.origin, username: '', password: '', updatedAt: 0 };
+
+      const readSavedUser = () => {
+        try {
+          const raw = sessionStorage.getItem('__prism_last_user');
+          if (!raw) return '';
+          const parsed = JSON.parse(raw);
+          if (parsed && parsed.u && Date.now() - parsed.t < 180000) return String(parsed.u);
+        } catch (e) {}
+        return '';
+      };
+
+      const saveTempUser = (u) => {
+        if (!u) return;
+        try { sessionStorage.setItem('__prism_last_user', JSON.stringify({ u, t: Date.now() })); } catch (e) {}
+      };
+
+      const findVisibleUserNear = (anchor) => {
+        const root = (anchor && anchor.closest && anchor.closest('form')) || document.body || document;
+        const inputs = Array.from(root.querySelectorAll('input'));
+        for (const el of inputs) {
+          if (el === anchor || el.type === 'password' || el.type === 'hidden' || knownPwInputs.has(el)) continue;
+          const v = (el.value || '').trim();
+          if (v && (el.type === 'email' || el.type === 'text' || el.type === 'tel' || /user|email|mail|login|name|account/i.test((el.name || '') + (el.id || '') + (el.autocomplete || '')))) {
+            return v;
+          }
+        }
+        return readSavedUser();
+      };
+
+      const flushCredential = (anchor) => {
+        const root = (anchor && anchor.closest && anchor.closest('form')) || document.body || document;
+        let pwEl = null;
+        for (const el of root.querySelectorAll('input')) {
+          if ((el.type === 'password' || knownPwInputs.has(el)) && el.value) {
+            pwEl = el;
+            break;
+          }
+        }
+        const pwVal = pwEl ? pwEl.value : (Date.now() - liveCred.updatedAt < 15000 ? liveCred.password : '');
+        if (!pwVal) return;
+        const userVal = findVisibleUserNear(pwEl || anchor) || liveCred.username || '';
+        post('passwordCapture', { origin: location.origin, username: userVal, password: pwVal });
+        liveCred.password = '';
+      };
+
       document.addEventListener('focusin', (e) => {
         const t = e.target;
-        if (t && t.tagName === 'INPUT' && (t.type === 'password' || /user|email|login/i.test(t.name + t.id + t.autocomplete))) {
+        if (!t || t.tagName !== 'INPUT') return;
+        if (t.type === 'password') knownPwInputs.add(t);
+        if (t.type === 'password' || knownPwInputs.has(t) || /user|email|login/i.test((t.name || '') + (t.id || '') + (t.autocomplete || ''))) {
           post('passwordFocus', { origin: location.origin });
         }
       }, true);
 
-      document.addEventListener('submit', (e) => {
-        const form = e.target;
-        if (!form || !form.querySelector) return;
-        const pw = form.querySelector('input[type="password"]');
-        if (!pw || !pw.value) return;
-        const userEl = form.querySelector('input[type="email"], input[type="text"], input[name*="user"], input[name*="email"]');
-        post('passwordCapture', {
-          origin: location.origin,
-          username: userEl ? (userEl.value || '') : '',
-          password: pw.value
-        });
+      document.addEventListener('input', (e) => {
+        const t = e.target;
+        if (!t || t.tagName !== 'INPUT') return;
+        if (t.type === 'password' || knownPwInputs.has(t)) {
+          knownPwInputs.add(t);
+          if (t.value) {
+            liveCred = {
+              origin: location.origin,
+              username: findVisibleUserNear(t) || liveCred.username,
+              password: t.value,
+              updatedAt: Date.now()
+            };
+          }
+        } else if (t.value && /email|user|login|tel|text/i.test((t.type || '') + (t.name || '') + (t.id || '') + (t.autocomplete || ''))) {
+          saveTempUser(t.value.trim());
+          liveCred.username = t.value.trim();
+        }
       }, true);
+
+      document.addEventListener('submit', (e) => { flushCredential(e.target); }, true);
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && e.target && e.target.tagName === 'INPUT') flushCredential(e.target);
+      }, true);
+      document.addEventListener('click', (e) => {
+        const btn = e.target && e.target.closest && e.target.closest('button, input[type="submit"], input[type="button"], [role="button"], a[href^="javascript"]');
+        if (btn) flushCredential(btn);
+      }, true);
+      window.addEventListener('pagehide', () => { flushCredential(null); }, true);
     })();
     """
 
