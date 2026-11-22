@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import UIKit
 import WebKit
@@ -630,7 +631,7 @@ private final class OmniboxRemoteSuggester: ObservableObject {
             if let direct = try? JSONSerialization.jsonObject(with: data) {
                 parsedObj = direct
             } else if engine == .baidu {
-                let cfEnc = CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue))
+                let cfEnc = CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(0x0632))
                 if let gbkStr = String(data: data, encoding: String.Encoding(rawValue: cfEnc)),
                    let utf8Data = gbkStr.data(using: .utf8) {
                     parsedObj = try? JSONSerialization.jsonObject(with: utf8Data)
@@ -678,6 +679,10 @@ private struct OmniboxEditorSheet: View {
     @StateObject private var remoteSuggester = OmniboxRemoteSuggester()
 
     var body: some View {
+        buildBody()
+    }
+
+    private func buildBody() -> some View {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let q = trimmed.lowercased()
         let tokens = q.split(whereSeparator: { $0.isWhitespace }).map(String.init)
@@ -687,7 +692,7 @@ private struct OmniboxEditorSheet: View {
         let libraryItems = ranked.library
         let remoteList = buildRemoteSearchList(trimmed: trimmed, rawLower: q, remote: remoteSuggester.suggestions)
 
-        NavigationStack {
+        return NavigationStack {
             VStack(spacing: 10) {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass")
@@ -810,7 +815,7 @@ private struct OmniboxEditorSheet: View {
                                                     .font(.system(size: 13))
                                                     .foregroundStyle(.secondary)
                                             }
-                                            Text(highlightedSuggestion(term: term, query: trimmed))
+                                            highlightedSuggestionText(term: term, query: trimmed)
                                                 .lineLimit(1)
                                             Spacer(minLength: 0)
                                         }
@@ -919,27 +924,17 @@ private struct OmniboxEditorSheet: View {
         return out
     }
 
-    private func highlightedSuggestion(term: String, query: String) -> AttributedString {
-        var attr = AttributedString(term)
+    private func highlightedSuggestionText(term: String, query: String) -> Text {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else {
-            attr.foregroundColor = .primary
-            return attr
+        guard !q.isEmpty, let range = term.range(of: q, options: .caseInsensitive) else {
+            return Text(term).foregroundColor(.primary)
         }
-        if term.lowercased().hasPrefix(q.lowercased()), let endIdx = attr.index(attr.startIndex, offsetByCharacters: min(q.count, term.count)) as AttributedString.Index? {
-            attr.foregroundColor = .secondary
-            attr[attr.startIndex..<endIdx].foregroundColor = .primary
-            attr[attr.startIndex..<endIdx].font = .body.weight(.semibold)
-            return attr
-        }
-        if let range = attr.range(of: q, options: [.caseInsensitive]) {
-            attr.foregroundColor = .secondary
-            attr[range].foregroundColor = .primary
-            attr[range].font = .body.weight(.semibold)
-            return attr
-        }
-        attr.foregroundColor = .primary
-        return attr
+        let before = String(term[..<range.lowerBound])
+        let match = String(term[range])
+        let after = String(term[range.upperBound...])
+        return Text(before).foregroundColor(.secondary)
+            + Text(match).fontWeight(.semibold).foregroundColor(.primary)
+            + Text(after).foregroundColor(.secondary)
     }
 
     private func normalizeKey(_ raw: String) -> String {
