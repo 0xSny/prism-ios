@@ -147,12 +147,12 @@ struct BrowserRootView: View {
                     }
                 }
 
-                // Video Quick Control Strip (Desktop Handoff only; PiP & Speed moved into More menu)
-                if let tab = currentTab, tab.hasVideo && !tab.isNewTab {
+                // Always-visible Floating Handoff Pill above Dock on every non-newTab webpage
+                if let tab = currentTab, !tab.isNewTab {
                     VideoMiniStrip(tab: tab, handoffService: handoffService, syncEngine: syncEngine, tabManager: tabManager) {
                         activeSheet = .account
                     }
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .transition(.scale(scale: 0.94).combined(with: .opacity))
                 }
 
                 // Single-Hand 52pt Bottom Thumb Dock
@@ -247,31 +247,31 @@ struct BrowserRootView: View {
                     canFindInPage: !(currentTab?.isNewTab ?? true),
                     onSubmit: { target in
                         tabManager.navigateActive(target)
-                        withAnimation(.spring(response: 0.24, dampingFraction: 0.88)) {
+                        withAnimation(.easeOut(duration: 0.14)) {
                             showOmniboxEditor = false
                         }
                     },
                     onSelectTab: { tabId in
                         tabManager.activateTab(id: tabId)
-                        withAnimation(.spring(response: 0.24, dampingFraction: 0.88)) {
+                        withAnimation(.easeOut(duration: 0.14)) {
                             showOmniboxEditor = false
                         }
                     },
                     onFindInPage: { query in
-                        withAnimation(.easeOut(duration: 0.16)) {
+                        withAnimation(.easeOut(duration: 0.14)) {
                             showOmniboxEditor = false
                         }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
                             tabManager.findInActivePage(query)
                         }
                     },
                     onDismiss: {
-                        withAnimation(.spring(response: 0.24, dampingFraction: 0.88)) {
+                        withAnimation(.easeOut(duration: 0.14)) {
                             showOmniboxEditor = false
                         }
                     }
                 )
-                .transition(.opacity.combined(with: .move(edge: .bottom)))
+                .transition(.opacity)
                 .zIndex(50)
             }
         }
@@ -437,39 +437,6 @@ private struct BottomThumbDock: View {
                         }
                     }
             )
-
-            // Quick One-Tap Desktop Handoff / 桌面续播 directly on Bottom Dock for any webpage
-            if let tab = activeTab, !tab.isNewTab {
-                Button {
-                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    guard syncEngine.loggedIn else {
-                        tabManager.showToast(L10n.t("请先登录 Prism Account 使用桌面续播", "Sign in to Prism Account to continue on desktop"))
-                        onRequireAccount()
-                        return
-                    }
-                    Task {
-                        let ok = await handoffService.push(
-                            kind: tab.hasVideo ? "video" : "tab",
-                            title: tab.title,
-                            url: tab.urlString,
-                            videoSeconds: tab.hasVideo ? tab.videoSeconds : 0,
-                            syncEngine: syncEngine
-                        )
-                        tabManager.showToast(
-                            ok
-                                ? (tab.hasVideo
-                                    ? L10n.t("已带进度接力至桌面端", "Sent video to desktop")
-                                    : L10n.t("已推送当前网页至桌面端", "Sent page to desktop"))
-                                : L10n.t("发送失败", "Failed")
-                        )
-                    }
-                } label: {
-                    Image(systemName: "laptopcomputer")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(tab.hasVideo ? Color.indigo : Color.primary)
-                        .frame(width: 28, height: 36)
-                }
-            }
 
             // Tab Count Badge
             Button(action: onOpenTabs) {
@@ -733,9 +700,30 @@ private struct OmniboxInlineOverlay: View {
     @StateObject private var remoteSuggester = OmniboxRemoteSuggester()
     @State private var pageMatchCount: Int?
     @State private var findCountTask: Task<Void, Never>?
+    @State private var keyboardHeight: CGFloat = 0
+    @State private var isDismissing: Bool = false
 
     var body: some View {
         buildBody()
+    }
+
+    private func currentKeyboardOverlap(for endFrame: CGRect) -> CGFloat {
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        let screenHeight = scene?.screen.bounds.height ?? UIScreen.main.bounds.height
+        let safeBottom = scene?.windows.first { $0.isKeyWindow }?.safeAreaInsets.bottom ?? 0
+        return max(0, screenHeight - endFrame.origin.y - safeBottom)
+    }
+
+    private func triggerSmoothClose(after action: @escaping () -> Void) {
+        guard !isDismissing else { return }
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        withAnimation(.timingCurve(0.22, 1.0, 0.36, 1.0, duration: 0.24)) {
+            isDismissing = true
+            keyboardHeight = 0
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
+            action()
+        }
     }
 
     private func buildBody() -> some View {
@@ -752,7 +740,8 @@ private struct OmniboxInlineOverlay: View {
             Rectangle()
                 .fill(.regularMaterial)
                 .ignoresSafeArea()
-                .onTapGesture { onDismiss() }
+                .opacity(isDismissing ? 0 : 1)
+                .onTapGesture { triggerSmoothClose { onDismiss() } }
 
             VStack(spacing: 0) {
                 ScrollView(.vertical, showsIndicators: true) {
@@ -763,9 +752,9 @@ private struct OmniboxInlineOverlay: View {
                                 if let hit = topHit {
                                     Button {
                                         if let tid = hit.tabId {
-                                            onSelectTab(tid)
+                                            triggerSmoothClose { onSelectTab(tid) }
                                         } else {
-                                            onSubmit(hit.url)
+                                            triggerSmoothClose { onSubmit(hit.url) }
                                         }
                                     } label: {
                                         HStack(spacing: 12) {
@@ -803,9 +792,9 @@ private struct OmniboxInlineOverlay: View {
                                     ForEach(matchedTabs) { item in
                                         Button {
                                             if let tid = item.tabId {
-                                                onSelectTab(tid)
+                                                triggerSmoothClose { onSelectTab(tid) }
                                             } else {
-                                                onSubmit(item.url)
+                                                triggerSmoothClose { onSubmit(item.url) }
                                             }
                                         } label: {
                                             HStack(spacing: 12) {
@@ -845,7 +834,11 @@ private struct OmniboxInlineOverlay: View {
                                     .padding(.horizontal, 12)
                                 ForEach(matchedTabs) { item in
                                     Button {
-                                        if let tid = item.tabId { onSelectTab(tid) } else { onSubmit(item.url) }
+                                        if let tid = item.tabId {
+                                            triggerSmoothClose { onSelectTab(tid) }
+                                        } else {
+                                            triggerSmoothClose { onSubmit(item.url) }
+                                        }
                                     } label: {
                                         HStack(spacing: 12) {
                                             ZStack {
@@ -888,7 +881,7 @@ private struct OmniboxInlineOverlay: View {
                                 ForEach(remoteList, id: \.self) { term in
                                     HStack(spacing: 10) {
                                         Button {
-                                            onSubmit(term)
+                                            triggerSmoothClose { onSubmit(term) }
                                         } label: {
                                             HStack(spacing: 12) {
                                                 ZStack {
@@ -939,7 +932,7 @@ private struct OmniboxInlineOverlay: View {
 
                                 ForEach(libraryItems) { item in
                                     Button {
-                                        onSubmit(item.url)
+                                        triggerSmoothClose { onSubmit(item.url) }
                                     } label: {
                                         HStack(spacing: 12) {
                                             ZStack {
@@ -986,7 +979,7 @@ private struct OmniboxInlineOverlay: View {
                                     .padding(.horizontal, 12)
 
                                 Button {
-                                    onFindInPage(trimmed)
+                                    triggerSmoothClose { onFindInPage(trimmed) }
                                 } label: {
                                     HStack(spacing: 12) {
                                         ZStack {
@@ -1015,6 +1008,8 @@ private struct OmniboxInlineOverlay: View {
                     .padding(.bottom, 12)
                 }
                 .scrollDismissesKeyboard(.interactively)
+                .opacity(isDismissing ? 0 : 1)
+                .offset(y: isDismissing ? 16 : 0)
 
                 // Docked Bottom Search Capsule + Circular [×] Cancel Button directly under Candidates
                 HStack(spacing: 10) {
@@ -1026,10 +1021,10 @@ private struct OmniboxInlineOverlay: View {
                             text: $text,
                             placeholder: L10n.t("搜索或输入网址", "Search or enter website name"),
                             onSubmit: { target in
-                                onSubmit(target)
+                                triggerSmoothClose { onSubmit(target) }
                             },
                             onPasteAndGo: { target in
-                                onSubmit(target)
+                                triggerSmoothClose { onSubmit(target) }
                             }
                         )
                         .frame(height: 24)
@@ -1055,7 +1050,9 @@ private struct OmniboxInlineOverlay: View {
                         Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
                     )
 
-                    Button(action: onDismiss) {
+                    Button {
+                        triggerSmoothClose { onDismiss() }
+                    } label: {
                         Image(systemName: "xmark")
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundStyle(.primary)
@@ -1073,7 +1070,21 @@ private struct OmniboxInlineOverlay: View {
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, 6)
-                .padding(.bottom, 10)
+                .padding(.bottom, isDismissing ? 10 : max(10, keyboardHeight + 6))
+            }
+        }
+        .ignoresSafeArea(.keyboard, edges: .bottom)
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
+            guard !isDismissing,
+                  let endFrame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+            let overlap = currentKeyboardOverlap(for: endFrame)
+            withAnimation(.interpolatingSpring(stiffness: 360, damping: 32)) {
+                keyboardHeight = overlap
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            withAnimation(.timingCurve(0.22, 1.0, 0.36, 1.0, duration: 0.24)) {
+                keyboardHeight = 0
             }
         }
         .onAppear {
@@ -1430,13 +1441,19 @@ private struct VideoMiniStrip: View {
             }
             Task {
                 let ok = await handoffService.push(
-                    kind: "video",
+                    kind: tab.hasVideo ? "video" : "tab",
                     title: tab.title,
                     url: tab.urlString,
-                    videoSeconds: tab.videoSeconds,
+                    videoSeconds: tab.hasVideo ? tab.videoSeconds : 0,
                     syncEngine: syncEngine
                 )
-                tabManager.showToast(ok ? L10n.t("已带进度接力至桌面端", "Sent video to desktop") : L10n.t("发送失败", "Failed"))
+                tabManager.showToast(
+                    ok
+                        ? (tab.hasVideo
+                            ? L10n.t("已带进度接力至桌面端", "Sent video to desktop")
+                            : L10n.t("已推送当前网页至桌面端", "Sent page to desktop"))
+                        : L10n.t("发送失败", "Failed")
+                )
             }
         } label: {
             Label(L10n.t("桌面续播", "Continue on Desktop"), systemImage: "laptopcomputer")

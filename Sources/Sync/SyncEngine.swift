@@ -2,6 +2,10 @@ import CryptoKit
 import Foundation
 import UIKit
 
+extension Notification.Name {
+    static let prismSyncSessionChanged = Notification.Name("PrismSyncSessionChanged")
+}
+
 @MainActor
 final class SyncEngine: ObservableObject {
     static let defaultServerUrl = "https://prism.zzaoo.com"
@@ -160,7 +164,7 @@ final class SyncEngine: ObservableObject {
                 "authKey": derived.authKey,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.0.6",
+                "appVersion": "1.0.7",
             ])
 
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -225,7 +229,7 @@ final class SyncEngine: ObservableObject {
                 "authKey": derived.authKey,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.0.6",
+                "appVersion": "1.0.7",
             ])
 
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -280,6 +284,7 @@ final class SyncEngine: ObservableObject {
         token = nil
         kdfSalt = nil
         encKey = nil
+        NotificationCenter.default.post(name: .prismSyncSessionChanged, object: nil)
     }
 
     func sendResetCode(email rawEmail: String) async -> (Bool, String?) {
@@ -361,7 +366,7 @@ final class SyncEngine: ObservableObject {
                 "wipeOldCiphertext": true,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.0.6",
+                "appVersion": "1.0.7",
             ]
 
             let cleanRec = recoveryKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -487,6 +492,7 @@ final class SyncEngine: ObservableObject {
         self.unlocked = true
         self.lastPulledAt = session.lastPulledAt ?? 0
         CryptoVault.saveSession(session)
+        NotificationCenter.default.post(name: .prismSyncSessionChanged, object: nil)
     }
 
     // MARK: - Encrypted Bidirectional Sync
