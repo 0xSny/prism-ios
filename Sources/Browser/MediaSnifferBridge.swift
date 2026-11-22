@@ -86,7 +86,8 @@ enum MediaSnifferScripts {
           if (el.currentSrc) reportMedia(el.currentSrc);
           if (el.src) reportMedia(el.src);
         });
-        const v = document.querySelector('video');
+        const videos = Array.from(document.querySelectorAll('video'));
+        const v = videos.find((el) => el.readyState > 0 || el.currentSrc || el.src) || videos[0];
         if (v) {
           post('videoState', {
             hasVideo: true,
@@ -95,9 +96,22 @@ enum MediaSnifferScripts {
             duration: Number.isFinite(v.duration) ? v.duration : 0,
             rate: v.playbackRate || 1
           });
+        } else if (window === window.top) {
+          post('videoState', {
+            hasVideo: false,
+            paused: true,
+            currentTime: 0,
+            duration: 0,
+            rate: 1
+          });
         }
       };
-      setInterval(scanVideos, 2000);
+      if (document.readyState !== 'loading') scanVideos();
+      else document.addEventListener('DOMContentLoaded', scanVideos, { once: true });
+      document.addEventListener('play', scanVideos, true);
+      document.addEventListener('playing', scanVideos, true);
+      document.addEventListener('loadedmetadata', scanVideos, true);
+      setInterval(scanVideos, 1500);
 
       // Video Controls API exposed to Swift
       window.__prismVideoControl = function(cmd, val) {

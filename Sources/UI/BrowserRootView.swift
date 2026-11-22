@@ -159,13 +159,17 @@ struct BrowserRootView: View {
                 BottomThumbDock(
                     syncEngine: syncEngine,
                     tabManager: tabManager,
+                    handoffService: handoffService,
                     onTapOmnibox: {
                         omniboxInput = (currentTab?.isNewTab == true) ? "" : (currentTab?.urlString ?? "")
-                        showOmniboxEditor = true
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                            showOmniboxEditor = true
+                        }
                     },
                     onOpenTabs: { showTabSwitcher = true },
                     onOpenProfiles: { activeSheet = .profiles },
                     onOpenMenu: { activeSheet = .menu },
+                    onRequireAccount: { activeSheet = .account },
                     onHorizontalScrub: { deltaX, ended in
                         if tabManager.activeTab?.hasVideo == true && !(tabManager.activeTab?.isNewTab ?? true) {
                             if !ended {
@@ -229,38 +233,53 @@ struct BrowserRootView: View {
             .padding(.top, 10)
             .padding(.horizontal, 16)
             .allowsHitTesting(topCapsuleToast != nil)
+
+            // Safari-Style Inline Omnibox Candidate Overlay Directly Above Bottom Search Bar
+            if showOmniboxEditor {
+                OmniboxInlineOverlay(
+                    text: $omniboxInput,
+                    bookmarks: syncEngine.bookmarks,
+                    history: syncEngine.history,
+                    tabs: tabManager.tabs,
+                    activeTab: currentTab,
+                    shortcuts: syncEngine.homeConfig.shortcuts,
+                    searchEngine: tabManager.searchEngine,
+                    canFindInPage: !(currentTab?.isNewTab ?? true),
+                    onSubmit: { target in
+                        tabManager.navigateActive(target)
+                        withAnimation(.spring(response: 0.24, dampingFraction: 0.88)) {
+                            showOmniboxEditor = false
+                        }
+                    },
+                    onSelectTab: { tabId in
+                        tabManager.activateTab(id: tabId)
+                        withAnimation(.spring(response: 0.24, dampingFraction: 0.88)) {
+                            showOmniboxEditor = false
+                        }
+                    },
+                    onFindInPage: { query in
+                        withAnimation(.easeOut(duration: 0.16)) {
+                            showOmniboxEditor = false
+                        }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                            tabManager.findInActivePage(query)
+                        }
+                    },
+                    onDismiss: {
+                        withAnimation(.spring(response: 0.24, dampingFraction: 0.88)) {
+                            showOmniboxEditor = false
+                        }
+                    }
+                )
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+                .zIndex(50)
+            }
         }
         .onAppear {
             handleIncomingHandoff(handoffService.latestIncoming)
         }
         .onChange(of: handoffService.latestIncoming) { _, incoming in
             handleIncomingHandoff(incoming)
-        }
-        .sheet(isPresented: $showOmniboxEditor) {
-            OmniboxEditorSheet(
-                text: $omniboxInput,
-                bookmarks: syncEngine.bookmarks,
-                history: syncEngine.history,
-                tabs: tabManager.tabs,
-                activeTabId: tabManager.activeTabId,
-                shortcuts: syncEngine.homeConfig.shortcuts,
-                searchEngine: tabManager.searchEngine,
-                canFindInPage: !(currentTab?.isNewTab ?? true),
-                onSubmit: { target in
-                    tabManager.navigateActive(target)
-                    showOmniboxEditor = false
-                },
-                onSelectTab: { tabId in
-                    tabManager.activateTab(id: tabId)
-                    showOmniboxEditor = false
-                },
-                onFindInPage: { query in
-                    showOmniboxEditor = false
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
-                        tabManager.findInActivePage(query)
-                    }
-                }
-            )
         }
         .sheet(isPresented: $showTabSwitcher) {
             TabSwitcherView(tabManager: tabManager, syncEngine: syncEngine)
@@ -341,10 +360,12 @@ struct BrowserRootView: View {
 private struct BottomThumbDock: View {
     @ObservedObject var syncEngine: SyncEngine
     @ObservedObject var tabManager: TabManager
+    @ObservedObject var handoffService: HandoffService
     let onTapOmnibox: () -> Void
     let onOpenTabs: () -> Void
     let onOpenProfiles: () -> Void
     let onOpenMenu: () -> Void
+    let onRequireAccount: () -> Void
     let onHorizontalScrub: (CGFloat, Bool) -> Void
     let onPullUpTabs: () -> Void
 
@@ -416,6 +437,39 @@ private struct BottomThumbDock: View {
                         }
                     }
             )
+
+            // Quick One-Tap Desktop Handoff / 桌面续播 directly on Bottom Dock for any webpage
+            if let tab = activeTab, !tab.isNewTab {
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    guard syncEngine.loggedIn else {
+                        tabManager.showToast(L10n.t("请先登录 Prism Account 使用桌面续播", "Sign in to Prism Account to continue on desktop"))
+                        onRequireAccount()
+                        return
+                    }
+                    Task {
+                        let ok = await handoffService.push(
+                            kind: tab.hasVideo ? "video" : "tab",
+                            title: tab.title,
+                            url: tab.urlString,
+                            videoSeconds: tab.hasVideo ? tab.videoSeconds : 0,
+                            syncEngine: syncEngine
+                        )
+                        tabManager.showToast(
+                            ok
+                                ? (tab.hasVideo
+                                    ? L10n.t("已带进度接力至桌面端", "Sent video to desktop")
+                                    : L10n.t("已推送当前网页至桌面端", "Sent page to desktop"))
+                                : L10n.t("发送失败", "Failed")
+                        )
+                    }
+                } label: {
+                    Image(systemName: "laptopcomputer")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(tab.hasVideo ? Color.indigo : Color.primary)
+                        .frame(width: 28, height: 36)
+                }
+            }
 
             // Tab Count Badge
             Button(action: onOpenTabs) {
@@ -662,21 +716,23 @@ private struct OmniboxCandidateEntry: Identifiable {
     let visitedAt: Double
 }
 
-private struct OmniboxEditorSheet: View {
+private struct OmniboxInlineOverlay: View {
     @Binding var text: String
     let bookmarks: [BookmarkItem]
     let history: [HistoryItem]
     let tabs: [BrowserTab]
-    let activeTabId: UUID?
+    let activeTab: BrowserTab?
     let shortcuts: [HomeShortcut]
     let searchEngine: SearchEngineOption
     let canFindInPage: Bool
     let onSubmit: (String) -> Void
     let onSelectTab: (UUID) -> Void
     let onFindInPage: (String) -> Void
+    let onDismiss: () -> Void
 
-    @Environment(\.dismiss) private var dismiss
     @StateObject private var remoteSuggester = OmniboxRemoteSuggester()
+    @State private var pageMatchCount: Int?
+    @State private var findCountTask: Task<Void, Never>?
 
     var body: some View {
         buildBody()
@@ -692,220 +748,372 @@ private struct OmniboxEditorSheet: View {
         let libraryItems = ranked.library
         let remoteList = buildRemoteSearchList(trimmed: trimmed, rawLower: q, remote: remoteSuggester.suggestions)
 
-        return NavigationStack {
-            VStack(spacing: 10) {
-                HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundStyle(.secondary)
-                    SelectableAddressBar(
-                        text: $text,
-                        placeholder: L10n.t("输入网址或搜索词", "Search or type a URL"),
-                        onSubmit: { target in
-                            onSubmit(target)
-                        },
-                        onPasteAndGo: { target in
-                            onSubmit(target)
-                        }
-                    )
-                    .frame(height: 24)
-                    if !text.isEmpty {
-                        Button {
-                            text = ""
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .padding(.horizontal)
+        return ZStack(alignment: .bottom) {
+            Rectangle()
+                .fill(.regularMaterial)
+                .ignoresSafeArea()
+                .onTapGesture { onDismiss() }
 
-                List {
-                    if let hit = topHit {
-                        Section {
-                            Button {
-                                if let tid = hit.tabId {
-                                    onSelectTab(tid)
-                                } else {
-                                    onSubmit(hit.url)
-                                }
-                            } label: {
-                                HStack(spacing: 12) {
-                                    ZStack {
-                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                            .fill(Color.indigo.opacity(0.14))
-                                            .frame(width: 32, height: 32)
-                                        Image(systemName: hit.tabId != nil ? "macwindow" : (hit.isBookmark ? "bookmark.fill" : "globe"))
-                                            .font(.system(size: 14, weight: .semibold))
-                                            .foregroundStyle(.indigo)
-                                    }
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(hit.title)
-                                            .font(.body.weight(.semibold))
-                                            .foregroundStyle(.primary)
-                                            .lineLimit(1)
-                                        Text(hit.subtitle)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
-                                    }
-                                    Spacer()
-                                    Text(L10n.t("最佳匹配", "Top Hit"))
-                                        .font(.caption2.weight(.medium))
-                                        .foregroundStyle(.indigo)
-                                        .padding(.horizontal, 7)
-                                        .padding(.vertical, 3)
-                                        .background(Color.indigo.opacity(0.12), in: Capsule())
-                                }
-                            }
-                            .listRowBackground(Color(.secondarySystemGroupedBackground))
-                        }
-                    }
-
-                    if !matchedTabs.isEmpty {
-                        Section(q.isEmpty ? L10n.t("打开的标签页", "Open Tabs") : "") {
-                            ForEach(matchedTabs) { item in
-                                Button {
-                                    if let tid = item.tabId {
-                                        onSelectTab(tid)
-                                    } else {
-                                        onSubmit(item.url)
-                                    }
-                                } label: {
-                                    HStack(spacing: 12) {
-                                        ZStack {
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .fill(Color(.tertiarySystemFill))
-                                                .frame(width: 30, height: 30)
-                                            Image(systemName: "macwindow")
-                                                .font(.system(size: 13))
-                                                .foregroundStyle(.secondary)
-                                        }
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(item.title)
-                                                .foregroundStyle(.primary)
-                                                .lineLimit(1)
-                                            Text(item.subtitle)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                                .lineLimit(1)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if !remoteList.isEmpty {
-                        Section("\(searchEngine.title)\(L10n.t(" 建议", " Suggestions"))") {
-                            ForEach(remoteList, id: \.self) { term in
-                                HStack(spacing: 10) {
+            VStack(spacing: 0) {
+                ScrollView(.vertical, showsIndicators: true) {
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        // 1. Pinned Top Hit + Open Matching Tabs directly below
+                        if topHit != nil || (!q.isEmpty && !matchedTabs.isEmpty) {
+                            VStack(spacing: 2) {
+                                if let hit = topHit {
                                     Button {
-                                        onSubmit(term)
+                                        if let tid = hit.tabId {
+                                            onSelectTab(tid)
+                                        } else {
+                                            onSubmit(hit.url)
+                                        }
+                                    } label: {
+                                        HStack(spacing: 12) {
+                                            ZStack {
+                                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                    .fill(Color.primary.opacity(0.08))
+                                                    .frame(width: 34, height: 34)
+                                                Image(systemName: hit.tabId != nil ? "macwindow" : (hit.isBookmark ? "bookmark.fill" : "globe"))
+                                                    .font(.system(size: 15, weight: .semibold))
+                                                    .foregroundStyle(.primary)
+                                            }
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(hit.title)
+                                                    .font(.system(size: 16, weight: .semibold))
+                                                    .foregroundStyle(.primary)
+                                                    .lineLimit(1)
+                                                Text(hit.subtitle)
+                                                    .font(.system(size: 12.5))
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                            }
+                                            Spacer(minLength: 0)
+                                        }
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 10)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                                .fill(Color(.secondarySystemGroupedBackground))
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+
+                                if !q.isEmpty {
+                                    ForEach(matchedTabs) { item in
+                                        Button {
+                                            if let tid = item.tabId {
+                                                onSelectTab(tid)
+                                            } else {
+                                                onSubmit(item.url)
+                                            }
+                                        } label: {
+                                            HStack(spacing: 12) {
+                                                ZStack {
+                                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                        .fill(Color(.tertiarySystemFill))
+                                                        .frame(width: 32, height: 32)
+                                                    Image(systemName: "macwindow")
+                                                        .font(.system(size: 13.5))
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text(item.title)
+                                                        .font(.system(size: 15))
+                                                        .foregroundStyle(.primary)
+                                                        .lineLimit(1)
+                                                    Text(item.subtitle)
+                                                        .font(.system(size: 12))
+                                                        .foregroundStyle(.secondary)
+                                                        .lineLimit(1)
+                                                }
+                                                Spacer(minLength: 0)
+                                            }
+                                            .padding(.horizontal, 12)
+                                            .padding(.vertical, 7)
+                                            .contentShape(Rectangle())
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                        } else if q.isEmpty && !matchedTabs.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(L10n.t("打开的标签页", "Open Tabs"))
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 12)
+                                ForEach(matchedTabs) { item in
+                                    Button {
+                                        if let tid = item.tabId { onSelectTab(tid) } else { onSubmit(item.url) }
                                     } label: {
                                         HStack(spacing: 12) {
                                             ZStack {
                                                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                                                     .fill(Color(.tertiarySystemFill))
-                                                    .frame(width: 30, height: 30)
-                                                Image(systemName: "magnifyingglass")
-                                                    .font(.system(size: 13))
+                                                    .frame(width: 32, height: 32)
+                                                Image(systemName: "macwindow")
+                                                    .font(.system(size: 13.5))
                                                     .foregroundStyle(.secondary)
                                             }
-                                            highlightedSuggestionText(term: term, query: trimmed)
-                                                .lineLimit(1)
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(item.title)
+                                                    .font(.system(size: 15))
+                                                    .foregroundStyle(.primary)
+                                                    .lineLimit(1)
+                                                Text(item.subtitle)
+                                                    .font(.system(size: 12))
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                            }
                                             Spacer(minLength: 0)
                                         }
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 6)
                                         .contentShape(Rectangle())
                                     }
                                     .buttonStyle(.plain)
-
-                                    if term.lowercased() != q {
-                                        Button {
-                                            text = term
-                                        } label: {
-                                            Image(systemName: "arrow.up.left")
-                                                .font(.system(size: 12, weight: .semibold))
-                                                .foregroundStyle(.secondary)
-                                                .frame(width: 28, height: 28)
-                                                .background(Color(.tertiarySystemFill), in: Circle())
-                                        }
-                                        .buttonStyle(.borderless)
-                                    }
                                 }
                             }
                         }
-                    }
 
-                    if !libraryItems.isEmpty {
-                        Section(L10n.t("书签、历史记录和标签页", "Bookmarks & History")) {
-                            ForEach(libraryItems) { item in
+                        // 2. Search Engine Suggestions
+                        if !remoteList.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("\(searchEngine.title)\(L10n.t("建议", " Suggestions"))")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 12)
+
+                                ForEach(remoteList, id: \.self) { term in
+                                    HStack(spacing: 10) {
+                                        Button {
+                                            onSubmit(term)
+                                        } label: {
+                                            HStack(spacing: 12) {
+                                                ZStack {
+                                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                        .fill(Color(.tertiarySystemFill))
+                                                        .frame(width: 32, height: 32)
+                                                    Image(systemName: "magnifyingglass")
+                                                        .font(.system(size: 14))
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                                highlightedSuggestionText(term: term, query: trimmed)
+                                                    .font(.system(size: 16))
+                                                    .lineLimit(1)
+                                                Spacer(minLength: 0)
+                                            }
+                                            .contentShape(Rectangle())
+                                        }
+                                        .buttonStyle(.plain)
+
+                                        if term.lowercased() != q {
+                                            Button {
+                                                text = term
+                                            } label: {
+                                                Image(systemName: "arrow.down.left")
+                                                    .font(.system(size: 12, weight: .medium))
+                                                    .foregroundStyle(.secondary)
+                                                    .frame(width: 26, height: 26)
+                                                    .overlay(
+                                                        Circle().stroke(Color.secondary.opacity(0.35), lineWidth: 1)
+                                                    )
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 4)
+                                }
+                            }
+                        }
+
+                        // 3. Bookmarks, History & Open Tabs
+                        if !libraryItems.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(L10n.t("书签、历史记录和标签页", "Bookmarks & History"))
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 12)
+
+                                ForEach(libraryItems) { item in
+                                    Button {
+                                        onSubmit(item.url)
+                                    } label: {
+                                        HStack(spacing: 12) {
+                                            ZStack {
+                                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                    .fill(Color(.tertiarySystemFill))
+                                                    .frame(width: 32, height: 32)
+                                                Image(systemName: item.isBookmark ? "bookmark.fill" : "clock")
+                                                    .font(.system(size: 14))
+                                                    .foregroundStyle(item.isBookmark ? .blue : .secondary)
+                                            }
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(item.title)
+                                                    .font(.system(size: 15.5, weight: .medium))
+                                                    .foregroundStyle(.primary)
+                                                    .lineLimit(1)
+                                                Text(item.subtitle)
+                                                    .font(.system(size: 12))
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                            }
+                                            Spacer(minLength: 0)
+                                        }
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 5)
+                                        .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+
+                        // 4. On This Page (right above bottom search bar just like Safari)
+                        if canFindInPage && !trimmed.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                let countLabel: String = {
+                                    if let c = pageMatchCount {
+                                        return L10n.t("此页（\(c)个匹配项）", "On This Page (\(c) matches)")
+                                    }
+                                    return L10n.t("此页", "On This Page")
+                                }()
+                                Text(countLabel)
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 12)
+
                                 Button {
-                                    onSubmit(item.url)
+                                    onFindInPage(trimmed)
                                 } label: {
                                     HStack(spacing: 12) {
                                         ZStack {
                                             RoundedRectangle(cornerRadius: 8, style: .continuous)
                                                 .fill(Color(.tertiarySystemFill))
-                                                .frame(width: 30, height: 30)
-                                            Image(systemName: item.isBookmark ? "bookmark.fill" : "clock")
-                                                .font(.system(size: 13))
-                                                .foregroundStyle(item.isBookmark ? .blue : .secondary)
-                                        }
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(item.title)
-                                                .foregroundStyle(.primary)
-                                                .lineLimit(1)
-                                            Text(item.subtitle)
-                                                .font(.caption)
+                                                .frame(width: 32, height: 32)
+                                            Image(systemName: "doc.text.magnifyingglass")
+                                                .font(.system(size: 14))
                                                 .foregroundStyle(.secondary)
-                                                .lineLimit(1)
                                         }
+                                        Text(L10n.t("查找“\(trimmed)”", "Find “\(trimmed)”"))
+                                            .font(.system(size: 15.5))
+                                            .foregroundStyle(.primary)
+                                        Spacer(minLength: 0)
                                     }
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .contentShape(Rectangle())
                                 }
+                                .buttonStyle(.plain)
                             }
                         }
                     }
+                    .padding(.horizontal, 8)
+                    .padding(.top, 10)
+                    .padding(.bottom, 12)
+                }
+                .scrollDismissesKeyboard(.interactively)
 
-                    if canFindInPage && !trimmed.isEmpty {
-                        Section(L10n.t("此页", "On This Page")) {
-                            Button {
-                                onFindInPage(trimmed)
-                            } label: {
-                                HStack(spacing: 12) {
-                                    ZStack {
-                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                            .fill(Color(.tertiarySystemFill))
-                                            .frame(width: 30, height: 30)
-                                        Image(systemName: "doc.text.magnifyingglass")
-                                            .font(.system(size: 13))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Text(L10n.t("查找“\(trimmed)”", "Find “\(trimmed)”"))
-                                        .foregroundStyle(.primary)
-                                }
+                // Docked Bottom Search Capsule + Circular [×] Cancel Button directly under Candidates
+                HStack(spacing: 10) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        SelectableAddressBar(
+                            text: $text,
+                            placeholder: L10n.t("搜索或输入网址", "Search or enter website name"),
+                            onSubmit: { target in
+                                onSubmit(target)
+                            },
+                            onPasteAndGo: { target in
+                                onSubmit(target)
                             }
+                        )
+                        .frame(height: 24)
+                        if !text.isEmpty {
+                            Button {
+                                text = ""
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 16))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
+                    .padding(.horizontal, 14)
+                    .frame(height: 44)
+                    .background(
+                        Capsule()
+                            .fill(Color(.secondarySystemGroupedBackground))
+                            .shadow(color: Color.black.opacity(0.12), radius: 8, y: 2)
+                    )
+                    .overlay(
+                        Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+                    )
+
+                    Button(action: onDismiss) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .frame(width: 44, height: 44)
+                            .background(
+                                Circle()
+                                    .fill(Color(.secondarySystemGroupedBackground))
+                                    .shadow(color: Color.black.opacity(0.12), radius: 8, y: 2)
+                            )
+                            .overlay(
+                                Circle().stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+                            )
+                    }
+                    .buttonStyle(.plain)
                 }
-                .listStyle(.insetGrouped)
+                .padding(.horizontal, 14)
+                .padding(.top, 6)
+                .padding(.bottom, 10)
             }
-            .padding(.top, 10)
-            .navigationTitle(L10n.t("地址与搜索", "Navigate"))
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(L10n.t("取消", "Cancel")) { dismiss() }
+        }
+        .onAppear {
+            remoteSuggester.update(query: text, engine: searchEngine)
+            schedulePageMatchCount(text)
+        }
+        .onChange(of: text) { _, newValue in
+            remoteSuggester.update(query: newValue, engine: searchEngine)
+            schedulePageMatchCount(newValue)
+        }
+    }
+
+    private func schedulePageMatchCount(_ raw: String) {
+        findCountTask?.cancel()
+        let q = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard canFindInPage, !q.isEmpty, let wv = activeTab?.webView else {
+            pageMatchCount = nil
+            return
+        }
+        findCountTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 140_000_000)
+            guard !Task.isCancelled else { return }
+            let encoded = (try? JSONEncoder().encode(q)).flatMap { String(data: $0, encoding: .utf8) } ?? "\"\""
+            let js = """
+            (() => {
+              const q = (\(encoded) || '').toLowerCase();
+              if (!q || !document.body) return 0;
+              const txt = (document.body.innerText || '').toLowerCase();
+              let count = 0, pos = 0;
+              while ((pos = txt.indexOf(q, pos)) !== -1) {
+                count++; pos += q.length;
+                if (count >= 999) break;
+              }
+              return count;
+            })()
+            """
+            wv.evaluateJavaScript(js) { val, _ in
+                if !Task.isCancelled {
+                    pageMatchCount = val as? Int
                 }
-            }
-            .onAppear {
-                remoteSuggester.update(query: text, engine: searchEngine)
-            }
-            .onChange(of: text) { _, newValue in
-                remoteSuggester.update(query: newValue, engine: searchEngine)
             }
         }
     }
@@ -942,8 +1150,14 @@ private struct OmniboxEditorSheet: View {
             return raw.lowercased()
         }
         let host = (u.host ?? "").lowercased()
+        let normalizedHost = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
         let path = (u.path == "/" || u.path.isEmpty) && u.query == nil ? "" : u.path
-        return "\(host)\(path)\(u.query.map { "?\($0)" } ?? "")"
+        return "\(normalizedHost)\(path)\(u.query.map { "?\($0)" } ?? "")"
+    }
+
+    private func isRootURL(_ raw: String) -> Bool {
+        guard let u = URL(string: raw) else { return false }
+        return (u.path.isEmpty || u.path == "/") && (u.query == nil || u.query?.isEmpty == true)
     }
 
     private func hostOnly(_ raw: String) -> String {
@@ -976,20 +1190,27 @@ private struct OmniboxEditorSheet: View {
             }
         }
         var score = 15
-        if titleLow == queryLower || hostLow == queryLower { score += 120 }
-        else if hostLow.hasPrefix(queryLower) || titleLow.hasPrefix(queryLower) { score += 80 }
-        else if urlLow.contains("://\(queryLower)") || urlLow.contains(".\(queryLower)") { score += 55 }
+        if hostLow == queryLower || titleLow == queryLower { score += 130 }
+        else if hostLow.hasPrefix(queryLower) { score += 100 }
+        else if titleLow.hasPrefix(queryLower) { score += 85 }
+        else if urlLow.contains("://\(queryLower)") || urlLow.contains(".\(queryLower)") { score += 60 }
         else if titleLow.contains(queryLower) { score += 35 }
         else if urlLow.contains(queryLower) { score += 25 }
+
+        // Safari prioritizes clean domain landing pages over deep subpages for Top Hit
+        if isRootURL(url) && score >= 95 {
+            score += 45
+        }
         return score
     }
 
     private func buildLocalCandidates(queryLower: String, tokens: [String]) -> (topHit: OmniboxCandidateEntry?, tabs: [OmniboxCandidateEntry], library: [OmniboxCandidateEntry]) {
         var seen = Set<String>()
+        let activeId = activeTab?.id
 
         if queryLower.isEmpty {
             var tabEntries: [OmniboxCandidateEntry] = []
-            for t in tabs where !t.isNewTab && t.id != activeTabId {
+            for t in tabs where !t.isNewTab && t.id != activeId {
                 let k = normalizeKey(t.urlString)
                 if seen.contains(k) { continue }
                 seen.insert(k)
@@ -1044,9 +1265,22 @@ private struct OmniboxEditorSheet: View {
             return (nil, tabEntries, libEntries)
         }
 
-        // Non-empty query: rank Top Hit + matching Open Tabs + Bookmarks & History
+        // Aggregate history frequency per normalized URL so repeated sites surface like Safari
+        var visitFreq: [String: Int] = [:]
+        var latestByKey: [String: HistoryItem] = [:]
+        for h in history {
+            let k = normalizeKey(h.url)
+            visitFreq[k, default: 0] += 1
+            if let cur = latestByKey[k] {
+                if h.visitedAt > cur.visitedAt { latestByKey[k] = h }
+            } else {
+                latestByKey[k] = h
+            }
+        }
+
         var scoredSites: [OmniboxCandidateEntry] = []
         var tabMatches: [OmniboxCandidateEntry] = []
+        let nowMs = Date().timeIntervalSince1970 * 1000.0
 
         for t in tabs where !t.isNewTab {
             let s = scoreMatch(queryLower: queryLower, tokens: tokens, title: t.title, url: t.urlString)
@@ -1060,7 +1294,7 @@ private struct OmniboxEditorSheet: View {
                     isBookmark: false,
                     tabId: t.id,
                     score: s + 8,
-                    visitedAt: Date().timeIntervalSince1970 * 1000
+                    visitedAt: nowMs
                 ))
             }
         }
@@ -1070,6 +1304,7 @@ private struct OmniboxEditorSheet: View {
             let s = scoreMatch(queryLower: queryLower, tokens: tokens, title: bm.title, url: bm.url)
             if s > 0 {
                 let host = hostOnly(bm.url)
+                let freqBoost = min(28, (visitFreq[normalizeKey(bm.url)] ?? 0) * 5)
                 scoredSites.append(OmniboxCandidateEntry(
                     id: "bm-\(bm.id)",
                     title: bm.title.isEmpty ? host : bm.title,
@@ -1077,7 +1312,7 @@ private struct OmniboxEditorSheet: View {
                     subtitle: host,
                     isBookmark: true,
                     tabId: nil,
-                    score: s + 12,
+                    score: s + 18 + freqBoost,
                     visitedAt: bm.createdAt
                 ))
             }
@@ -1093,15 +1328,18 @@ private struct OmniboxEditorSheet: View {
                     subtitle: host,
                     isBookmark: true,
                     tabId: nil,
-                    score: s + 10,
+                    score: s + 14,
                     visitedAt: 0
                 ))
             }
         }
-        for h in history {
+        for (k, h) in latestByKey {
             let s = scoreMatch(queryLower: queryLower, tokens: tokens, title: h.title, url: h.url)
             if s > 0 {
                 let host = hostOnly(h.url)
+                let freqBoost = min(35, (visitFreq[k] ?? 1) * 6)
+                let ageSec = max(0, (nowMs - h.visitedAt) / 1000.0)
+                let recencyBoost = ageSec < 86400 ? 16 : (ageSec < 604800 ? 9 : 0)
                 scoredSites.append(OmniboxCandidateEntry(
                     id: "hist-\(h.id)",
                     title: h.title.isEmpty ? host : h.title,
@@ -1109,7 +1347,7 @@ private struct OmniboxEditorSheet: View {
                     subtitle: "\(host) · \(relativeTime(h.visitedAt))",
                     isBookmark: false,
                     tabId: nil,
-                    score: s,
+                    score: s + freqBoost + recencyBoost,
                     visitedAt: h.visitedAt
                 ))
             }
@@ -1120,7 +1358,7 @@ private struct OmniboxEditorSheet: View {
         }
 
         var topHit: OmniboxCandidateEntry? = nil
-        if let best = scoredSites.first, best.score >= 70 {
+        if let best = scoredSites.first, best.score >= 85 {
             let host = hostOnly(best.url)
             topHit = OmniboxCandidateEntry(
                 id: "top-\(best.id)",
@@ -1136,7 +1374,7 @@ private struct OmniboxEditorSheet: View {
         }
 
         var outTabs: [OmniboxCandidateEntry] = []
-        for t in tabMatches where t.tabId != activeTabId {
+        for t in tabMatches where t.tabId != activeId {
             let k = normalizeKey(t.url)
             if seen.contains(k) && topHit?.title.lowercased() == t.title.lowercased() { continue }
             outTabs.append(t)
