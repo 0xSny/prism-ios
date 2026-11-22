@@ -27,8 +27,9 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.zzaoo.prism.mobile
         INFOPLIST_FILE: Resources/Info.plist
         GENERATE_INFOPLIST_FILE: NO
-        MARKETING_VERSION: "0.7.0"
-        CURRENT_PROJECT_VERSION: "700"
+        INFOPLIST_KEY_CFBundleDisplayName: Prism
+        MARKETING_VERSION: "0.9.0"
+        CURRENT_PROJECT_VERSION: "800"
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
         AD_HOC_CODE_SIGNING_ALLOWED: YES

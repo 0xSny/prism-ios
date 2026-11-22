@@ -203,12 +203,58 @@ struct AccountSessionDisk: Codable {
 struct HandoffPayload: Identifiable, Codable, Equatable {
     var id: String
     var kind: String // "tab" | "video" | "clipboard"
+    var type: String?
+    var targetPlatform: String?
     var title: String?
     var url: String?
     var videoSeconds: Double?
     var text: String?
     var fromDeviceName: String?
     var createdAt: Double
+
+    enum CodingKeys: String, CodingKey {
+        case id, kind, type, targetPlatform, title, url, videoSeconds, text, fromDeviceName, createdAt
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        kind: String,
+        type: String? = nil,
+        targetPlatform: String? = nil,
+        title: String? = nil,
+        url: String? = nil,
+        videoSeconds: Double? = nil,
+        text: String? = nil,
+        fromDeviceName: String? = nil,
+        createdAt: Double = Date().timeIntervalSince1970 * 1000
+    ) {
+        self.id = id
+        self.kind = kind
+        self.type = type ?? kind
+        self.targetPlatform = targetPlatform
+        self.title = title
+        self.url = url
+        self.videoSeconds = videoSeconds
+        self.text = text
+        self.fromDeviceName = fromDeviceName
+        self.createdAt = createdAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        let decodedKind = try container.decodeIfPresent(String.self, forKey: .kind)
+        let decodedType = try container.decodeIfPresent(String.self, forKey: .type)
+        self.kind = decodedKind ?? decodedType ?? "tab"
+        self.type = decodedType ?? self.kind
+        self.targetPlatform = try container.decodeIfPresent(String.self, forKey: .targetPlatform)
+        self.title = try container.decodeIfPresent(String.self, forKey: .title)
+        self.url = try container.decodeIfPresent(String.self, forKey: .url)
+        self.videoSeconds = try container.decodeIfPresent(Double.self, forKey: .videoSeconds)
+        self.text = try container.decodeIfPresent(String.self, forKey: .text)
+        self.fromDeviceName = try container.decodeIfPresent(String.self, forKey: .fromDeviceName)
+        self.createdAt = try container.decodeIfPresent(Double.self, forKey: .createdAt) ?? (Date().timeIntervalSince1970 * 1000)
+    }
 }
 
 struct SniffedMediaItem: Identifiable, Equatable {

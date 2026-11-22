@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 @main
 struct PrismMobileApp: App {
@@ -24,12 +25,17 @@ struct PrismMobileApp: App {
             .onOpenURL { url in
                 tabManager.handleDeepLink(url)
             }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+                handoffService.handleForegroundResume(syncEngine: syncEngine)
+                tabManager.checkClipboardForURL()
+            }
             .onChange(of: scenePhase) { _, phase in
                 switch phase {
                 case .active:
+                    handoffService.handleForegroundResume(syncEngine: syncEngine)
                     tabManager.checkClipboardForURL()
-                    Task { await handoffService.pollOnce(syncEngine: syncEngine) }
                 case .background:
+                    handoffService.pauseForBackground()
                     Task { await syncEngine.flushPendingBeforeBackground() }
                 default:
                     break

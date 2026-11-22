@@ -4,21 +4,45 @@ import Foundation
 final class HandoffService: ObservableObject {
     @Published var latestIncoming: HandoffPayload?
     @Published var lastPushedAt: Date?
+    @Published var isForegroundActive: Bool = true
 
     private var lastPolledAt: Double = UserDefaults.standard.double(forKey: "prism.handoff.lastPolledAt")
     private var seenIds = Set<String>()
     private var pollTimer: Task<Void, Never>?
+    private var isPolling = false
 
     func startPolling(syncEngine: SyncEngine) {
+        handleForegroundResume(syncEngine: syncEngine)
+    }
+
+    func setForeground(_ active: Bool, syncEngine: SyncEngine) {
+        if active {
+            handleForegroundResume(syncEngine: syncEngine)
+        } else {
+            pauseForBackground()
+        }
+    }
+
+    func handleForegroundResume(syncEngine: SyncEngine) {
+        isForegroundActive = true
         pollTimer?.cancel()
         pollTimer = Task { [weak self, weak syncEngine] in
+            // Trigger immediate foreground poll within 0.1s
+            try? await Task.sleep(nanoseconds: 50_000_000)
             while !Task.isCancelled {
-                if let self, let syncEngine, syncEngine.loggedIn, syncEngine.unlocked {
+                guard let self, let syncEngine, self.isForegroundActive else { break }
+                if syncEngine.loggedIn, syncEngine.unlocked {
                     await self.pollOnce(syncEngine: syncEngine)
                 }
-                try? await Task.sleep(nanoseconds: 12_000_000_000)
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
             }
         }
+    }
+
+    func pauseForBackground() {
+        isForegroundActive = false
+        pollTimer?.cancel()
+        pollTimer = nil
     }
 
     func push(kind: String, title: String?, url: String?, videoSeconds: Double? = nil, text: String? = nil, syncEngine: SyncEngine) async -> Bool {
@@ -27,9 +51,12 @@ final class HandoffService: ObservableObject {
               let endpoint = URL(string: "\(syncEngine.serverUrl)/api/handoff/push") else {
             return false
         }
+        let payloadId = UUID().uuidString
         let payload = HandoffPayload(
-            id: UUID().uuidString,
+            id: payloadId,
             kind: kind,
+            type: kind,
+            targetPlatform: "desktop",
             title: title,
             url: url,
             videoSeconds: videoSeconds,
@@ -44,7 +71,10 @@ final class HandoffService: ObservableObject {
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "id": payloadId,
             "kind": kind,
+            "type": kind,
+            "targetPlatform": "desktop",
             "iv": envelope.iv,
             "ciphertext": envelope.ciphertext,
             "tag": envelope.tag,
@@ -62,11 +92,15 @@ final class HandoffService: ObservableObject {
     }
 
     func pollOnce(syncEngine: SyncEngine) async {
+        guard !isPolling else { return }
         guard let token = syncEngine.currentToken,
               let encKey = syncEngine.currentEncKey,
-              let url = URL(string: "\(syncEngine.serverUrl)/api/handoff/poll?since=\(Int(lastPolledAt))") else {
+              let url = URL(string: "\(syncEngine.serverUrl)/api/handoff/poll?since=\(Int(lastPolledAt))&platform=ios") else {
             return
         }
+        isPolling = true
+        defer { isPolling = false }
+
         var req = URLRequest(url: url)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         do {
@@ -76,7 +110,8 @@ final class HandoffService: ObservableObject {
                 let id: String
                 let fromDeviceId: String
                 let fromDeviceName: String?
-                let kind: String
+                let kind: String?
+                let type: String?
                 let iv: String
                 let ciphertext: String
                 let tag: String
@@ -93,7 +128,14 @@ final class HandoffService: ObservableObject {
                 if item.fromDeviceId == decoded.currentDeviceId || seenIds.contains(item.id) { continue }
                 seenIds.insert(item.id)
                 if var payload = try? CryptoVault.decryptJSON(HandoffPayload.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag) {
+                    payload.id = item.id
+                    if payload.kind.isEmpty {
+                        payload.kind = item.kind ?? item.type ?? "tab"
+                    }
                     payload.fromDeviceName = item.fromDeviceName ?? payload.fromDeviceName
+                    if item.createdAt > 0 {
+                        payload.createdAt = item.createdAt
+                    }
                     latestIncoming = payload
                     break
                 }

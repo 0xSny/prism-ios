@@ -87,7 +87,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     }
 
     @discardableResult
-    func createTab(url: URL? = nil, profileId: String? = nil, activate: Bool = true) -> BrowserTab {
+    func createTab(url: URL? = nil, profileId: String? = nil, activate: Bool = true, seekSeconds: Double? = nil) -> BrowserTab {
         let pid = profileId ?? activeProfile.id
         let tab = BrowserTab(profileId: pid, initialURL: url)
         tabs.append(tab)
@@ -95,7 +95,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             activeTabId = tab.id
         }
         if let url {
-            load(url: url, in: tab)
+            load(url: url, in: tab, seekSeconds: seekSeconds)
         }
         return tab
     }
@@ -140,7 +140,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         tab.blockedAppJumpURL = nil
         webView.load(URLRequest(url: url))
 
-        if let seekSeconds, seekSeconds > 2 {
+        if let seekSeconds, seekSeconds > 0 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
                 webView.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('seekTo', \(seekSeconds));", completionHandler: nil)
             }
@@ -507,7 +507,11 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         return searchEngine.searchURL(for: raw)
     }
 
-    private func extractHTTPURL(from text: String) -> URL? {
+    func syncClipboardChangeCount() {
+        lastClipboardChangeCount = UIPasteboard.general.changeCount
+    }
+
+    func extractHTTPURL(from text: String) -> URL? {
         if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) {
             let range = NSRange(location: 0, length: text.utf16.count)
             if let match = detector.firstMatch(in: text, options: [], range: range),

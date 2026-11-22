@@ -13,7 +13,8 @@ jobs:
   build-ios:
     runs-on: macos-15
     env:
-      APP_VERSION: "0.7.0"
+      APP_VERSION: "0.9.0"
+      BUILD_NUMBER: "800"
       BUNDLE_ID: "com.zzaoo.prism.mobile"
     steps:
       - name: Checkout repository
@@ -57,34 +58,34 @@ jobs:
           mkdir -p dist/Payload
           cp -R build/Build/Products/Release-iphoneos/PrismMobile.app dist/Payload/
           cd dist
-          zip -r -y Prism-Mobile-${APP_VERSION}.ipa Payload
-          IPA_SIZE=$(wc -c < Prism-Mobile-${APP_VERSION}.ipa | tr -d ' ')
+          zip -r -y Prism-${APP_VERSION}.ipa Payload
+          IPA_SIZE=$(wc -c < Prism-${APP_VERSION}.ipa | tr -d ' ')
           BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           cat > repo.json <<EOF
           {
-            "name": "Prism Browser Official iOS Repo",
+            "name": "Prism Official iOS Repo",
             "subtitle": "零知识云同步 · 多重隔离容器 · 自签轻量移动浏览器",
-            "description": "Prism Mobile v${APP_VERSION} 无签名 IPA 软件源（兼容 ESign 轻松签 / OmniSign 全能签 / Feather / AltStore）",
+            "description": "Prism v${APP_VERSION} 无签名 IPA 软件源（兼容 ESign 轻松签 / OmniSign 全能签 / Feather / AltStore）",
             "iconURL": "https://prism.zzaoo.com/ios/icon.png",
             "website": "https://prism.zzaoo.com",
             "apps": [
               {
-                "name": "Prism Browser",
+                "name": "Prism",
                 "bundleIdentifier": "${BUNDLE_ID}",
                 "developerName": "Prism Team",
                 "subtitle": "零知识云同步与指纹容器隔离浏览器",
-                "localizedDescription": "Prism v${APP_VERSION} 原生 SwiftUI 移动客户端：顶部下拉刷新、地址栏点击自动全选、实时天气胶囊、忘记主密码验证码找回、Face ID 密码库填充、iOS 17 代理隔离容器与媒体嗅探。",
+                "localizedDescription": "Prism v${APP_VERSION} 原生 SwiftUI 移动客户端：桌面 ⇄ iOS 秒级隔空接力、顶部下拉刷新、地址栏点击自动全选、实时天气胶囊、忘记主密码验证码找回、Face ID 密码库填充、iOS 17 代理隔离容器与媒体嗅探。",
                 "iconURL": "https://prism.zzaoo.com/ios/icon.png",
                 "tintColor": "#4285F4",
                 "versions": [
                   {
                     "version": "${APP_VERSION}",
-                    "buildVersion": "700",
+                    "buildVersion": "${BUILD_NUMBER}",
                     "date": "${BUILD_DATE}",
                     "size": ${IPA_SIZE},
                     "minOSVersion": "17.0",
-                    "downloadURL": "https://prism.zzaoo.com/releases/Prism-Mobile-${APP_VERSION}.ipa",
-                    "localizedDescription": "v0.7.0：网页顶部下拉刷新、真图标 AppIcon 矩阵修复、地址栏自动全选+40pt 快捷键盘条、Open-Meteo 天气、全平台密码捕获与忘记密码找回。"
+                    "downloadURL": "https://prism.zzaoo.com/releases/Prism-${APP_VERSION}.ipa",
+                    "localizedDescription": "v${APP_VERSION}：统一品牌 Prism、桌面 ⇄ iOS 3 秒极速隔空接力与剪贴板同步、网页顶部下拉刷新、Open-Meteo 天气、全平台密码捕获与忘记密码找回。"
                   }
                 ]
               }
@@ -92,26 +93,26 @@ jobs:
             "news": []
           }
           EOF
-          ls -lh Prism-Mobile-${APP_VERSION}.ipa repo.json
+          ls -lh Prism-${APP_VERSION}.ipa repo.json
           cat repo.json
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: prism-ios-v0.7.0
+          name: prism-ios-v${{ env.APP_VERSION }}
           path: |
-            dist/Prism-Mobile-${{ env.APP_VERSION }}.ipa
+            dist/Prism-${{ env.APP_VERSION }}.ipa
             dist/repo.json
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.7.0
-          name: Prism Mobile v0.7.0 (Unsigned IPA)
+          tag_name: v0.9.0
+          name: Prism v0.9.0 (Unsigned IPA)
           body: |
-            Prism Mobile v0.7.0 无签名原生 `.ipa` 与 AltStore / ESign / OmniSign / Feather 软件源。
+            Prism v0.9.0 无签名原生 `.ipa` 与 AltStore / ESign / OmniSign / Feather 软件源。
             - 无受限权限（No restricted entitlements），完整实心 AppIcon，个人证书 / 自签工具直接安装。
             - 官方自签源 URL：`https://prism.zzaoo.com/ios/repo.json`
           files: |
-            dist/Prism-Mobile-0.7.0.ipa
+            dist/Prism-0.9.0.ipa
             dist/repo.json

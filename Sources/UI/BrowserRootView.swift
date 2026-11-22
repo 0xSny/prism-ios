@@ -15,6 +15,8 @@ struct BrowserRootView: View {
     @State private var isSpeed2x = false
     @State private var scrubOffsetSec: Double = 0
     @State private var isScrubbingVideo = false
+    @State private var topCapsuleToast: ToastNotice?
+    @State private var topToastDismissTask: Task<Void, Never>?
 
     enum ActiveSheet: Identifiable {
         case menu, account, profiles, vault, sniffer, devtools
@@ -93,13 +95,13 @@ struct BrowserRootView: View {
                 if let handoff = handoffService.latestIncoming {
                     HandoffBannerView(payload: handoff) {
                         if let raw = handoff.url, let url = URL(string: raw) {
-                            let tab = tabManager.createTab(url: url, activate: true)
-                            if handoff.kind == "video", let secs = handoff.videoSeconds, secs > 2 {
-                                tabManager.load(url: url, in: tab, seekSeconds: secs)
-                            }
+                            let seek = (handoff.videoSeconds ?? 0) > 0 ? handoff.videoSeconds : nil
+                            tabManager.createTab(url: url, activate: true, seekSeconds: seek)
                         } else if let text = handoff.text {
                             UIPasteboard.general.string = text
-                            tabManager.showToast(L10n.t("已复制桌面端推送的剪贴板内容", "Copied clipboard from desktop"))
+                            tabManager.syncClipboardChangeCount()
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            showTopCapsuleToast(L10n.t("📋 已同步来自电脑的剪贴板", "📋 Synced clipboard from desktop"))
                         }
                         handoffService.latestIncoming = nil
                     } onDismiss: {
@@ -185,6 +187,37 @@ struct BrowserRootView: View {
             }
             .padding(.horizontal, 12)
             .padding(.bottom, 8)
+
+            // Top Capsule Toast Overlay for Instant Handoff & Clipboard Sync
+            VStack {
+                if let toast = topCapsuleToast {
+                    TopCapsuleToastView(toast: toast) {
+                        if let raw = toast.urlToOpen, let url = URL(string: raw) {
+                            tabManager.createTab(url: url, activate: true)
+                        }
+                        topToastDismissTask?.cancel()
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            topCapsuleToast = nil
+                        }
+                    } onDismiss: {
+                        topToastDismissTask?.cancel()
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            topCapsuleToast = nil
+                        }
+                    }
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                Spacer()
+            }
+            .padding(.top, 10)
+            .padding(.horizontal, 16)
+            .allowsHitTesting(topCapsuleToast != nil)
+        }
+        .onAppear {
+            handleIncomingHandoff(handoffService.latestIncoming)
+        }
+        .onChange(of: handoffService.latestIncoming) { _, incoming in
+            handleIncomingHandoff(incoming)
         }
         .sheet(isPresented: $showOmniboxEditor) {
             OmniboxEditorSheet(
@@ -220,6 +253,55 @@ struct BrowserRootView: View {
         .preferredColorScheme(
             tabManager.appTheme == .dark ? .dark : (tabManager.appTheme == .light ? .light : nil)
         )
+    }
+
+    private func showTopCapsuleToast(_ message: String, actionTitle: String? = nil, urlToOpen: String? = nil) {
+        let notice = ToastNotice(message: message, actionTitle: actionTitle, urlToOpen: urlToOpen, handoff: nil)
+        topToastDismissTask?.cancel()
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) {
+            topCapsuleToast = notice
+        }
+        topToastDismissTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 4_500_000_000)
+            guard !Task.isCancelled else { return }
+            if topCapsuleToast?.id == notice.id {
+                withAnimation(.easeOut(duration: 0.25)) {
+                    topCapsuleToast = nil
+                }
+            }
+        }
+    }
+
+    private func handleIncomingHandoff(_ payload: HandoffPayload?) {
+        guard let payload else { return }
+        let kind = payload.kind.lowercased()
+        if kind == "clipboard" {
+            let text = payload.text ?? ""
+            if !text.isEmpty {
+                UIPasteboard.general.string = text
+                tabManager.syncClipboardChangeCount()
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                let validUrl = tabManager.extractHTTPURL(from: text)?.absoluteString
+                showTopCapsuleToast(
+                    L10n.t("📋 已同步来自电脑的剪贴板", "📋 Synced clipboard from desktop"),
+                    actionTitle: validUrl != nil ? L10n.t("直接打开", "Open") : nil,
+                    urlToOpen: validUrl
+                )
+            }
+            handoffService.latestIncoming = nil
+            return
+        }
+
+        if kind == "tab" || kind == "video" {
+            let ageMs = Date().timeIntervalSince1970 * 1000 - payload.createdAt
+            if ageMs <= 90_000, let raw = payload.url, let url = URL(string: raw) {
+                let seek = (payload.videoSeconds ?? 0) > 0 ? payload.videoSeconds : nil
+                tabManager.createTab(url: url, activate: true, seekSeconds: seek)
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                showTopCapsuleToast(L10n.t("💻 已接力打开来自电脑的网页", "💻 Opened webpage from desktop"))
+                handoffService.latestIncoming = nil
+            }
+        }
     }
 }
 
@@ -615,28 +697,61 @@ private struct HandoffBannerView: View {
     let onDismiss: () -> Void
 
     var body: some View {
-        HStack {
-            Image(systemName: "arrow.triangle.2.circlepath.circle.fill").foregroundStyle(.blue)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(L10n.t("来自桌面端接力", "Desktop Handoff"))
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(.secondary)
-                Text(payload.title ?? payload.url ?? payload.text ?? "")
-                    .font(.caption.weight(.medium))
+        let displayTitle = (payload.title?.isEmpty == false ? payload.title : nil) ?? payload.url ?? payload.text ?? ""
+        HStack(spacing: 8) {
+            Button(action: onOpen) {
+                Text("💻 " + L10n.t("来自电脑：", "From Desktop: ") + displayTitle + " · " + L10n.t("立即打开", "Open Now"))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
                     .lineLimit(1)
             }
-            Spacer()
-            Button(L10n.t("打开", "Open"), action: onOpen)
-                .font(.caption.weight(.bold))
-                .buttonStyle(.borderedProminent)
-                .controlSize(.mini)
+            .buttonStyle(.plain)
+            Spacer(minLength: 4)
             Button(action: onDismiss) {
-                Image(systemName: "xmark").font(.caption)
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
             }
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(
+            Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.14), radius: 8, y: 3)
+    }
+}
+
+private struct TopCapsuleToastView: View {
+    let toast: ToastNotice
+    let onAction: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(toast.message)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+            if let actionTitle = toast.actionTitle {
+                Button(actionTitle, action: onAction)
+                    .font(.caption.weight(.bold))
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.mini)
+            }
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay(
+            Capsule().stroke(Color.primary.opacity(0.1), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.14), radius: 10, y: 4)
     }
 }
 
