@@ -26,14 +26,19 @@ struct TabSwitcherView: View {
                                 dismiss()
                             },
                             onClose: {
-                                withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                                withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
                                     tabManager.closeTab(tab.id)
                                 }
                             }
                         )
+                        .transition(.asymmetric(
+                            insertion: .scale(scale: 0.92).combined(with: .opacity),
+                            removal: .scale(scale: 0.82).combined(with: .opacity)
+                        ))
                     }
                 }
                 .padding(16)
+                .animation(.spring(response: 0.34, dampingFraction: 0.82), value: tabManager.tabs.map(\.id))
             }
             .navigationTitle(L10n.t("标签页 (\(tabManager.tabs.count))", "Tabs (\(tabManager.tabs.count))"))
             .navigationBarTitleDisplayMode(.inline)

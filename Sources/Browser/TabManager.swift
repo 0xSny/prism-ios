@@ -227,7 +227,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         activeTabId = tabs[nextIdx].id
     }
 
-    func activateTab(id: String) {
+    func activateTab(id: UUID) {
         guard tabs.contains(where: { $0.id == id }) else { return }
         activeTabId = id
     }

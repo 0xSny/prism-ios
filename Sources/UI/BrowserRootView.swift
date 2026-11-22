@@ -657,7 +657,7 @@ private struct OmniboxCandidateEntry: Identifiable {
     let url: String
     let subtitle: String
     let isBookmark: Bool
-    let tabId: String?
+    let tabId: UUID?
     let score: Int
     let visitedAt: Double
 }
@@ -667,12 +667,12 @@ private struct OmniboxEditorSheet: View {
     let bookmarks: [BookmarkItem]
     let history: [HistoryItem]
     let tabs: [BrowserTab]
-    let activeTabId: String?
+    let activeTabId: UUID?
     let shortcuts: [HomeShortcut]
     let searchEngine: SearchEngineOption
     let canFindInPage: Bool
     let onSubmit: (String) -> Void
-    let onSelectTab: (String) -> Void
+    let onSelectTab: (UUID) -> Void
     let onFindInPage: (String) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -927,14 +927,14 @@ private struct OmniboxEditorSheet: View {
     private func highlightedSuggestionText(term: String, query: String) -> Text {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty, let range = term.range(of: q, options: .caseInsensitive) else {
-            return Text(term).foregroundColor(.primary)
+            return Text(term).foregroundStyle(.primary)
         }
         let before = String(term[..<range.lowerBound])
         let match = String(term[range])
         let after = String(term[range.upperBound...])
-        return Text(before).foregroundColor(.secondary)
-            + Text(match).fontWeight(.semibold).foregroundColor(.primary)
-            + Text(after).foregroundColor(.secondary)
+        return Text(before).foregroundStyle(.secondary)
+            + Text(match).bold().foregroundStyle(.primary)
+            + Text(after).foregroundStyle(.secondary)
     }
 
     private func normalizeKey(_ raw: String) -> String {
@@ -995,7 +995,7 @@ private struct OmniboxEditorSheet: View {
                 seen.insert(k)
                 let host = hostOnly(t.urlString)
                 tabEntries.append(OmniboxCandidateEntry(
-                    id: "tab-\(t.id)",
+                    id: "tab-\(t.id.uuidString)",
                     title: t.title.isEmpty ? host : t.title,
                     url: t.urlString,
                     subtitle: "\(host) · \(L10n.t("打开的标签页", "Open Tab"))",
@@ -1053,7 +1053,7 @@ private struct OmniboxEditorSheet: View {
             if s > 0 {
                 let host = hostOnly(t.urlString)
                 tabMatches.append(OmniboxCandidateEntry(
-                    id: "tab-\(t.id)",
+                    id: "tab-\(t.id.uuidString)",
                     title: t.title.isEmpty ? host : t.title,
                     url: t.urlString,
                     subtitle: "\(host) · \(L10n.t("打开的标签页", "Open Tab"))",
