@@ -73,9 +73,10 @@ struct HomeNewTabView: View {
                         L10n.t("在 Google 中搜索，或输入网址", "Search or type a URL"),
                         text: $query
                     )
+                    .keyboardType(.default)
                     .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .submitLabel(.go)
+                    .autocorrectionDisabled(true)
+                    .submitLabel(.search)
                     .onSubmit {
                         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !q.isEmpty else { return }
@@ -187,10 +188,14 @@ struct HomeNewTabView: View {
             NavigationStack {
                 Form {
                     TextField(L10n.t("网站名称", "Name"), text: $newTitle)
-                    TextField(L10n.t("网址 (例如 https://example.com)", "URL (e.g. https://example.com)"), text: $newUrl)
-                        .keyboardType(.URL)
+                        .keyboardType(.default)
                         .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+                        .autocorrectionDisabled(true)
+                    TextField(L10n.t("网址 (例如 https://example.com)", "URL (e.g. https://example.com)"), text: $newUrl)
+                        .keyboardType(.default)
+                        .submitLabel(.search)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
                 }
                 .navigationTitle(L10n.t("添加快捷方式", "Add Shortcut"))
                 .toolbar {
@@ -311,6 +316,10 @@ private struct WeatherCityPickerSheet: View {
 
                 Section(L10n.t("搜索城市", "Search City")) {
                     TextField(L10n.t("输入城市名（如 北京 / Shanghai / Tokyo）", "City name..."), text: $searchQuery)
+                        .keyboardType(.default)
+                        .submitLabel(.search)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
                         .onChange(of: searchQuery) { _, val in
                             Task { await searchCities(val) }
                         }

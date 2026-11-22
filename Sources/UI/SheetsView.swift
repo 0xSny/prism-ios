@@ -136,7 +136,7 @@ struct MenuSheetView: View {
                     }
                 }
             }
-            .navigationTitle("Prism v0.9.0")
+            .navigationTitle("Prism v1.0.0")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -432,6 +432,9 @@ struct ProfilesSheetView: View {
                 NavigationStack {
                     Form {
                         TextField(L10n.t("身份名称", "Profile Name"), text: $newName)
+                            .keyboardType(.default)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled(true)
                         Picker(L10n.t("网络代理", "Proxy Mode"), selection: $proxyMode) {
                             Text(L10n.t("系统代理", "System")).tag(ProxyMode.system)
                             Text(L10n.t("直连", "Direct")).tag(ProxyMode.direct)
@@ -439,8 +442,9 @@ struct ProfilesSheetView: View {
                         }
                         if proxyMode == .custom {
                             TextField("socks5://127.0.0.1:7891", text: $newProxy)
+                                .keyboardType(.default)
                                 .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
+                                .autocorrectionDisabled(true)
                         }
                     }
                     .navigationTitle(L10n.t("创建隔离身份", "New Profile"))
@@ -503,6 +507,10 @@ struct VaultSheetView: View {
                 }
             }
             .searchable(text: $search)
+            .keyboardType(.default)
+            .submitLabel(.search)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled(true)
             .navigationTitle(L10n.t("加密密码库", "Password Vault"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

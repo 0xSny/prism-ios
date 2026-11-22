@@ -6,7 +6,7 @@ final class AdBlockManager: ObservableObject {
     static let shared = AdBlockManager()
     @Published private(set) var compiledRuleList: WKContentRuleList?
 
-    private static let ruleIdentifier = "prism-easylist-adguard-cn-v1"
+    private static let ruleIdentifier = "prism-easylist-adguard-cn-v1.0.0"
 
     static let blockedAppSchemes: Set<String> = [
         "itms-apps", "itms-appss", "itms",

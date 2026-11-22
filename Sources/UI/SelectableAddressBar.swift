@@ -16,10 +16,13 @@ struct SelectableAddressBar: UIViewRepresentable {
         tf.delegate = context.coordinator
         tf.placeholder = placeholder
         tf.font = .systemFont(ofSize: 15, weight: .regular)
-        tf.keyboardType = .URL
-        tf.returnKeyType = .go
-        tf.autocorrectionType = .no
+        tf.keyboardType = .default
+        tf.textContentType = nil
+        tf.returnKeyType = .search
         tf.autocapitalizationType = .none
+        tf.autocorrectionType = .no
+        tf.smartQuotesType = .no
+        tf.smartDashesType = .no
         tf.clearButtonMode = .whileEditing
         tf.borderStyle = .none
         tf.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)

@@ -647,8 +647,9 @@ private struct SavePasswordBanner: View {
                     .font(.caption.weight(.semibold))
                 TextField(L10n.t("账号/邮箱", "Username"), text: $editedUsername)
                     .font(.caption2)
+                    .keyboardType(.default)
                     .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
+                    .autocorrectionDisabled(true)
                     .onAppear { editedUsername = initialUsername }
             }
             Spacer()
