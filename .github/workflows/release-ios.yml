@@ -13,8 +13,8 @@ jobs:
   build-ios:
     runs-on: macos-15
     env:
-      APP_VERSION: "1.1.1"
-      BUILD_NUMBER: "1101"
+      APP_VERSION: "1.1.2"
+      BUILD_NUMBER: "1102"
       BUNDLE_ID: "com.zzaoo.prism.mobile"
     steps:
       - name: Checkout repository
@@ -86,7 +86,7 @@ jobs:
                     "size": ${IPA_SIZE},
                     "minOSVersion": "17.0",
                     "downloadURL": "https://prism.zzaoo.com/releases/Prism-${APP_VERSION}.ipa",
-                    "localizedDescription": "v${APP_VERSION}：液态玻璃倒序悬浮 Omnibox、0ms 网页深色预染色自愈、精准视频接力定位、底栏安全内边距、锁屏媒体控制、书签/历史/密码库 CRUD 与 Tombstone 同步。"
+                    "localizedDescription": "v${APP_VERSION}：新增 iOS WKWebView 中文输入法合成态与 CodeMirror 编辑器自愈补丁、液态玻璃倒序悬浮 Omnibox、0ms 网页深色预染色自愈、精准视频接力定位、书签/历史/密码库云同步。"
                   }
                 ]
               }

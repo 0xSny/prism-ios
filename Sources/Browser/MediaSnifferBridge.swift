@@ -311,6 +311,317 @@ enum MediaSnifferScripts {
     })();
     """
 
+    static let imeCodeMirrorHealerSource = """
+    (() => {
+      if (window.__prismImeHealerInstalled) return;
+      window.__prismImeHealerInstalled = true;
+
+      const composingTargets = new WeakSet();
+      const inputTimers = new WeakMap();
+      const ZWS_RE = /[\\u200B\\uFEFF]/g;
+
+      function hasActiveCompositionInside(root) {
+        if (!root) return false;
+        const active = document.activeElement;
+        if (active && root.contains(active) && composingTargets.has(active)) {
+          return true;
+        }
+        return composingTargets.has(root);
+      }
+
+      function stripZws(str) {
+        return (str || '').replace(ZWS_RE, '');
+      }
+
+      function collectTextSkipping(node, skipSelector, out) {
+        if (!node) return;
+        if (node.nodeType === 3) {
+          const clean = stripZws(node.nodeValue);
+          if (clean) out.push(clean);
+          return;
+        }
+        if (node.nodeType !== 1) return;
+        if (skipSelector && node.matches && node.matches(skipSelector)) return;
+        const children = node.childNodes;
+        for (let i = 0; i < children.length; i++) {
+          collectTextSkipping(children[i], skipSelector, out);
+        }
+        if (node.matches && node.matches('.CodeMirror-line, .cm-line, div, p, pre')) {
+          out.push('\\n');
+        }
+      }
+
+      function removeDirectOrphanTextNodes(el) {
+        if (!el || !el.childNodes) return;
+        for (let i = el.childNodes.length - 1; i >= 0; i--) {
+          const child = el.childNodes[i];
+          if (child.nodeType === 3) {
+            el.removeChild(child);
+          }
+        }
+      }
+
+      function anchorSelectionInsideLine(lineEl) {
+        if (!lineEl) return;
+        try {
+          const sel = window.getSelection();
+          if (!sel) return;
+          const range = document.createRange();
+          if (lineEl.firstChild && lineEl.firstChild.nodeType === 3) {
+            range.setStart(lineEl.firstChild, lineEl.firstChild.nodeValue.length);
+          } else {
+            range.selectNodeContents(lineEl);
+          }
+          range.collapse(false);
+          sel.removeAllRanges();
+          sel.addRange(range);
+        } catch (_) {}
+      }
+
+      function healCodeMirror5(wrapper, restoreFocus) {
+        try {
+          if (!wrapper || !wrapper.CodeMirror || hasActiveCompositionInside(wrapper)) return false;
+          const cm = wrapper.CodeMirror;
+          if (typeof cm.getValue !== 'function' || typeof cm.setValue !== 'function') return false;
+          const currentVal = cm.getValue() || '';
+          const ph = wrapper.querySelector('.CodeMirror-placeholder');
+          const phVisible = !!(ph && ph.offsetParent !== null && getComputedStyle(ph).display !== 'none');
+          if (currentVal !== '' && !phVisible) return false;
+
+          const codeEl = wrapper.querySelector('.CodeMirror-code');
+          if (!codeEl) return false;
+
+          const parts = [];
+          const skipSel = '.CodeMirror-placeholder, .CodeMirror-linenumber, .CodeMirror-gutter-elt, .CodeMirror-cursors, .CodeMirror-selected, .CodeMirror-gutter-wrapper';
+          collectTextSkipping(codeEl, skipSel, parts);
+          let rescued = parts.join('');
+          rescued = rescued.replace(/\\n+$/, '');
+          if (!stripZws(rescued).trim()) return false;
+          if (rescued === currentVal) return false;
+
+          removeDirectOrphanTextNodes(codeEl);
+          const sizer = wrapper.querySelector('.CodeMirror-sizer');
+          const lines = wrapper.querySelector('.CodeMirror-lines');
+          removeDirectOrphanTextNodes(sizer);
+          removeDirectOrphanTextNodes(lines);
+
+          cm.setValue(rescued);
+          const lastLine = Math.max(0, (typeof cm.lineCount === 'function' ? cm.lineCount() : 1) - 1);
+          const lastText = typeof cm.getLine === 'function' ? (cm.getLine(lastLine) || '') : rescued;
+          if (typeof cm.setCursor === 'function') {
+            cm.setCursor({ line: lastLine, ch: lastText.length });
+          }
+          if (typeof cm.refresh === 'function') {
+            cm.refresh();
+          }
+          if (restoreFocus && typeof cm.focus === 'function') {
+            cm.focus();
+          }
+          return true;
+        } catch (_) {
+          return false;
+        }
+      }
+
+      function healCodeMirror6(editor, restoreFocus) {
+        try {
+          if (!editor || hasActiveCompositionInside(editor)) return false;
+          const content = editor.querySelector('.cm-content');
+          if (!content) return false;
+          const hasPlaceholder = !!editor.querySelector('.cm-placeholder');
+          if (!hasPlaceholder) return false;
+
+          let orphanParts = [];
+          for (let i = content.childNodes.length - 1; i >= 0; i--) {
+            const child = content.childNodes[i];
+            if (child.nodeType === 3) {
+              const txt = stripZws(child.nodeValue);
+              if (txt) orphanParts.unshift(txt);
+              content.removeChild(child);
+            }
+          }
+          let rescued = orphanParts.join('');
+          if (!rescued) {
+            const collected = [];
+            collectTextSkipping(content, '.cm-placeholder', collected);
+            const candidate = collected.join('').replace(/\\n+$/, '');
+            if (!stripZws(candidate).trim()) return false;
+            rescued = candidate;
+            const firstLine = content.querySelector('.cm-line');
+            if (firstLine) {
+              firstLine.textContent = '';
+            }
+          }
+
+          if (!rescued) return false;
+          content.focus({ preventScroll: true });
+          const targetLine = content.querySelector('.cm-line') || content;
+          anchorSelectionInsideLine(targetLine);
+          let inserted = false;
+          try {
+            inserted = document.execCommand('insertText', false, rescued);
+          } catch (_) {
+            inserted = false;
+          }
+          if (!inserted) {
+            try {
+              const bi = new InputEvent('beforeinput', {
+                bubbles: true,
+                cancelable: true,
+                inputType: 'insertText',
+                data: rescued
+              });
+              content.dispatchEvent(bi);
+              content.dispatchEvent(new InputEvent('input', {
+                bubbles: true,
+                inputType: 'insertText',
+                data: rescued
+              }));
+            } catch (_) {
+              content.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+          }
+          if (!restoreFocus && document.activeElement === content) {
+            content.blur();
+          }
+          return true;
+        } catch (_) {
+          return false;
+        }
+      }
+
+      function healVueComposingFlag(el) {
+        try {
+          if (!el || composingTargets.has(el)) return false;
+          if (el.composing === true) {
+            el.composing = false;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            return true;
+          }
+        } catch (_) {}
+        return false;
+      }
+
+      function healForTarget(target, restoreFocus) {
+        if (!target || composingTargets.has(target)) return;
+        const el = target.nodeType === 1 ? target : target.parentElement;
+        if (!el) return;
+
+        const cm5 = el.closest ? el.closest('.CodeMirror') : null;
+        if (cm5) healCodeMirror5(cm5, restoreFocus);
+
+        const cm6 = el.closest ? el.closest('.cm-editor') : null;
+        if (cm6) healCodeMirror6(cm6, restoreFocus);
+
+        const field = el.closest ? el.closest('input, textarea, [contenteditable]') : null;
+        if (field) healVueComposingFlag(field);
+      }
+
+      function scheduleHeal(target, delayMs, restoreFocus) {
+        const el = target && target.nodeType === 1 ? target : (target && target.parentElement);
+        if (!el) return;
+        const prev = inputTimers.get(el);
+        if (prev) clearTimeout(prev);
+        const timer = setTimeout(() => {
+          inputTimers.delete(el);
+          healForTarget(el, restoreFocus);
+        }, delayMs);
+        inputTimers.set(el, timer);
+      }
+
+      function handleTouchOrClickFocus(e) {
+        try {
+          if (e.type === 'touchend' && lastTouchMoved) return;
+          const target = e.target;
+          if (!target || !target.closest) return;
+
+          const cm5 = target.closest('.CodeMirror');
+          if (cm5 && cm5.CodeMirror && !cm5.classList.contains('CodeMirror-focused')) {
+            const cm = cm5.CodeMirror;
+            if (typeof cm.focus === 'function') cm.focus();
+            if (typeof cm.getValue === 'function' && !cm.getValue() && typeof cm.setCursor === 'function') {
+              cm.setCursor(0, 0);
+            }
+            return;
+          }
+
+          const cm6 = target.closest('.cm-editor');
+          if (cm6) {
+            const content = cm6.querySelector('.cm-content');
+            if (content && document.activeElement !== content && !content.contains(document.activeElement)) {
+              content.focus({ preventScroll: true });
+              const line = content.querySelector('.cm-line') || content;
+              anchorSelectionInsideLine(line);
+            }
+          }
+        } catch (_) {}
+      }
+
+      let touchStartX = 0;
+      let touchStartY = 0;
+      let lastTouchMoved = false;
+
+      document.addEventListener('touchstart', (e) => {
+        const t = e.touches && e.touches[0];
+        if (!t) return;
+        touchStartX = t.clientX;
+        touchStartY = t.clientY;
+        lastTouchMoved = false;
+      }, { capture: true, passive: true });
+
+      document.addEventListener('touchmove', (e) => {
+        if (lastTouchMoved) return;
+        const t = e.touches && e.touches[0];
+        if (!t) return;
+        if (Math.abs(t.clientX - touchStartX) > 10 || Math.abs(t.clientY - touchStartY) > 10) {
+          lastTouchMoved = true;
+        }
+      }, { capture: true, passive: true });
+
+      document.addEventListener('touchend', handleTouchOrClickFocus, true);
+      document.addEventListener('click', handleTouchOrClickFocus, true);
+
+      document.addEventListener('compositionstart', (e) => {
+        if (e.target) composingTargets.add(e.target);
+      }, true);
+
+      document.addEventListener('compositionend', (e) => {
+        const t = e.target;
+        if (t) composingTargets.delete(t);
+        scheduleHeal(t, 20, true);
+      }, true);
+
+      document.addEventListener('blur', (e) => {
+        if (e.target) composingTargets.delete(e.target);
+      }, true);
+
+      document.addEventListener('input', (e) => {
+        if (e.isComposing || (e.target && composingTargets.has(e.target))) return;
+        healVueComposingFlag(e.target);
+        scheduleHeal(e.target, 80, true);
+      }, true);
+
+      document.addEventListener('pointerdown', (e) => {
+        try {
+          const btn = e.target && e.target.closest ? e.target.closest('button, [type="submit"], [role="button"]') : null;
+          if (!btn) return;
+          const fields = document.querySelectorAll('input, textarea, [contenteditable]');
+          for (let i = 0; i < fields.length; i++) {
+            healVueComposingFlag(fields[i]);
+          }
+          const cm5s = document.querySelectorAll('.CodeMirror');
+          for (let i = 0; i < cm5s.length; i++) {
+            healCodeMirror5(cm5s[i], false);
+          }
+          const cm6s = document.querySelectorAll('.cm-editor');
+          for (let i = 0; i < cm6s.length; i++) {
+            healCodeMirror6(cm6s[i], false);
+          }
+        } catch (_) {}
+      }, true);
+    })();
+    """
+
     static func autofillJS(username: String, password: String) -> String {
         let uJson = (try? String(data: JSONEncoder().encode(username), encoding: .utf8)) ?? "\"\""
         let pJson = (try? String(data: JSONEncoder().encode(password), encoding: .utf8)) ?? "\"\""

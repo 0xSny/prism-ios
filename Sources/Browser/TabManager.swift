@@ -757,6 +757,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         let shieldSource = AppJumpShield.antiHijackScriptSource(enabled: shieldEnabled)
         ucc.addUserScript(WKUserScript(source: shieldSource, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         ucc.addUserScript(WKUserScript(source: MediaSnifferScripts.injectScriptSource, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        ucc.addUserScript(WKUserScript(source: MediaSnifferScripts.imeCodeMirrorHealerSource, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         if devToolsActive {
             ucc.addUserScript(WKUserScript(source: "window.__prismDevToolsEnabled = true;", injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
