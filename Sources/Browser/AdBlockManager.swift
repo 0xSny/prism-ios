@@ -25,8 +25,11 @@ final class AdBlockManager: ObservableObject {
     ]
 
     func prepareRules() async {
+        guard let store = WKContentRuleListStore.default() else {
+            self.compiledRuleLists = []
+            return
+        }
         var loaded: [WKContentRuleList] = []
-        let store = WKContentRuleListStore.default()
         for pack in Self.rulePacks {
             if let existing = try? await store.contentRuleList(forIdentifier: pack.identifier) {
                 loaded.append(existing)
