@@ -13,9 +13,9 @@ struct MenuSheetView: View {
         NavigationStack {
             List {
                 Section {
-                    HStack(spacing: 12) {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 5), spacing: 8) {
                         QuickMenuTile(
-                            title: L10n.t("新标签页", "New Tab"),
+                            title: L10n.t("新标签", "New Tab"),
                             icon: "plus.square",
                             color: .blue
                         ) {
@@ -23,7 +23,7 @@ struct MenuSheetView: View {
                             dismiss()
                         }
                         QuickMenuTile(
-                            title: tabManager.isCurrentBookmarked() ? L10n.t("已收藏", "Saved") : L10n.t("收藏本页", "Bookmark"),
+                            title: tabManager.isCurrentBookmarked() ? L10n.t("已收藏", "Saved") : L10n.t("收藏", "Bookmark"),
                             icon: tabManager.isCurrentBookmarked() ? "star.fill" : "star",
                             color: .orange
                         ) {
@@ -31,7 +31,7 @@ struct MenuSheetView: View {
                             dismiss()
                         }
                         QuickMenuTile(
-                            title: (tabManager.activeTab?.isTranslated == true) ? L10n.t("恢复原文", "Original") : L10n.t("中文翻译", "Translate"),
+                            title: (tabManager.activeTab?.isTranslated == true) ? L10n.t("原文", "Original") : L10n.t("翻译", "Translate"),
                             icon: "character.book.closed",
                             color: .purple
                         ) {
@@ -45,6 +45,31 @@ struct MenuSheetView: View {
                         ) {
                             tabManager.toggleDesktopUserAgent()
                             dismiss()
+                        }
+                        if let tab = tabManager.activeTab, !tab.isNewTab, let shareURL = URL(string: tab.urlString) {
+                            ShareLink(item: shareURL) {
+                                VStack(spacing: 6) {
+                                    Image(systemName: "square.and.arrow.up")
+                                        .font(.system(size: 18, weight: .semibold))
+                                        .foregroundStyle(.teal)
+                                        .frame(width: 44, height: 44)
+                                        .background(Color.teal.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                    Text(L10n.t("分享", "Share"))
+                                        .font(.caption2.weight(.medium))
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                }
+                                .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            QuickMenuTile(
+                                title: L10n.t("分享", "Share"),
+                                icon: "square.and.arrow.up",
+                                color: .teal
+                            ) {
+                                tabManager.showToast(L10n.t("请先打开网页再分享", "Open a webpage first"))
+                            }
                         }
                     }
                     .padding(.vertical, 4)
@@ -183,8 +208,51 @@ struct MenuSheetView: View {
                 }
 
                 Section(L10n.t("防护与偏好", "Protection & Preferences")) {
+                    if let tab = tabManager.activeTab, !tab.isNewTab {
+                        HStack {
+                            Label(L10n.t("本页已拦截强跳与追踪", "Blocked on Current Page"), systemImage: "checkmark.shield")
+                                .foregroundStyle(.primary)
+                            Spacer()
+                            Text(L10n.t("\(tab.blockedCount) 次", "\(tab.blockedCount)"))
+                                .font(.caption.weight(.bold).monospacedDigit())
+                                .foregroundStyle(tab.blockedCount > 0 ? .green : .secondary)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(
+                                    (tab.blockedCount > 0 ? Color.green.opacity(0.14) : Color(.tertiarySystemFill)),
+                                    in: Capsule()
+                                )
+                        }
+                    }
                     Toggle(L10n.t("屏蔽追踪与广告", "Ad & Tracker Blocker"), isOn: $tabManager.adblockEnabled)
                     Toggle(L10n.t("拦截强跳 App Store / 外部App", "Block Rogue App Jumps"), isOn: $tabManager.blockRogueAppJumps)
+                    if tabManager.blockRogueAppJumps, let host = tabManager.activeTabHTTPHost {
+                        Toggle(isOn: Binding(
+                            get: { tabManager.isActiveTabAppJumpWhitelisted },
+                            set: { _ in tabManager.toggleAppJumpWhitelistForActiveTab() }
+                        )) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(L10n.t("在此网站允许打开外部 App", "Allow External Apps on This Site"))
+                                Text(host)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                    if !tabManager.appJumpWhitelistHosts.isEmpty {
+                        Button(role: .destructive) {
+                            tabManager.clearAppJumpWhitelist()
+                        } label: {
+                            Label(
+                                L10n.t(
+                                    "清空外部 App 豁免域名 (\(tabManager.appJumpWhitelistHosts.count))",
+                                    "Clear External App Exceptions (\(tabManager.appJumpWhitelistHosts.count))"
+                                ),
+                                systemImage: "hand.raised.slash"
+                            )
+                        }
+                    }
                     Toggle(L10n.t("地址栏回车直达首位命中站点", "Enter Opens Top Hit in Address Bar"), isOn: $tabManager.omniboxEnterTopHitEnabled)
                     Toggle(L10n.t("深色模式下自动将网页变暗", "Auto-Darken Webpages in Dark Mode"), isOn: $tabManager.webDarkModeFollowTheme)
                     if !tabManager.webDarkModeWhitelistHosts.isEmpty {
@@ -218,7 +286,7 @@ struct MenuSheetView: View {
                     }
                 }
             }
-            .navigationTitle("Prism v1.0.8")
+            .navigationTitle("Prism v1.0.9")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {

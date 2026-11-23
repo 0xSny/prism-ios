@@ -3,6 +3,7 @@ import SwiftUI
 struct TabSwitcherView: View {
     @ObservedObject var tabManager: TabManager
     @ObservedObject var syncEngine: SyncEngine
+    @ObservedObject var handoffService: HandoffService
     @Environment(\.dismiss) private var dismiss
 
     private let columns = [
@@ -21,7 +22,7 @@ struct TabSwitcherView: View {
                             isActive: tab.id == tabManager.activeTabId,
                             onSelect: {
                                 withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
-                                    tabManager.activeTabId = tab.id
+                                    tabManager.activateTab(id: tab.id)
                                 }
                                 dismiss()
                             },
@@ -31,6 +32,54 @@ struct TabSwitcherView: View {
                                 }
                             }
                         )
+                        .contextMenu {
+                            if !tab.isNewTab && !tab.urlString.isEmpty {
+                                Button {
+                                    UIPasteboard.general.string = tab.urlString
+                                    tabManager.syncClipboardChangeCount()
+                                    tabManager.showToast(L10n.t("已复制标签页链接", "Tab URL copied"))
+                                } label: {
+                                    Label(L10n.t("复制链接", "Copy URL"), systemImage: "doc.on.doc")
+                                }
+
+                                Button {
+                                    guard syncEngine.loggedIn else {
+                                        tabManager.showToast(L10n.t("请先登录 Prism Account", "Sign in to Prism Account"))
+                                        return
+                                    }
+                                    Task {
+                                        let ok = await handoffService.push(
+                                            kind: tab.hasVideo ? "video" : "tab",
+                                            title: tab.title,
+                                            url: tab.urlString,
+                                            videoSeconds: tab.hasVideo ? tab.videoSeconds : 0,
+                                            syncEngine: syncEngine
+                                        )
+                                        tabManager.showToast(ok ? L10n.t("已推送至电脑端", "Sent to desktop") : L10n.t("发送失败", "Failed"))
+                                    }
+                                } label: {
+                                    Label(L10n.t("发送到桌面端", "Send to Desktop"), systemImage: "laptopcomputer")
+                                }
+                            }
+
+                            if tabManager.tabs.count > 1 {
+                                Button {
+                                    withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
+                                        tabManager.closeOtherTabs(keeping: tab.id)
+                                    }
+                                } label: {
+                                    Label(L10n.t("关闭其他标签页", "Close Other Tabs"), systemImage: "xmark.square")
+                                }
+                            }
+
+                            Button(role: .destructive) {
+                                withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
+                                    tabManager.closeTab(tab.id)
+                                }
+                            } label: {
+                                Label(L10n.t("关闭此标签页", "Close Tab"), systemImage: "trash")
+                            }
+                        }
                         .transition(.asymmetric(
                             insertion: .scale(scale: 0.92).combined(with: .opacity),
                             removal: .scale(scale: 0.82).combined(with: .opacity)
@@ -43,8 +92,24 @@ struct TabSwitcherView: View {
             .navigationTitle(L10n.t("标签页 (\(tabManager.tabs.count))", "Tabs (\(tabManager.tabs.count))"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItemGroup(placement: .topBarLeading) {
                     Button(L10n.t("关闭", "Done")) { dismiss() }
+
+                    if !tabManager.recentlyClosedTabs.isEmpty {
+                        Button {
+                            withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
+                                tabManager.restoreLastClosedTab()
+                            }
+                            dismiss()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.uturn.backward")
+                                Text("\(tabManager.recentlyClosedTabs.count)")
+                                    .font(.caption.weight(.bold).monospacedDigit())
+                            }
+                        }
+                        .accessibilityLabel(L10n.t("恢复刚关闭的标签页", "Reopen Closed Tab"))
+                    }
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     if tabManager.tabs.count > 1 {

@@ -38,6 +38,7 @@ final class SyncEngine: ObservableObject {
     private var autoSyncTask: Task<Void, Never>?
 
     private let cacheDir: URL
+    var onRemotePortableSettings: ((PortableSettings) -> Void)?
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -164,7 +165,7 @@ final class SyncEngine: ObservableObject {
                 "authKey": derived.authKey,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.0.8",
+                "appVersion": "1.0.9",
             ])
 
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -229,7 +230,7 @@ final class SyncEngine: ObservableObject {
                 "authKey": derived.authKey,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.0.8",
+                "appVersion": "1.0.9",
             ])
 
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -366,7 +367,7 @@ final class SyncEngine: ObservableObject {
                 "wipeOldCiphertext": true,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.0.8",
+                "appVersion": "1.0.9",
             ]
 
             let cleanRec = recoveryKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -620,6 +621,10 @@ final class SyncEngine: ObservableObject {
                         UserDefaults.standard.set(freq, forKey: "prism.autoSyncInterval")
                         rescheduleAutoSync()
                     }
+                    if let blockJumps = remote.blockRogueAppJumps {
+                        UserDefaults.standard.set(blockJumps, forKey: "prism.blockRogueAppJumps")
+                    }
+                    onRemotePortableSettings?(remote)
                 }
             default:
                 break
@@ -679,6 +684,9 @@ final class SyncEngine: ObservableObject {
                 let settings: PortableSettings
                 let updatedAt: Double
             }
+            let storedBlockAppJumps = UserDefaults.standard.object(forKey: "prism.blockRogueAppJumps") != nil
+                ? UserDefaults.standard.bool(forKey: "prism.blockRogueAppJumps")
+                : true
             let portable = PortableSettings(
                 language: L10n.isEnglish ? .en : .zhCN,
                 theme: nil,
@@ -687,7 +695,7 @@ final class SyncEngine: ObservableObject {
                 stripTrackingParams: nil,
                 autoSyncIntervalMinutes: autoSyncIntervalMinutes,
                 builtInAdblockEnabled: nil,
-                blockRogueAppJumps: nil
+                blockRogueAppJumps: storedBlockAppJumps
             )
             if let env = try? CryptoVault.encryptJSON(SettingsPayload(settings: portable, updatedAt: nowMs), encKey: encKey) {
                 out.append(SyncItemPayload(scope: "settings", itemId: "settings:portable", iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: nowMs))

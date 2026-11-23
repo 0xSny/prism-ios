@@ -3,6 +3,19 @@ import LocalAuthentication
 import UIKit
 import WebKit
 
+struct PersistedTabItem: Codable, Identifiable, Equatable {
+    var id: UUID
+    var profileId: String
+    var title: String
+    var urlString: String
+    var isNewTab: Bool
+}
+
+private struct PersistedSessionState: Codable {
+    var tabs: [PersistedTabItem]
+    var activeTabId: UUID?
+}
+
 @MainActor
 protocol PrismTopColorHost: AnyObject {
     func applyTopColor(_ color: UIColor, from traitCollection: UITraitCollection?)
@@ -39,6 +52,7 @@ final class BrowserTab: ObservableObject, Identifiable {
 
     var webView: WKWebView?
     var topBackdropColor: UIColor?
+    var lastUserInteractionAt: TimeInterval = 0
     var themeColorObservation: NSKeyValueObservation?
     var progressObservation: NSKeyValueObservation?
     var loadingObservation: NSKeyValueObservation?
@@ -46,6 +60,14 @@ final class BrowserTab: ObservableObject, Identifiable {
     var urlObservation: NSKeyValueObservation?
     var backObservation: NSKeyValueObservation?
     var forwardObservation: NSKeyValueObservation?
+
+    var isWithinUserGestureWindow: Bool {
+        (Date().timeIntervalSince1970 - lastUserInteractionAt) <= 0.85
+    }
+
+    func markUserInteraction() {
+        lastUserInteractionAt = Date().timeIntervalSince1970
+    }
 
     init(id: UUID = UUID(), profileId: String, initialURL: URL? = nil) {
         self.id = id
@@ -95,8 +117,18 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     }
 
     @Published var tabs: [BrowserTab] = []
-    @Published var activeTabId: UUID?
+    @Published var activeTabId: UUID? {
+        didSet {
+            guard !isRestoringSession else { return }
+            if let nextId = activeTabId, nextId != oldValue {
+                loadLazyWebViewIfNeeded(for: tabs.first(where: { $0.id == nextId }))
+            }
+            scheduleSessionSave()
+        }
+    }
     @Published var activeToast: ToastNotice?
+    @Published var recentlyClosedTabs: [PersistedTabItem] = []
+    @Published var hasClipboardWebURL: Bool = false
     @Published var searchEngine: SearchEngineOption = .google
     @Published var appTheme: AppTheme = .system {
         didSet {
@@ -127,7 +159,21 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             applyAdblockToAllTabs()
         }
     }
-    @Published var blockRogueAppJumps: Bool = true
+    @Published var blockRogueAppJumps: Bool = true {
+        didSet {
+            UserDefaults.standard.set(blockRogueAppJumps, forKey: "prism.blockRogueAppJumps")
+            syncAppJumpShieldToAllTabs()
+            if !isApplyingRemoteSettings {
+                syncEngine?.notifyScopeDirty("settings")
+            }
+        }
+    }
+    @Published var appJumpWhitelistHosts: Set<String> = [] {
+        didSet {
+            UserDefaults.standard.set(Array(appJumpWhitelistHosts).sorted(), forKey: "prism.appJumpWhitelistHosts")
+            syncAppJumpShieldToAllTabs()
+        }
+    }
     @Published var desktopMode: Bool = false
     @Published var omniboxEnterTopHitEnabled: Bool = false {
         didSet {
@@ -139,16 +185,33 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     weak var syncEngine: SyncEngine?
     weak var handoffService: HandoffService?
 
+    private static let allowWithoutAppLink = WKNavigationActionPolicy(rawValue: WKNavigationActionPolicy.allow.rawValue + 2) ?? .allow
+
     private var lastClipboardChangeCount: Int = UIPasteboard.general.changeCount
     private var lastPromptedClipboard: String = ""
     private var allowedOnceJumpURL: URL?
+    private var allowedOnceJumpExpiresAt: TimeInterval = 0
+    private var isApplyingRemoteSettings: Bool = false
+    private var isRestoringSession: Bool = false
+    private var skipAutoLazyLoadTabId: UUID?
+    private var sessionSaveTask: Task<Void, Never>?
+    private var blockedAppBannerDismissTask: Task<Void, Never>?
     private var systemIsDark: Bool = UITraitCollection.current.userInterfaceStyle == .dark
     private var devToolsActive: Bool = false
     private var downloadMap: [ObjectIdentifier: UUID] = [:]
 
+    private let sessionFileURL: URL = {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        return base.appendingPathComponent("tabs-session.json")
+    }()
+
     override init() {
         super.init()
         URLCache.shared = URLCache(memoryCapacity: 32 * 1024 * 1024, diskCapacity: 160 * 1024 * 1024)
+        isApplyingRemoteSettings = true
+        defer { isApplyingRemoteSettings = false }
         if let rawEngine = UserDefaults.standard.string(forKey: "prism.searchEngine"),
            let eng = SearchEngineOption(rawValue: rawEngine) {
             self.searchEngine = eng
@@ -159,6 +222,16 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         }
         if UserDefaults.standard.object(forKey: "prism.adblockEnabled") != nil {
             self.adblockEnabled = UserDefaults.standard.bool(forKey: "prism.adblockEnabled")
+        }
+        if UserDefaults.standard.object(forKey: "prism.blockRogueAppJumps") != nil {
+            self.blockRogueAppJumps = UserDefaults.standard.bool(forKey: "prism.blockRogueAppJumps")
+        } else {
+            UserDefaults.standard.set(true, forKey: "prism.blockRogueAppJumps")
+        }
+        if let savedJumpHosts = UserDefaults.standard.stringArray(forKey: "prism.appJumpWhitelistHosts") {
+            self.appJumpWhitelistHosts = Set(
+                savedJumpHosts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }.filter { !$0.isEmpty }
+            )
         }
         if UserDefaults.standard.object(forKey: "prism.omniboxEnterTopHitEnabled") != nil {
             self.omniboxEnterTopHitEnabled = UserDefaults.standard.bool(forKey: "prism.omniboxEnterTopHitEnabled")
@@ -173,7 +246,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             self.webDarkModeWhitelistHosts = Set(cleaned)
         }
         BackgroundMediaController.shared.configureAudioSession()
-        createTab(url: nil, activate: true)
+        restoreSessionOrCreateDefault()
     }
 
     var isEffectiveAppDark: Bool {
@@ -237,6 +310,31 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         webDarkModeWhitelistHosts.removeAll()
     }
 
+    var isActiveTabAppJumpWhitelisted: Bool {
+        guard let host = activeTabHTTPHost else { return false }
+        return appJumpWhitelistHosts.contains(host)
+    }
+
+    func isHostAppJumpWhitelisted(_ url: URL?) -> Bool {
+        guard let host = normalizedHTTPHost(from: url) else { return false }
+        return appJumpWhitelistHosts.contains(host)
+    }
+
+    func toggleAppJumpWhitelistForActiveTab() {
+        guard let host = activeTabHTTPHost else { return }
+        if appJumpWhitelistHosts.contains(host) {
+            appJumpWhitelistHosts.remove(host)
+            showToast(L10n.t("已恢复此网站防强跳拦截", "App jump blocker restored for this site"))
+        } else {
+            appJumpWhitelistHosts.insert(host)
+            showToast(L10n.t("已允许此网站打开外部 App", "External app opening allowed for this site"))
+        }
+    }
+
+    func clearAppJumpWhitelist() {
+        appJumpWhitelistHosts.removeAll()
+    }
+
     var activeTab: BrowserTab? {
         tabs.first(where: { $0.id == activeTabId }) ?? tabs.first
     }
@@ -245,6 +343,103 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         let profiles = syncEngine?.profiles ?? [.defaultProfile]
         let pid = activeTab?.profileId ?? "default"
         return profiles.first(where: { $0.id == pid }) ?? profiles.first ?? .defaultProfile
+    }
+
+    // MARK: - Session Persistence & Lazy Tab Loading
+
+    private func restoreSessionOrCreateDefault() {
+        if let data = try? Data(contentsOf: sessionFileURL),
+           let saved = try? JSONDecoder().decode(PersistedSessionState.self, from: data),
+           !saved.tabs.isEmpty {
+            isRestoringSession = true
+            var restored: [BrowserTab] = []
+            for item in saved.tabs {
+                let targetURL = item.isNewTab ? nil : URL(string: item.urlString)
+                let tab = BrowserTab(id: item.id, profileId: item.profileId, initialURL: targetURL)
+                tab.isNewTab = item.isNewTab || targetURL == nil
+                tab.urlString = item.isNewTab ? "" : item.urlString
+                if !item.title.isEmpty {
+                    tab.title = item.title
+                }
+                restored.append(tab)
+            }
+            self.tabs = restored
+            if let savedActive = saved.activeTabId, restored.contains(where: { $0.id == savedActive }) {
+                self.activeTabId = savedActive
+            } else {
+                self.activeTabId = restored.first?.id
+            }
+            isRestoringSession = false
+            // Only instantiate WKWebView for the visible active tab at cold launch (0ms background lazy restore)
+            loadLazyWebViewIfNeeded(for: activeTab)
+            return
+        }
+        createTab(url: nil, activate: true)
+    }
+
+    func loadLazyWebViewIfNeeded(for tab: BrowserTab?) {
+        guard let tab, !tab.isNewTab, tab.webView == nil,
+              let url = URL(string: tab.urlString), !tab.urlString.isEmpty else {
+            return
+        }
+        load(url: url, in: tab)
+    }
+
+    func scheduleSessionSave() {
+        guard !isRestoringSession else { return }
+        sessionSaveTask?.cancel()
+        sessionSaveTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard !Task.isCancelled else { return }
+            self?.saveSessionImmediately()
+        }
+    }
+
+    func saveSessionImmediately() {
+        sessionSaveTask?.cancel()
+        sessionSaveTask = nil
+        let items = tabs.map { tab in
+            PersistedTabItem(
+                id: tab.id,
+                profileId: tab.profileId,
+                title: tab.title,
+                urlString: tab.urlString,
+                isNewTab: tab.isNewTab
+            )
+        }
+        let state = PersistedSessionState(tabs: items, activeTabId: activeTabId)
+        let targetURL = sessionFileURL
+        if let data = try? JSONEncoder().encode(state) {
+            Task.detached(priority: .utility) {
+                try? data.write(to: targetURL, options: .atomic)
+            }
+        }
+    }
+
+    private func recordClosedTabIfEligible(_ tab: BrowserTab) {
+        guard !tab.isNewTab, !tab.urlString.isEmpty else { return }
+        let entry = PersistedTabItem(
+            id: tab.id,
+            profileId: tab.profileId,
+            title: tab.title,
+            urlString: tab.urlString,
+            isNewTab: false
+        )
+        recentlyClosedTabs.removeAll { $0.urlString == entry.urlString }
+        recentlyClosedTabs.insert(entry, at: 0)
+        if recentlyClosedTabs.count > 5 {
+            recentlyClosedTabs = Array(recentlyClosedTabs.prefix(5))
+        }
+    }
+
+    func restoreLastClosedTab() {
+        guard !recentlyClosedTabs.isEmpty else { return }
+        let entry = recentlyClosedTabs.removeFirst()
+        let url = URL(string: entry.urlString)
+        let restored = createTab(url: url, profileId: entry.profileId, activate: true)
+        if !entry.title.isEmpty {
+            restored.title = entry.title
+        }
     }
 
     @discardableResult
@@ -256,16 +451,20 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         let tab = BrowserTab(profileId: pid, initialURL: url)
         tabs.append(tab)
         if activate {
+            skipAutoLazyLoadTabId = tab.id
             activeTabId = tab.id
+            skipAutoLazyLoadTabId = nil
         }
         if let url {
             load(url: url, in: tab, seekSeconds: seekSeconds)
         }
+        scheduleSessionSave()
         return tab
     }
 
     func closeTab(_ id: UUID) {
         guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
+        recordClosedTabIfEligible(tabs[idx])
         tabs[idx].teardown()
         tabs.remove(at: idx)
         if tabs.isEmpty {
@@ -276,10 +475,26 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             let nextIdx = min(idx, tabs.count - 1)
             activeTabId = tabs[nextIdx].id
         }
+        scheduleSessionSave()
+    }
+
+    func closeOtherTabs(keeping keepId: UUID) {
+        for tab in tabs where tab.id != keepId {
+            recordClosedTabIfEligible(tab)
+            tab.teardown()
+        }
+        tabs.removeAll { $0.id != keepId }
+        if tabs.isEmpty {
+            createTab(url: nil, activate: true)
+            return
+        }
+        activeTabId = keepId
+        scheduleSessionSave()
     }
 
     func closeAllTabs() {
         for tab in tabs {
+            recordClosedTabIfEligible(tab)
             tab.teardown()
         }
         tabs.removeAll()
@@ -331,6 +546,33 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             let profile = profiles.first(where: { $0.id == tab.profileId }) ?? .defaultProfile
             AdBlockManager.shared.apply(to: webView.configuration.userContentController, enabled: adblockEnabled && profile.fingerprint.blockTrackers)
         }
+    }
+
+    func applyRemotePortableSettings(_ remote: PortableSettings) {
+        if let blockJumps = remote.blockRogueAppJumps, blockRogueAppJumps != blockJumps {
+            isApplyingRemoteSettings = true
+            blockRogueAppJumps = blockJumps
+            isApplyingRemoteSettings = false
+        }
+    }
+
+    func syncAppJumpShieldToAllTabs() {
+        let profiles = syncEngine?.profiles ?? [.defaultProfile]
+        for tab in tabs {
+            guard let webView = tab.webView else { continue }
+            let profile = profiles.first(where: { $0.id == tab.profileId }) ?? .defaultProfile
+            let pageURL = webView.url ?? URL(string: tab.urlString)
+            let enabled = blockRogueAppJumps && profile.fingerprint.blockTrackers && !isHostAppJumpWhitelisted(pageURL)
+            configureUserScripts(on: webView.configuration.userContentController, profile: profile, initialURL: pageURL)
+            webView.evaluateJavaScript(
+                "window.__prismSetAppJumpShield && window.__prismSetAppJumpShield(\(enabled ? "true" : "false"));",
+                completionHandler: nil
+            )
+        }
+    }
+
+    func markActiveTabUserInteraction() {
+        activeTab?.markUserInteraction()
     }
 
     func extractReaderArticle(completion: @escaping (ReaderArticle?) -> Void) {
@@ -404,8 +646,9 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         config.preferences.isElementFullscreenEnabled = true
 
         let ucc = config.userContentController
-        ucc.add(self, name: "prismBridge")
-        ucc.add(self, name: "prismTopColor")
+        let bridgeHandler = WeakScriptMessageHandler(self)
+        ucc.add(bridgeHandler, name: "prismBridge")
+        ucc.add(bridgeHandler, name: "prismTopColor")
         configureUserScripts(on: ucc, profile: profile, initialURL: URL(string: tab.urlString))
         AdBlockManager.shared.apply(to: ucc, enabled: adblockEnabled && profile.fingerprint.blockTrackers)
 
@@ -487,6 +730,9 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
 
     private func configureUserScripts(on ucc: WKUserContentController, profile: BrowserProfile, initialURL: URL?) {
         ucc.removeAllUserScripts()
+        let shieldEnabled = blockRogueAppJumps && profile.fingerprint.blockTrackers && !isHostAppJumpWhitelisted(initialURL)
+        let shieldSource = AppJumpShield.antiHijackScriptSource(enabled: shieldEnabled)
+        ucc.addUserScript(WKUserScript(source: shieldSource, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         ucc.addUserScript(WKUserScript(source: MediaSnifferScripts.injectScriptSource, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         if devToolsActive {
             ucc.addUserScript(WKUserScript(source: "window.__prismDevToolsEnabled = true;", injectionTime: .atDocumentStart, forMainFrameOnly: false))
@@ -758,8 +1004,122 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
 
     func allowOnceAppJump(_ url: URL) {
         allowedOnceJumpURL = url
+        allowedOnceJumpExpiresAt = Date().timeIntervalSince1970 + 3.0
+        blockedAppBannerDismissTask?.cancel()
+        blockedAppBannerDismissTask = nil
         activeTab?.blockedAppJumpURL = nil
-        UIApplication.shared.open(url)
+        UIApplication.shared.open(url, options: [:], completionHandler: nil)
+    }
+
+    private func showBlockedAppJumpBanner(_ url: URL, on tab: BrowserTab?) {
+        guard let tab else { return }
+        tab.blockedAppJumpURL = url
+        blockedAppBannerDismissTask?.cancel()
+        blockedAppBannerDismissTask = Task { @MainActor [weak tab] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled, let tab else { return }
+            if tab.blockedAppJumpURL == url {
+                tab.blockedAppJumpURL = nil
+            }
+        }
+    }
+
+    private func confirmSystemCommunicationURL(_ url: URL) {
+        let scheme = (url.scheme ?? "").lowercased()
+        let title = L10n.t("打开外部通信应用", "Open System App")
+        let targetText = url.absoluteString
+        let actionLabel: String = {
+            switch scheme {
+            case "tel", "facetime", "facetime-audio":
+                return L10n.t("呼叫", "Call")
+            case "sms":
+                return L10n.t("发送短信", "Message")
+            case "mailto":
+                return L10n.t("发送邮件", "Mail")
+            default:
+                return L10n.t("打开", "Open")
+            }
+        }()
+
+        let alert = UIAlertController(title: title, message: targetText, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: L10n.t("取消", "Cancel"), style: .cancel))
+        alert.addAction(UIAlertAction(title: actionLabel, style: .default) { _ in
+            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+        })
+        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first,
+           let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController ?? scene.windows.first?.rootViewController {
+            var presenter = root
+            while let presented = presenter.presentedViewController {
+                presenter = presented
+            }
+            presenter.present(alert, animated: true)
+        }
+    }
+
+    private func evaluateAppJumpShieldPolicy(
+        for url: URL,
+        in webView: WKWebView,
+        isMainFrame: Bool,
+        isNewWindow: Bool
+    ) -> WKNavigationActionPolicy {
+        let now = Date().timeIntervalSince1970
+        let isAllowedOnce: Bool
+        if let allowed = allowedOnceJumpURL, allowed == url, now <= allowedOnceJumpExpiresAt {
+            isAllowedOnce = true
+            allowedOnceJumpURL = nil
+            allowedOnceJumpExpiresAt = 0
+        } else {
+            if allowedOnceJumpURL != nil && now > allowedOnceJumpExpiresAt {
+                allowedOnceJumpURL = nil
+                allowedOnceJumpExpiresAt = 0
+            }
+            isAllowedOnce = false
+        }
+
+        let tab = tabs.first(where: { $0.webView === webView })
+        let profiles = syncEngine?.profiles ?? [.defaultProfile]
+        let profile = profiles.first(where: { $0.id == tab?.profileId }) ?? .defaultProfile
+        let currentURL = webView.url ?? tab.flatMap { URL(string: $0.urlString) }
+        let shieldEnabled = blockRogueAppJumps && profile.fingerprint.blockTrackers && !isHostAppJumpWhitelisted(currentURL)
+        let withinGesture = tab?.isWithinUserGestureWindow ?? false
+
+        let decision = AppJumpShield.evaluateNavigation(
+            url: url,
+            currentTabURL: currentURL,
+            isMainFrame: isMainFrame,
+            withinGestureWindow: withinGesture,
+            shieldEnabled: shieldEnabled,
+            isAllowedOnce: isAllowedOnce
+        )
+
+        switch decision {
+        case .allowNormal:
+            let scheme = (url.scheme ?? "").lowercased()
+            if shieldEnabled && (scheme == "http" || scheme == "https") {
+                return Self.allowWithoutAppLink
+            }
+            return .allow
+        case .cancelSilently(let incrementBlocked):
+            if incrementBlocked {
+                tab?.blockedCount += 1
+            }
+            return .cancel
+        case .redirectInWebView(let cleanURL):
+            tab?.blockedCount += 1
+            if isNewWindow {
+                createTab(url: cleanURL, profileId: tab?.profileId, activate: true)
+            } else {
+                webView.load(URLRequest(url: cleanURL))
+            }
+            return .cancel
+        case .promptExternalApp(let externalURL, _):
+            tab?.blockedCount += 1
+            showBlockedAppJumpBanner(externalURL, on: tab)
+            return .cancel
+        case .promptSystemCommunication(let sysURL):
+            confirmSystemCommunicationURL(sysURL)
+            return .cancel
+        }
     }
 
     func autofillWithFaceID(entry: PasswordEntry) {
@@ -806,26 +1166,46 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         showToast(L10n.t("已加密保存并同步密码", "Password saved & encrypted"))
     }
 
+    func refreshClipboardWebURLPatternSilently() {
+        let board = UIPasteboard.general
+        board.detectPatterns(for: [.probableWebURL]) { [weak self] result in
+            let isWebURL = (try? result.get().contains(.probableWebURL)) ?? false
+            Task { @MainActor [weak self] in
+                self?.hasClipboardWebURL = isWebURL
+            }
+        }
+    }
+
     func checkClipboardForURL() {
         let board = UIPasteboard.general
         guard board.changeCount != lastClipboardChangeCount else { return }
-        lastClipboardChangeCount = board.changeCount
-        guard let text = board.string?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !text.isEmpty,
-              text != lastPromptedClipboard,
-              text != activeTab?.urlString,
-              let url = extractHTTPURL(from: text) else { return }
-        lastPromptedClipboard = text
-        activeToast = ToastNotice(
-            message: L10n.t("检测到剪贴板链接：", "Clipboard URL detected: ") + (url.host ?? url.absoluteString),
-            actionTitle: L10n.t("立即打开", "Open"),
-            urlToOpen: url.absoluteString,
-            handoff: nil
-        )
-        let toastId = activeToast?.id
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-            if self?.activeToast?.id == toastId {
-                self?.activeToast = nil
+        let currentChangeCount = board.changeCount
+        lastClipboardChangeCount = currentChangeCount
+        // Use privacy-safe detectPatterns first so copying ordinary text NEVER triggers iOS system paste banners
+        board.detectPatterns(for: [.probableWebURL]) { [weak self] result in
+            let isWebURL = (try? result.get().contains(.probableWebURL)) ?? false
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.hasClipboardWebURL = isWebURL
+                guard isWebURL else { return }
+                guard let text = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !text.isEmpty,
+                      text != self.lastPromptedClipboard,
+                      text != self.activeTab?.urlString,
+                      let url = self.extractHTTPURL(from: text) else { return }
+                self.lastPromptedClipboard = text
+                self.activeToast = ToastNotice(
+                    message: L10n.t("检测到剪贴板链接：", "Clipboard URL detected: ") + (url.host ?? url.absoluteString),
+                    actionTitle: L10n.t("立即打开", "Open"),
+                    urlToOpen: url.absoluteString,
+                    handoff: nil
+                )
+                let toastId = self.activeToast?.id
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                    if self?.activeToast?.id == toastId {
+                        self?.activeToast = nil
+                    }
+                }
             }
         }
     }
@@ -857,32 +1237,36 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             decisionHandler(.allow)
             return
         }
-        if blockRogueAppJumps, let allowed = allowedOnceJumpURL, allowed == url {
-            allowedOnceJumpURL = nil
-            decisionHandler(.allow)
-            return
-        }
-        if blockRogueAppJumps && AdBlockManager.shouldInterceptNavigation(url) {
-            if let tab = tabs.first(where: { $0.webView === webView }) {
-                tab.blockedCount += 1
-                tab.blockedAppJumpURL = url
-            }
+        let isMain = navigationAction.targetFrame?.isMainFrame ?? true
+        let policy = evaluateAppJumpShieldPolicy(for: url, in: webView, isMainFrame: isMain, isNewWindow: false)
+        if policy == .cancel {
             decisionHandler(.cancel)
             return
         }
-        if navigationAction.targetFrame?.isMainFrame == true {
+        if isMain {
             applyWebDarkAppearance(to: webView, url: url)
         }
-        decisionHandler(.allow)
+        decisionHandler(policy)
     }
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        if let url = navigationAction.request.url {
-            if navigationAction.targetFrame == nil {
-                createTab(url: url, profileId: tabs.first(where: { $0.webView === webView })?.profileId, activate: true)
-            } else {
-                webView.load(URLRequest(url: url))
-            }
+        guard let url = navigationAction.request.url else {
+            return nil
+        }
+        let isNewWin = (navigationAction.targetFrame == nil)
+        let policy = evaluateAppJumpShieldPolicy(
+            for: url,
+            in: webView,
+            isMainFrame: navigationAction.targetFrame?.isMainFrame ?? true,
+            isNewWindow: isNewWin
+        )
+        if policy == .cancel {
+            return nil
+        }
+        if isNewWin {
+            createTab(url: url, profileId: tabs.first(where: { $0.webView === webView })?.profileId, activate: true)
+        } else {
+            webView.load(URLRequest(url: url))
         }
         return nil
     }
@@ -985,8 +1369,10 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         }
         applyWebDarkAppearance(to: webView, url: webView.url)
         let enabled = effectiveWebDarkEnabled(for: webView.url)
+        let profile = (syncEngine?.profiles ?? [.defaultProfile]).first(where: { $0.id == tabs.first(where: { $0.webView === webView })?.profileId }) ?? .defaultProfile
+        let jumpShieldOn = blockRogueAppJumps && profile.fingerprint.blockTrackers && !isHostAppJumpWhitelisted(webView.url)
         webView.evaluateJavaScript(
-            "window.__prismSetWebDark && window.__prismSetWebDark(\(enabled ? "true" : "false")); window.__prismSampleTopColor && window.__prismSampleTopColor(true);",
+            "window.__prismSetWebDark && window.__prismSetWebDark(\(enabled ? "true" : "false")); window.__prismSampleTopColor && window.__prismSampleTopColor(true); window.__prismSetAppJumpShield && window.__prismSetAppJumpShield(\(jumpShieldOn ? "true" : "false"));",
             completionHandler: nil
         )
     }
@@ -1000,6 +1386,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             completionHandler: nil
         )
         syncWebViewState(webView)
+        scheduleSessionSave()
         guard let tab = tabs.first(where: { $0.webView === webView }),
               let urlStr = webView.url?.absoluteString,
               !urlStr.isEmpty else { return }
@@ -1067,6 +1454,8 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         guard let tab = tabs.first(where: { $0.webView === webView }) else { return }
 
         switch type {
+        case "userGesture":
+            tab.markUserInteraction()
         case "media":
             guard let url = payload["url"] as? String,
                   let ext = payload["ext"] as? String else { return }
@@ -1108,9 +1497,13 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
                 )
             }
         case "passwordFocus":
-            guard let origin = payload["origin"] as? String, let syncEngine else { return }
-            let host = URL(string: origin)?.host ?? origin
-            let matches = syncEngine.passwords.filter { $0.origin.contains(host) || origin.contains($0.origin) }
+            guard let trusted = trustedOrigin(from: message), let syncEngine else { return }
+            let matches = syncEngine.passwords.filter { entry in
+                let storedHost = (URL(string: entry.origin)?.host ?? entry.origin).lowercased()
+                return storedHost == trusted.host
+                    || trusted.host.hasSuffix(".\(storedHost)")
+                    || storedHost.hasSuffix(".\(trusted.host)")
+            }
             tab.matchedPasswords = matches
             let shouldShow = !matches.isEmpty
             if tab.showAutofillBar != shouldShow {
@@ -1123,14 +1516,43 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
                 }
             }
         case "passwordCapture":
-            guard let origin = payload["origin"] as? String,
+            guard let trusted = trustedOrigin(from: message),
                   let password = payload["password"] as? String,
                   !password.isEmpty else { return }
             let username = (payload["username"] as? String) ?? ""
-            tab.pendingPasswordSave = (origin: origin, username: username, password: password)
+            tab.pendingPasswordSave = (origin: trusted.origin, username: username, password: password)
         default:
             break
         }
+    }
+
+    private func trustedOrigin(from message: WKScriptMessage) -> (origin: String, host: String)? {
+        let sec = message.frameInfo.securityOrigin
+        let scheme = sec.protocol.lowercased()
+        let host = sec.host.lowercased()
+        guard (scheme == "http" || scheme == "https"), !host.isEmpty else {
+            return nil
+        }
+        let defaultPort = (scheme == "https" ? 443 : 80)
+        let framePort = sec.port != 0 ? sec.port : defaultPort
+
+        if !message.frameInfo.isMainFrame {
+            guard let mainURL = message.webView?.url,
+                  let mainScheme = mainURL.scheme?.lowercased(),
+                  let mainHost = mainURL.host?.lowercased() else {
+                return nil
+            }
+            let mainDefaultPort = (mainScheme == "https" ? 443 : 80)
+            let mainPort = mainURL.port ?? mainDefaultPort
+            guard mainScheme == scheme && mainHost == host && mainPort == framePort else {
+                return nil
+            }
+        }
+
+        let canonicalOrigin = (sec.port != 0 && sec.port != defaultPort)
+            ? "\(scheme)://\(host):\(sec.port)"
+            : "\(scheme)://\(host)"
+        return (canonicalOrigin, host)
     }
 
     // MARK: - URL Parsing

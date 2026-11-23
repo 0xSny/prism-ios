@@ -61,6 +61,9 @@ final class PrismAppStateContainer {
         didBootstrap = true
         tabManager.syncEngine = syncEngine
         tabManager.handoffService = handoffService
+        syncEngine.onRemotePortableSettings = { [weak tabManager] remote in
+            tabManager?.applyRemotePortableSettings(remote)
+        }
         Task {
             await AdBlockManager.shared.prepareRules()
             tabManager.applyAdblockToAllTabs()
@@ -142,6 +145,7 @@ final class PrismSceneDelegate: UIResponder, UIWindowSceneDelegate {
     func sceneDidEnterBackground(_ scene: UIScene) {
         let state = PrismAppStateContainer.shared
         state.handoffService.pauseForBackground()
+        state.tabManager.saveSessionImmediately()
         Task { await state.syncEngine.flushPendingBeforeBackground() }
     }
 }

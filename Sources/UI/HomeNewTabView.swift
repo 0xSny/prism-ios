@@ -3,7 +3,7 @@ import SwiftUI
 struct HomeNewTabView: View {
     @ObservedObject var syncEngine: SyncEngine
     @ObservedObject var tabManager: TabManager
-    @State private var query: String = ""
+    var onTapSearch: () -> Void = {}
     @State private var showAddShortcut: Bool = false
     @State private var newTitle: String = ""
     @State private var newUrl: String = ""
@@ -70,46 +70,32 @@ struct HomeNewTabView: View {
                         )
                 }
 
-                // Centered 48pt Rounded Search Pill
-                HStack(spacing: 10) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundStyle(.secondary)
-                        .font(.system(size: 16, weight: .medium))
-                    TextField(
-                        L10n.t("在 Google 中搜索，或输入网址", "Search or type a URL"),
-                        text: $query
+                // Centered 48pt Rounded Search Pill -> Opens Unified Safari-Grade Omnibox Overlay
+                Button(action: onTapSearch) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundStyle(.secondary)
+                            .font(.system(size: 16, weight: .medium))
+                        Text(L10n.t("在 \(tabManager.searchEngine.title) 中搜索，或输入网址", "Search \(tabManager.searchEngine.title) or type a URL"))
+                            .font(.system(size: 15))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 18)
+                    .frame(height: 48)
+                    .background(
+                        RoundedRectangle(cornerRadius: 24, style: .continuous)
+                            .fill(isDark ? Color(hex: "#303134")! : Color.white)
+                            .shadow(color: Color.black.opacity(isDark ? 0.25 : 0.12), radius: 8, x: 0, y: 2)
                     )
-                    .keyboardType(.default)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
-                    .submitLabel(.search)
-                    .onSubmit {
-                        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !q.isEmpty else { return }
-                        tabManager.navigateActive(q)
-                        query = ""
-                    }
-                    if !query.isEmpty {
-                        Button {
-                            query = ""
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 24, style: .continuous)
+                            .stroke(isDark ? Color(hex: "#5F6368")! : Color.black.opacity(0.06), lineWidth: 1)
+                    )
+                    .padding(.horizontal, 20)
                 }
-                .padding(.horizontal, 18)
-                .frame(height: 48)
-                .background(
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .fill(isDark ? Color(hex: "#303134")! : Color.white)
-                        .shadow(color: Color.black.opacity(isDark ? 0.25 : 0.12), radius: 8, x: 0, y: 2)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .stroke(isDark ? Color(hex: "#5F6368")! : Color.black.opacity(0.06), lineWidth: 1)
-                )
-                .padding(.horizontal, 20)
+                .buttonStyle(.plain)
 
                 // Synced Home Shortcuts Grid (max 10)
                 if syncEngine.homeConfig.showShortcuts {
@@ -409,29 +395,13 @@ struct ShortcutFavicon: View {
     let colorHex: String?
 
     var body: some View {
-        let host = URL(string: urlString)?.host ?? ""
-        if !host.isEmpty, let iconUrl = URL(string: "https://www.google.com/s2/favicons?domain=\(host)&sz=64") {
-            AsyncImage(url: iconUrl) { phase in
-                switch phase {
-                case .success(let image):
-                    image
-                        .resizable()
-                        .scaledToFit()
-                        .frame(width: 24, height: 24)
-                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                default:
-                    fallbackBadge
-                }
-            }
-        } else {
-            fallbackBadge
-        }
-    }
-
-    private var fallbackBadge: some View {
-        Text(String(title.prefix(1)).uppercased())
-            .font(.system(size: 16, weight: .bold))
-            .foregroundStyle(Color(hex: colorHex ?? "#4285F4") ?? .blue)
+        FaviconView(
+            urlString: urlString,
+            title: title,
+            size: 26,
+            cornerRadius: 7,
+            accentHex: colorHex
+        )
     }
 }
 

@@ -14,8 +14,10 @@ struct BrowserRootView: View {
     @State private var activeSheet: ActiveSheet?
 
     @State private var isSpeed2x = false
+    @State private var prevPlaybackRateBefore2x: Double = 1.0
     @State private var scrubOffsetSec: Double = 0
     @State private var isScrubbingVideo = false
+    @State private var isChromeCollapsed = false
     @State private var topCapsuleToast: ToastNotice?
     @State private var topToastDismissTask: Task<Void, Never>?
 
@@ -26,18 +28,35 @@ struct BrowserRootView: View {
 
     var body: some View {
         let currentTab = tabManager.activeTab
+        let showFullDock = (currentTab?.isNewTab ?? true) || !isChromeCollapsed
+
         ZStack(alignment: .bottom) {
             ZStack(alignment: .top) {
                 if let tab = currentTab {
                     if tab.isNewTab {
-                        HomeNewTabView(syncEngine: syncEngine, tabManager: tabManager)
+                        HomeNewTabView(syncEngine: syncEngine, tabManager: tabManager) {
+                            omniboxInput = ""
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                                showOmniboxEditor = true
+                            }
+                        }
                     } else {
-                        WebViewControllerRepresentable(tabId: tab.id, tab: tab, tabManager: tabManager)
-                            .ignoresSafeArea(.container, edges: [.top, .bottom])
-                            .ignoresSafeArea(.keyboard, edges: .bottom)
-                            .transaction { $0.animation = nil }
+                        WebViewControllerRepresentable(
+                            tabId: tab.id,
+                            tab: tab,
+                            tabManager: tabManager,
+                            onScrollCollapsedChange: { collapsed in
+                                guard isChromeCollapsed != collapsed else { return }
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                                    isChromeCollapsed = collapsed
+                                }
+                            }
+                        )
+                        .ignoresSafeArea(.container, edges: [.top, .bottom])
+                        .ignoresSafeArea(.keyboard, edges: .bottom)
+                        .transaction { $0.animation = nil }
 
-                        // Right-edge Long Press 2.0x Gesture Strip (unobtrusive 28pt edge)
+                        // Right-edge Long Press 2.0x Gesture Strip (unobtrusive 44pt edge, restores tab.playbackRate on release)
                         if tab.hasVideo {
                             HStack {
                                 Spacer()
@@ -45,10 +64,14 @@ struct BrowserRootView: View {
                                     .frame(width: 44)
                                     .contentShape(Rectangle())
                                     .onLongPressGesture(minimumDuration: 0.35, pressing: { pressing in
+                                        UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+                                        if pressing {
+                                            prevPlaybackRateBefore2x = tab.playbackRate
+                                        }
                                         withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
                                             isSpeed2x = pressing
                                         }
-                                        let rate = pressing ? 2.0 : 1.0
+                                        let rate = pressing ? 2.0 : prevPlaybackRateBefore2x
                                         tab.webView?.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('rate', \(rate));", completionHandler: nil)
                                     }, perform: {})
                             }
@@ -127,65 +150,80 @@ struct BrowserRootView: View {
                 }
 
                 // Always-visible Floating Handoff Pill above Dock on every non-newTab webpage
-                if let tab = currentTab, !tab.isNewTab {
-                    VideoMiniStrip(tab: tab, handoffService: handoffService, syncEngine: syncEngine, tabManager: tabManager) {
-                        activeSheet = .account
-                    }
-                    .transition(.scale(scale: 0.94).combined(with: .opacity))
-                }
-
-                // Single-Hand 52pt Bottom Thumb Dock
-                BottomThumbDock(
-                    syncEngine: syncEngine,
-                    tabManager: tabManager,
-                    handoffService: handoffService,
-                    onTapOmnibox: {
-                        omniboxInput = (currentTab?.isNewTab == true) ? "" : (currentTab?.urlString ?? "")
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                            showOmniboxEditor = true
-                        }
-                    },
-                    onOpenTabs: {
-                        tabManager.captureActiveSnapshot()
-                        showTabSwitcher = true
-                    },
-                    onOpenProfiles: { activeSheet = .profiles },
-                    onOpenMenu: { activeSheet = .menu },
-                    onRequireAccount: { activeSheet = .account },
-                    onHorizontalScrub: { deltaX, ended in
-                        if tabManager.activeTab?.hasVideo == true && !(tabManager.activeTab?.isNewTab ?? true) {
+                if let tab = currentTab, !tab.isNewTab, showFullDock {
+                    VideoMiniStrip(
+                        tab: tab,
+                        handoffService: handoffService,
+                        syncEngine: syncEngine,
+                        tabManager: tabManager,
+                        onRequireAccount: { activeSheet = .account },
+                        onVideoScrub: { deltaX, ended in
                             if !ended {
                                 withAnimation(.spring(response: 0.22, dampingFraction: 0.85)) {
                                     isScrubbingVideo = true
                                 }
-                                scrubOffsetSec = Double(deltaX / 8.0)
+                                scrubOffsetSec = Double(deltaX / 6.0)
                             } else {
                                 withAnimation(.easeOut(duration: 0.18)) {
                                     isScrubbingVideo = false
                                 }
                                 let sec = scrubOffsetSec
-                                tabManager.activeTab?.webView?.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('seekBy', \(sec));", completionHandler: nil)
-                            }
-                        } else if ended {
-                            if deltaX < -55 {
-                                withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) {
-                                    tabManager.switchTab(byOffset: 1)
-                                }
-                            } else if deltaX > 55 {
-                                withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) {
-                                    tabManager.switchTab(byOffset: -1)
-                                }
+                                tab.webView?.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('seekBy', \(sec));", completionHandler: nil)
                             }
                         }
-                    },
-                    onPullUpTabs: {
-                        tabManager.captureActiveSnapshot()
-                        showTabSwitcher = true
+                    )
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+
+                // Single-Hand 52pt Bottom Thumb Dock or 24pt Immersive Domain Pill
+                if showFullDock {
+                    BottomThumbDock(
+                        syncEngine: syncEngine,
+                        tabManager: tabManager,
+                        handoffService: handoffService,
+                        onTapOmnibox: {
+                            omniboxInput = ""
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                                showOmniboxEditor = true
+                            }
+                        },
+                        onOpenTabs: {
+                            tabManager.captureActiveSnapshot()
+                            showTabSwitcher = true
+                        },
+                        onOpenProfiles: { activeSheet = .profiles },
+                        onOpenMenu: { activeSheet = .menu },
+                        onRequireAccount: { activeSheet = .account },
+                        onSwitchTabOffset: { offset in
+                            UISelectionFeedbackGenerator().selectionChanged()
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) {
+                                tabManager.switchTab(byOffset: offset)
+                            }
+                        },
+                        onPullUpTabs: {
+                            tabManager.captureActiveSnapshot()
+                            showTabSwitcher = true
+                        }
+                    )
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                } else if let tab = currentTab, !tab.isNewTab {
+                    CollapsedDomainPill(tab: tab) {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                            isChromeCollapsed = false
+                        }
                     }
-                )
+                    .transition(.scale(scale: 0.92).combined(with: .opacity))
+                }
             }
             .padding(.horizontal, 12)
-            .padding(.bottom, 8)
+            .padding(.bottom, showFullDock ? 8 : 4)
+            .onChange(of: tabManager.activeTabId) { _, _ in
+                if isChromeCollapsed {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                        isChromeCollapsed = false
+                    }
+                }
+            }
 
             // Top Capsule Toast Overlay for Instant Handoff & Clipboard Sync
             VStack {
@@ -223,7 +261,11 @@ struct BrowserRootView: View {
                     shortcuts: syncEngine.homeConfig.shortcuts,
                     searchEngine: tabManager.searchEngine,
                     enterTopHitEnabled: $tabManager.omniboxEnterTopHitEnabled,
+                    hasClipboardWebURL: tabManager.hasClipboardWebURL,
                     canFindInPage: !(currentTab?.isNewTab ?? true),
+                    onRefreshClipboardPattern: {
+                        tabManager.refreshClipboardWebURLPatternSilently()
+                    },
                     onSubmit: { target in
                         tabManager.navigateActive(target)
                         withAnimation(.easeOut(duration: 0.14)) {
@@ -261,7 +303,7 @@ struct BrowserRootView: View {
             handleIncomingHandoff(incoming)
         }
         .sheet(isPresented: $showTabSwitcher) {
-            TabSwitcherView(tabManager: tabManager, syncEngine: syncEngine)
+            TabSwitcherView(tabManager: tabManager, syncEngine: syncEngine, handoffService: handoffService)
         }
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
@@ -340,6 +382,48 @@ struct BrowserRootView: View {
     }
 }
 
+private struct CollapsedDomainPill: View {
+    @ObservedObject var tab: BrowserTab
+    let onExpand: () -> Void
+
+    var body: some View {
+        let host = SmartOmniboxEngine.hostOnly(tab.urlString)
+        Button(action: onExpand) {
+            ZStack(alignment: .bottom) {
+                HStack(spacing: 5) {
+                    if tab.urlString.hasPrefix("https://") {
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(.green)
+                    }
+                    Text(host.isEmpty ? tab.title : host)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 14)
+                .frame(height: 24)
+
+                if tab.isLoading && tab.estimatedProgress < 0.995 {
+                    GeometryReader { geo in
+                        Capsule()
+                            .fill(Color.accentColor)
+                            .frame(width: max(12, geo.size.width * CGFloat(tab.estimatedProgress)), height: 1.5)
+                    }
+                    .frame(height: 1.5)
+                    .padding(.horizontal, 10)
+                }
+            }
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(
+                Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+            )
+            .shadow(color: .black.opacity(0.10), radius: 5, y: 2)
+        }
+        .buttonStyle(PrismTactileButtonStyle())
+    }
+}
+
 private struct BottomThumbDock: View {
     @ObservedObject var syncEngine: SyncEngine
     @ObservedObject var tabManager: TabManager
@@ -349,25 +433,22 @@ private struct BottomThumbDock: View {
     let onOpenProfiles: () -> Void
     let onOpenMenu: () -> Void
     let onRequireAccount: () -> Void
-    let onHorizontalScrub: (CGFloat, Bool) -> Void
+    let onSwitchTabOffset: (Int) -> Void
     let onPullUpTabs: () -> Void
-
-    @GestureState private var dragTranslation: CGSize = .zero
 
     var body: some View {
         let activeTab = tabManager.activeTab
         let profile = tabManager.activeProfile
 
         HStack(spacing: 8) {
-            // Quick Back
-            Button {
-                activeTab?.webView?.goBack()
-            } label: {
+            if let tab = activeTab {
+                DockBackButton(tab: tab)
+            } else {
                 Image(systemName: "chevron.left")
                     .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.tertiary)
                     .frame(width: 32, height: 36)
             }
-            .disabled(!(activeTab?.canGoBack ?? false))
 
             // Profile Color Pill
             Button(action: onOpenProfiles) {
@@ -378,48 +459,19 @@ private struct BottomThumbDock: View {
                     .frame(width: 28, height: 36)
             }
 
-            // Central Interactive Omnibox Pill (Tap to edit, Swipe L/R switch tab, Swipe Up tab grid)
-            Button(action: onTapOmnibox) {
-                HStack(spacing: 6) {
-                    if let tab = activeTab, !tab.isNewTab, tab.urlString.hasPrefix("https://") {
-                        Image(systemName: "lock.fill")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.green)
-                    }
-                    Text(displayOmniboxLabel(activeTab))
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
-                    if let tab = activeTab, !tab.isNewTab {
-                        Button {
-                            tab.webView?.reload()
-                        } label: {
-                            Image(systemName: tab.isLoading ? "xmark" : "arrow.clockwise")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                .padding(.horizontal, 12)
-                .frame(height: 36)
-                .background(Color(.tertiarySystemFill), in: Capsule())
+            // Central Interactive Omnibox Pill (Zero nested Buttons; Swipe L/R strictly switches tabs)
+            if let tab = activeTab {
+                DockAddressPill(
+                    tab: tab,
+                    tabManager: tabManager,
+                    syncEngine: syncEngine,
+                    handoffService: handoffService,
+                    onTapOmnibox: onTapOmnibox,
+                    onRequireAccount: onRequireAccount,
+                    onSwitchTabOffset: onSwitchTabOffset,
+                    onPullUpTabs: onPullUpTabs
+                )
             }
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 24)
-                    .onChanged { val in
-                        if abs(val.translation.width) > abs(val.translation.height) {
-                            onHorizontalScrub(val.translation.width, false)
-                        }
-                    }
-                    .onEnded { val in
-                        if val.translation.height < -45 && abs(val.translation.height) > abs(val.translation.width) {
-                            onPullUpTabs()
-                        } else if abs(val.translation.width) > abs(val.translation.height) {
-                            onHorizontalScrub(val.translation.width, true)
-                        }
-                    }
-            )
 
             // Tab Count Badge
             Button(action: onOpenTabs) {
@@ -449,9 +501,179 @@ private struct BottomThumbDock: View {
         )
         .shadow(color: Color.black.opacity(0.14), radius: 12, x: 0, y: 4)
     }
+}
 
-    private func displayOmniboxLabel(_ tab: BrowserTab?) -> String {
-        guard let tab, !tab.isNewTab else {
+private struct DockBackButton: View {
+    @ObservedObject var tab: BrowserTab
+
+    var body: some View {
+        let canBack = tab.canGoBack
+        let canForward = tab.canGoForward
+        Button {
+            tab.webView?.goBack()
+        } label: {
+            Image(systemName: "chevron.left")
+                .font(.system(size: 15, weight: .semibold))
+                .frame(width: 32, height: 36)
+                .contentShape(Rectangle())
+        }
+        .disabled(!canBack && !canForward)
+        .contextMenu {
+            if canForward, let fwd = tab.webView?.backForwardList.forwardItem {
+                Button {
+                    tab.webView?.goForward()
+                } label: {
+                    Label(
+                        L10n.t("前进：\(fwd.title ?? fwd.url.host ?? "")", "Forward: \(fwd.title ?? fwd.url.host ?? "")"),
+                        systemImage: "chevron.right"
+                    )
+                }
+            }
+            if let backItems = tab.webView?.backForwardList.backList.reversed().prefix(8), !backItems.isEmpty {
+                Section(L10n.t("后退历史", "History")) {
+                    ForEach(Array(backItems), id: \.url) { item in
+                        Button {
+                            tab.webView?.go(to: item)
+                        } label: {
+                            Text((item.title?.isEmpty == false ? item.title : nil) ?? item.url.host ?? item.url.absoluteString)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct DockAddressPill: View {
+    @ObservedObject var tab: BrowserTab
+    @ObservedObject var tabManager: TabManager
+    @ObservedObject var syncEngine: SyncEngine
+    @ObservedObject var handoffService: HandoffService
+    let onTapOmnibox: () -> Void
+    let onRequireAccount: () -> Void
+    let onSwitchTabOffset: (Int) -> Void
+    let onPullUpTabs: () -> Void
+
+    @State private var swipeOffsetX: CGFloat = 0
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Button(action: onTapOmnibox) {
+                HStack(spacing: 6) {
+                    if !tab.isNewTab, tab.urlString.hasPrefix("https://") {
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.green)
+                    }
+                    Text(displayOmniboxLabel(tab))
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .padding(.leading, 12)
+                .padding(.trailing, tab.isNewTab ? 12 : 4)
+                .frame(maxWidth: .infinity, height: 36)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if !tab.isNewTab {
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    if tab.isLoading {
+                        tab.webView?.stopLoading()
+                    } else {
+                        tab.webView?.reload()
+                    }
+                } label: {
+                    Image(systemName: tab.isLoading ? "xmark" : "arrow.clockwise")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 36, height: 36)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .frame(height: 36)
+        .background(Color(.tertiarySystemFill), in: Capsule())
+        .offset(x: swipeOffsetX)
+        .contextMenu {
+            Button {
+                if let pasted = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines), !pasted.isEmpty {
+                    tabManager.navigateActive(pasted)
+                }
+            } label: {
+                Label(L10n.t("粘贴并前往", "Paste & Go"), systemImage: "doc.on.clipboard")
+            }
+
+            if !tab.isNewTab && !tab.urlString.isEmpty {
+                Button {
+                    UIPasteboard.general.string = tab.urlString
+                    tabManager.syncClipboardChangeCount()
+                    tabManager.showToast(L10n.t("已复制当前网址", "URL copied"))
+                } label: {
+                    Label(L10n.t("复制当前网址", "Copy Current URL"), systemImage: "link")
+                }
+
+                if let shareUrl = URL(string: tab.urlString) {
+                    Button {
+                        BrowserRootView.presentSystemShareSheet(items: [shareUrl])
+                    } label: {
+                        Label(L10n.t("系统分享网页", "Share Page"), systemImage: "square.and.arrow.up")
+                    }
+                }
+
+                Button {
+                    guard syncEngine.loggedIn else {
+                        onRequireAccount()
+                        return
+                    }
+                    Task {
+                        let ok = await handoffService.push(
+                            kind: tab.hasVideo ? "video" : "tab",
+                            title: tab.title,
+                            url: tab.urlString,
+                            videoSeconds: tab.hasVideo ? tab.videoSeconds : 0,
+                            syncEngine: syncEngine
+                        )
+                        tabManager.showToast(ok ? L10n.t("已推送到电脑端", "Sent to desktop") : L10n.t("发送失败", "Failed"))
+                    }
+                } label: {
+                    Label(L10n.t("发送至电脑", "Send to Desktop"), systemImage: "laptopcomputer")
+                }
+            }
+        }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 18)
+                .onChanged { val in
+                    if abs(val.translation.width) > abs(val.translation.height) && tabManager.tabs.count > 1 {
+                        let raw = val.translation.width
+                        swipeOffsetX = max(-30, min(30, raw * 0.35))
+                    }
+                }
+                .onEnded { val in
+                    let dx = val.translation.width
+                    let dy = val.translation.height
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                        swipeOffsetX = 0
+                    }
+                    if dy < -45 && abs(dy) > abs(dx) {
+                        onPullUpTabs()
+                    } else if abs(dx) > abs(dy) {
+                        if dx < -50 {
+                            onSwitchTabOffset(1)
+                        } else if dx > 50 {
+                            onSwitchTabOffset(-1)
+                        }
+                    }
+                }
+        )
+    }
+
+    private func displayOmniboxLabel(_ tab: BrowserTab) -> String {
+        guard !tab.isNewTab else {
             return L10n.t("搜索或输入网址", "Search or enter URL")
         }
         if let host = URL(string: tab.urlString)?.host, !host.isEmpty {
@@ -510,6 +732,13 @@ final class PrismWebContainerView: UIView, PrismTopColorHost {
         topSafeAreaBackdropView.backgroundColor = resolved
         backgroundColor = resolved
         CATransaction.commit()
+    }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        if let event, event.type == .touches {
+            tabManager?.markActiveTabUserInteraction()
+        }
+        return super.hitTest(point, with: event)
     }
 
     override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
@@ -586,8 +815,13 @@ private struct TabLoadingProgressBar: View {
 @MainActor
 final class PrismWebViewController: UIViewController {
     let containerView = PrismWebContainerView(frame: .zero)
+    var onScrollCollapsedChange: ((Bool) -> Void)?
     private var attachedTabId: UUID?
     private weak var refreshWebView: WKWebView?
+    private var scrollOffsetObservation: NSKeyValueObservation?
+    private var lastOffsetY: CGFloat = 0
+    private var scrollDeltaAccumulator: CGFloat = 0
+    private var isCurrentlyCollapsed: Bool = false
 
     override func loadView() {
         view = containerView
@@ -599,8 +833,66 @@ final class PrismWebViewController: UIViewController {
             return
         }
         attachedTabId = tab.id
+        scrollDeltaAccumulator = 0
+        isCurrentlyCollapsed = false
+        lastOffsetY = target.scrollView.contentOffset.y
         containerView.attachWebView(target, tabManager: tabManager, targetURL: target.url ?? URL(string: tab.urlString))
         attachRefreshControl(to: target)
+        observeScroll(on: target)
+    }
+
+    private func observeScroll(on webView: WKWebView) {
+        scrollOffsetObservation?.invalidate()
+        scrollOffsetObservation = webView.scrollView.observe(\.contentOffset, options: [.new]) { [weak self, weak webView] _, _ in
+            guard let webView else { return }
+            let sv = webView.scrollView
+            let y = sv.contentOffset.y
+            let maxY = max(0, sv.contentSize.height - sv.bounds.height)
+            let isDragging = sv.isDragging || sv.isTracking || sv.isDecelerating
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.handleScrollOffset(y: y, maxY: maxY, isInteractive: isDragging)
+            }
+        }
+    }
+
+    private func handleScrollOffset(y: CGFloat, maxY: CGFloat, isInteractive: Bool) {
+        // Expand dock immediately at top region (protects pull-to-refresh)
+        if y <= 10 {
+            lastOffsetY = y
+            scrollDeltaAccumulator = 0
+            if isCurrentlyCollapsed {
+                isCurrentlyCollapsed = false
+                onScrollCollapsedChange?(false)
+            }
+            return
+        }
+
+        // Ignore bottom rubber-band bounce zone
+        if maxY > 80 && y >= maxY - 4 {
+            lastOffsetY = y
+            return
+        }
+
+        let dy = y - lastOffsetY
+        lastOffsetY = y
+        guard isInteractive, abs(dy) > 0.2 else { return }
+
+        if (scrollDeltaAccumulator >= 0 && dy >= 0) || (scrollDeltaAccumulator <= 0 && dy <= 0) {
+            scrollDeltaAccumulator += dy
+        } else {
+            scrollDeltaAccumulator = dy
+        }
+
+        if scrollDeltaAccumulator > 24 && !isCurrentlyCollapsed {
+            isCurrentlyCollapsed = true
+            scrollDeltaAccumulator = 0
+            onScrollCollapsedChange?(true)
+        } else if scrollDeltaAccumulator < -24 && isCurrentlyCollapsed {
+            isCurrentlyCollapsed = false
+            scrollDeltaAccumulator = 0
+            onScrollCollapsedChange?(false)
+        }
     }
 
     private func attachRefreshControl(to webView: WKWebView) {
@@ -628,1072 +920,18 @@ struct WebViewControllerRepresentable: UIViewControllerRepresentable {
     let tabId: UUID
     let tab: BrowserTab
     let tabManager: TabManager
+    var onScrollCollapsedChange: ((Bool) -> Void)? = nil
 
     func makeUIViewController(context: Context) -> PrismWebViewController {
         let vc = PrismWebViewController()
+        vc.onScrollCollapsedChange = onScrollCollapsedChange
         vc.attach(tab: tab, tabManager: tabManager)
         return vc
     }
 
     func updateUIViewController(_ uiViewController: PrismWebViewController, context: Context) {
+        uiViewController.onScrollCollapsedChange = onScrollCollapsedChange
         uiViewController.attach(tab: tab, tabManager: tabManager)
-    }
-}
-
-@MainActor
-private final class OmniboxRemoteSuggester: ObservableObject {
-    @Published var suggestions: [String] = []
-    private var fetchTask: Task<Void, Never>?
-    private var lastQuery = ""
-
-    func update(query: String, engine: SearchEngineOption) {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              !trimmed.contains("://"),
-              !trimmed.hasPrefix("localhost"),
-              !trimmed.hasPrefix("127.0.0.1") else {
-            fetchTask?.cancel()
-            lastQuery = ""
-            if !suggestions.isEmpty { suggestions = [] }
-            return
-        }
-        if trimmed == lastQuery { return }
-        lastQuery = trimmed
-        fetchTask?.cancel()
-        fetchTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 110_000_000)
-            guard !Task.isCancelled else { return }
-            let items = await Self.fetchRemote(query: trimmed, engine: engine)
-            guard !Task.isCancelled else { return }
-            self?.suggestions = items
-        }
-    }
-
-    private static func fetchRemote(query: String, engine: SearchEngineOption) async -> [String] {
-        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
-            return []
-        }
-        let endpointStr: String
-        switch engine {
-        case .bing:
-            endpointStr = "https://api.bing.com/osjson.aspx?query=\(encoded)"
-        case .duckduckgo:
-            endpointStr = "https://duckduckgo.com/ac/?q=\(encoded)"
-        case .baidu:
-            endpointStr = "https://suggestion.baidu.com/su?wd=\(encoded)&action=opensearch"
-        case .google:
-            endpointStr = "https://suggestqueries.google.com/complete/search?client=firefox&q=\(encoded)"
-        }
-        guard let url = URL(string: endpointStr) else { return [] }
-        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 1.5)
-        req.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
-        do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-                return []
-            }
-            if engine == .duckduckgo {
-                if let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-                    return arr.compactMap { ($0["phrase"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                        .filter { !$0.isEmpty }
-                }
-                return []
-            }
-            let parsedObj: Any?
-            if let direct = try? JSONSerialization.jsonObject(with: data) {
-                parsedObj = direct
-            } else if engine == .baidu {
-                let cfEnc = CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(0x0632))
-                if let gbkStr = String(data: data, encoding: String.Encoding(rawValue: cfEnc)),
-                   let utf8Data = gbkStr.data(using: .utf8) {
-                    parsedObj = try? JSONSerialization.jsonObject(with: utf8Data)
-                } else {
-                    parsedObj = nil
-                }
-            } else {
-                parsedObj = nil
-            }
-            if let root = parsedObj as? [Any], root.count > 1, let list = root[1] as? [String] {
-                return list.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-            }
-        } catch {
-            return []
-        }
-        return []
-    }
-}
-
-private struct OmniboxCandidateEntry: Identifiable {
-    let id: String
-    let title: String
-    let url: String
-    let subtitle: String
-    let isBookmark: Bool
-    let tabId: UUID?
-    let score: Int
-    let visitedAt: Double
-}
-
-private struct OmniboxInlineOverlay: View {
-    @Binding var text: String
-    let bookmarks: [BookmarkItem]
-    let history: [HistoryItem]
-    let tabs: [BrowserTab]
-    let activeTab: BrowserTab?
-    let shortcuts: [HomeShortcut]
-    let searchEngine: SearchEngineOption
-    @Binding var enterTopHitEnabled: Bool
-    let canFindInPage: Bool
-    let onSubmit: (String) -> Void
-    let onSelectTab: (UUID) -> Void
-    let onFindInPage: (String) -> Void
-    let onDismiss: () -> Void
-
-    @StateObject private var remoteSuggester = OmniboxRemoteSuggester()
-    @State private var pageMatchCount: Int?
-    @State private var findCountTask: Task<Void, Never>?
-    @State private var keyboardHeight: CGFloat = 0
-    @State private var isDismissing: Bool = false
-
-    var body: some View {
-        buildBody()
-    }
-
-    private func currentKeyboardOverlap(for endFrame: CGRect) -> CGFloat {
-        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
-        let screenHeight = scene?.screen.bounds.height ?? UIScreen.main.bounds.height
-        let safeBottom = scene?.windows.first { $0.isKeyWindow }?.safeAreaInsets.bottom ?? 0
-        return max(0, screenHeight - endFrame.origin.y - safeBottom)
-    }
-
-    private func triggerSmoothClose(after action: @escaping () -> Void) {
-        guard !isDismissing else { return }
-        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-        withAnimation(.timingCurve(0.22, 1.0, 0.36, 1.0, duration: 0.24)) {
-            isDismissing = true
-            keyboardHeight = 0
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
-            action()
-        }
-    }
-
-    private func buildBody() -> some View {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let q = trimmed.lowercased()
-        let tokens = q.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        let ranked = buildLocalCandidates(queryLower: q, tokens: tokens)
-        let topHit = !q.isEmpty ? ranked.topHit : nil
-        let matchedTabs = ranked.tabs
-        let libraryItems = ranked.library
-        let remoteList = buildRemoteSearchList(trimmed: trimmed, rawLower: q, remote: remoteSuggester.suggestions)
-        let mathResult = !trimmed.isEmpty ? Self.evaluateMathExpression(trimmed) : nil
-        let isExplicitURL = Self.isLikelyExplicitURL(trimmed)
-        let enterOpensTopHit = enterTopHitEnabled && !isExplicitURL && topHit != nil
-
-        return ZStack(alignment: .bottom) {
-            Rectangle()
-                .fill(.regularMaterial)
-                .ignoresSafeArea()
-                .opacity(isDismissing ? 0 : 1)
-                .onTapGesture { triggerSmoothClose { onDismiss() } }
-
-            VStack(spacing: 0) {
-                ScrollView(.vertical, showsIndicators: true) {
-                    LazyVStack(alignment: .leading, spacing: 14) {
-                        // 0. Instant Math Calculator
-                        if let calc = mathResult {
-                            Button {
-                                UIPasteboard.general.string = calc
-                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                text = calc
-                            } label: {
-                                HStack(spacing: 12) {
-                                    ZStack {
-                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                            .fill(Color.green.opacity(0.16))
-                                            .frame(width: 34, height: 34)
-                                        Image(systemName: "equal")
-                                            .font(.system(size: 15, weight: .bold))
-                                            .foregroundStyle(.green)
-                                    }
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text("= \(calc)")
-                                            .font(.system(size: 18, weight: .bold).monospacedDigit())
-                                            .foregroundStyle(.primary)
-                                        Text(L10n.t("轻点复制计算结果", "Tap to copy result"))
-                                            .font(.system(size: 11.5))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer(minLength: 0)
-                                }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 9)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                        .fill(Color(.secondarySystemGroupedBackground))
-                                )
-                            }
-                            .buttonStyle(.plain)
-                        }
-
-                        // 1. Pinned Top Hit + Open Matching Tabs directly below
-                        if topHit != nil || (!q.isEmpty && !matchedTabs.isEmpty) {
-                            VStack(spacing: 4) {
-                                if let hit = topHit {
-                                    HStack {
-                                        Text(L10n.t("最佳匹配", "Top Hit"))
-                                            .font(.system(size: 12, weight: .semibold))
-                                            .foregroundStyle(.secondary)
-                                        Spacer()
-                                        if !isExplicitURL {
-                                            Button {
-                                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                                enterTopHitEnabled.toggle()
-                                            } label: {
-                                                HStack(spacing: 4) {
-                                                    Image(systemName: enterTopHitEnabled ? "return" : "magnifyingglass")
-                                                        .font(.system(size: 10, weight: .semibold))
-                                                    Text(enterTopHitEnabled
-                                                         ? L10n.t("回车直达：开", "Enter → Site: On")
-                                                         : L10n.t("回车直达：关", "Enter → Search"))
-                                                        .font(.system(size: 11, weight: .medium))
-                                                }
-                                                .foregroundStyle(enterTopHitEnabled ? Color.blue : Color.secondary)
-                                                .padding(.horizontal, 8)
-                                                .padding(.vertical, 3)
-                                                .background(
-                                                    Capsule()
-                                                        .fill(enterTopHitEnabled ? Color.blue.opacity(0.12) : Color(.tertiarySystemFill))
-                                                )
-                                            }
-                                            .buttonStyle(.plain)
-                                        }
-                                    }
-                                    .padding(.horizontal, 12)
-
-                                    Button {
-                                        if let tid = hit.tabId {
-                                            triggerSmoothClose { onSelectTab(tid) }
-                                        } else {
-                                            triggerSmoothClose { onSubmit(hit.url) }
-                                        }
-                                    } label: {
-                                        HStack(spacing: 12) {
-                                            ZStack {
-                                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                    .fill(enterOpensTopHit ? Color.blue.opacity(0.15) : Color.primary.opacity(0.08))
-                                                    .frame(width: 34, height: 34)
-                                                Image(systemName: hit.tabId != nil ? "macwindow" : (hit.isBookmark ? "bookmark.fill" : "globe"))
-                                                    .font(.system(size: 15, weight: .semibold))
-                                                    .foregroundStyle(enterOpensTopHit ? Color.blue : Color.primary)
-                                            }
-                                            VStack(alignment: .leading, spacing: 2) {
-                                                Text(hit.title)
-                                                    .font(.system(size: 16, weight: .semibold))
-                                                    .foregroundStyle(.primary)
-                                                    .lineLimit(1)
-                                                Text(hit.subtitle)
-                                                    .font(.system(size: 12.5))
-                                                    .foregroundStyle(.secondary)
-                                                    .lineLimit(1)
-                                            }
-                                            Spacer(minLength: 0)
-                                            if enterOpensTopHit {
-                                                Text("↵")
-                                                    .font(.system(size: 12, weight: .bold))
-                                                    .foregroundStyle(.blue)
-                                                    .padding(.horizontal, 7)
-                                                    .padding(.vertical, 3)
-                                                    .background(Color.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                                            }
-                                        }
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 10)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                                .fill(Color(.secondarySystemGroupedBackground))
-                                        )
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                                .stroke(enterOpensTopHit ? Color.blue.opacity(0.35) : Color.clear, lineWidth: 1)
-                                        )
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-
-                                if !q.isEmpty {
-                                    ForEach(matchedTabs) { item in
-                                        Button {
-                                            if let tid = item.tabId {
-                                                triggerSmoothClose { onSelectTab(tid) }
-                                            } else {
-                                                triggerSmoothClose { onSubmit(item.url) }
-                                            }
-                                        } label: {
-                                            HStack(spacing: 12) {
-                                                ZStack {
-                                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                        .fill(Color(.tertiarySystemFill))
-                                                        .frame(width: 32, height: 32)
-                                                    Image(systemName: "macwindow")
-                                                        .font(.system(size: 13.5))
-                                                        .foregroundStyle(.secondary)
-                                                }
-                                                VStack(alignment: .leading, spacing: 2) {
-                                                    Text(item.title)
-                                                        .font(.system(size: 15))
-                                                        .foregroundStyle(.primary)
-                                                        .lineLimit(1)
-                                                    Text(item.subtitle)
-                                                        .font(.system(size: 12))
-                                                        .foregroundStyle(.secondary)
-                                                        .lineLimit(1)
-                                                }
-                                                Spacer(minLength: 0)
-                                            }
-                                            .padding(.horizontal, 12)
-                                            .padding(.vertical, 7)
-                                            .contentShape(Rectangle())
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                            }
-                        } else if q.isEmpty && !matchedTabs.isEmpty {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(L10n.t("打开的标签页", "Open Tabs"))
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 12)
-                                ForEach(matchedTabs) { item in
-                                    Button {
-                                        if let tid = item.tabId {
-                                            triggerSmoothClose { onSelectTab(tid) }
-                                        } else {
-                                            triggerSmoothClose { onSubmit(item.url) }
-                                        }
-                                    } label: {
-                                        HStack(spacing: 12) {
-                                            ZStack {
-                                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                    .fill(Color(.tertiarySystemFill))
-                                                    .frame(width: 32, height: 32)
-                                                Image(systemName: "macwindow")
-                                                    .font(.system(size: 13.5))
-                                                    .foregroundStyle(.secondary)
-                                            }
-                                            VStack(alignment: .leading, spacing: 2) {
-                                                Text(item.title)
-                                                    .font(.system(size: 15))
-                                                    .foregroundStyle(.primary)
-                                                    .lineLimit(1)
-                                                Text(item.subtitle)
-                                                    .font(.system(size: 12))
-                                                    .foregroundStyle(.secondary)
-                                                    .lineLimit(1)
-                                            }
-                                            Spacer(minLength: 0)
-                                        }
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 6)
-                                        .contentShape(Rectangle())
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        }
-
-                        // 2. Search Engine Suggestions
-                        if !remoteList.isEmpty {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text("\(searchEngine.title)\(L10n.t("建议", " Suggestions"))")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 12)
-
-                                ForEach(Array(remoteList.enumerated()), id: \.element) { idx, term in
-                                    let isDefaultSearchRow = (idx == 0 && !enterOpensTopHit)
-                                    HStack(spacing: 10) {
-                                        Button {
-                                            triggerSmoothClose { onSubmit(term) }
-                                        } label: {
-                                            HStack(spacing: 12) {
-                                                ZStack {
-                                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                        .fill(isDefaultSearchRow ? Color.blue.opacity(0.14) : Color(.tertiarySystemFill))
-                                                        .frame(width: 32, height: 32)
-                                                    Image(systemName: "magnifyingglass")
-                                                        .font(.system(size: 14))
-                                                        .foregroundStyle(isDefaultSearchRow ? Color.blue : Color.secondary)
-                                                }
-                                                highlightedSuggestionText(term: term, query: trimmed)
-                                                    .font(.system(size: 16))
-                                                    .lineLimit(1)
-                                                Spacer(minLength: 0)
-                                                if isDefaultSearchRow {
-                                                    Text("↵")
-                                                        .font(.system(size: 12, weight: .bold))
-                                                        .foregroundStyle(.blue)
-                                                        .padding(.horizontal, 7)
-                                                        .padding(.vertical, 3)
-                                                        .background(Color.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                                                }
-                                            }
-                                            .contentShape(Rectangle())
-                                        }
-                                        .buttonStyle(.plain)
-
-                                        if term.lowercased() != q {
-                                            Button {
-                                                text = term
-                                            } label: {
-                                                Image(systemName: "arrow.down.left")
-                                                    .font(.system(size: 12, weight: .medium))
-                                                    .foregroundStyle(.secondary)
-                                                    .frame(width: 26, height: 26)
-                                                    .overlay(
-                                                        Circle().stroke(Color.secondary.opacity(0.35), lineWidth: 1)
-                                                    )
-                                            }
-                                            .buttonStyle(.plain)
-                                        }
-                                    }
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 4)
-                                }
-                            }
-                        }
-
-                        // 3. Bookmarks, History & Open Tabs
-                        if !libraryItems.isEmpty {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(L10n.t("书签、历史记录和标签页", "Bookmarks & History"))
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 12)
-
-                                ForEach(libraryItems) { item in
-                                    Button {
-                                        triggerSmoothClose { onSubmit(item.url) }
-                                    } label: {
-                                        HStack(spacing: 12) {
-                                            ZStack {
-                                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                    .fill(Color(.tertiarySystemFill))
-                                                    .frame(width: 32, height: 32)
-                                                Image(systemName: item.isBookmark ? "bookmark.fill" : "clock")
-                                                    .font(.system(size: 14))
-                                                    .foregroundStyle(item.isBookmark ? .blue : .secondary)
-                                            }
-                                            VStack(alignment: .leading, spacing: 2) {
-                                                Text(item.title)
-                                                    .font(.system(size: 15.5, weight: .medium))
-                                                    .foregroundStyle(.primary)
-                                                    .lineLimit(1)
-                                                Text(item.subtitle)
-                                                    .font(.system(size: 12))
-                                                    .foregroundStyle(.secondary)
-                                                    .lineLimit(1)
-                                            }
-                                            Spacer(minLength: 0)
-                                        }
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 5)
-                                        .contentShape(Rectangle())
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        }
-
-                        // 4. On This Page (right above bottom search bar just like Safari)
-                        if canFindInPage && !trimmed.isEmpty {
-                            VStack(alignment: .leading, spacing: 6) {
-                                let countLabel: String = {
-                                    if let c = pageMatchCount {
-                                        return L10n.t("此页（\(c)个匹配项）", "On This Page (\(c) matches)")
-                                    }
-                                    return L10n.t("此页", "On This Page")
-                                }()
-                                Text(countLabel)
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 12)
-
-                                Button {
-                                    triggerSmoothClose { onFindInPage(trimmed) }
-                                } label: {
-                                    HStack(spacing: 12) {
-                                        ZStack {
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .fill(Color(.tertiarySystemFill))
-                                                .frame(width: 32, height: 32)
-                                            Image(systemName: "doc.text.magnifyingglass")
-                                                .font(.system(size: 14))
-                                                .foregroundStyle(.secondary)
-                                        }
-                                        Text(L10n.t("查找“\(trimmed)”", "Find “\(trimmed)”"))
-                                            .font(.system(size: 15.5))
-                                            .foregroundStyle(.primary)
-                                        Spacer(minLength: 0)
-                                    }
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 6)
-                                    .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.top, 10)
-                    .padding(.bottom, 12)
-                }
-                .scrollDismissesKeyboard(.interactively)
-                .opacity(isDismissing ? 0 : 1)
-                .offset(y: isDismissing ? 16 : 0)
-
-                // Docked Bottom Search Capsule + Circular [×] Cancel Button directly under Candidates
-                HStack(spacing: 10) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "magnifyingglass")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundStyle(.secondary)
-                        SelectableAddressBar(
-                            text: $text,
-                            placeholder: L10n.t("搜索或输入网址", "Search or enter website name"),
-                            onSubmit: { target in
-                                let t = target.trimmingCharacters(in: .whitespacesAndNewlines)
-                                if enterTopHitEnabled && !Self.isLikelyExplicitURL(t) && t.lowercased() == q, let hit = topHit {
-                                    if let tid = hit.tabId {
-                                        triggerSmoothClose { onSelectTab(tid) }
-                                    } else {
-                                        triggerSmoothClose { onSubmit(hit.url) }
-                                    }
-                                } else {
-                                    triggerSmoothClose { onSubmit(target) }
-                                }
-                            },
-                            onPasteAndGo: { target in
-                                triggerSmoothClose { onSubmit(target) }
-                            }
-                        )
-                        .frame(height: 24)
-                        if !text.isEmpty {
-                            Button {
-                                text = ""
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .font(.system(size: 16))
-                                    .foregroundStyle(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 14)
-                    .frame(height: 44)
-                    .background(
-                        Capsule()
-                            .fill(Color(.secondarySystemGroupedBackground))
-                            .shadow(color: Color.black.opacity(0.12), radius: 8, y: 2)
-                    )
-                    .overlay(
-                        Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
-                    )
-
-                    Button {
-                        triggerSmoothClose { onDismiss() }
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(.primary)
-                            .frame(width: 44, height: 44)
-                            .background(
-                                Circle()
-                                    .fill(Color(.secondarySystemGroupedBackground))
-                                    .shadow(color: Color.black.opacity(0.12), radius: 8, y: 2)
-                            )
-                            .overlay(
-                                Circle().stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 14)
-                .padding(.top, 6)
-                .padding(.bottom, isDismissing ? 10 : max(10, keyboardHeight + 6))
-            }
-        }
-        .ignoresSafeArea(.keyboard, edges: .bottom)
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
-            guard !isDismissing,
-                  let endFrame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
-            let overlap = currentKeyboardOverlap(for: endFrame)
-            withAnimation(.interpolatingSpring(stiffness: 360, damping: 32)) {
-                keyboardHeight = overlap
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-            withAnimation(.timingCurve(0.22, 1.0, 0.36, 1.0, duration: 0.24)) {
-                keyboardHeight = 0
-            }
-        }
-        .onAppear {
-            remoteSuggester.update(query: text, engine: searchEngine)
-            schedulePageMatchCount(text)
-        }
-        .onChange(of: text) { _, newValue in
-            remoteSuggester.update(query: newValue, engine: searchEngine)
-            schedulePageMatchCount(newValue)
-        }
-    }
-
-    private func schedulePageMatchCount(_ raw: String) {
-        findCountTask?.cancel()
-        let q = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard canFindInPage, !q.isEmpty, let wv = activeTab?.webView else {
-            pageMatchCount = nil
-            return
-        }
-        findCountTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 140_000_000)
-            guard !Task.isCancelled else { return }
-            let encoded = (try? JSONEncoder().encode(q)).flatMap { String(data: $0, encoding: .utf8) } ?? "\"\""
-            let js = """
-            (() => {
-              const q = (\(encoded) || '').toLowerCase();
-              if (!q || !document.body) return 0;
-              const txt = (document.body.innerText || '').toLowerCase();
-              let count = 0, pos = 0;
-              while ((pos = txt.indexOf(q, pos)) !== -1) {
-                count++; pos += q.length;
-                if (count >= 999) break;
-              }
-              return count;
-            })()
-            """
-            wv.evaluateJavaScript(js) { val, _ in
-                if !Task.isCancelled {
-                    pageMatchCount = val as? Int
-                }
-            }
-        }
-    }
-
-    private func buildRemoteSearchList(trimmed: String, rawLower: String, remote: [String]) -> [String] {
-        guard !trimmed.isEmpty else { return [] }
-        var out: [String] = [trimmed]
-        var seen: Set<String> = [rawLower]
-        for term in remote {
-            let low = term.lowercased()
-            if seen.contains(low) { continue }
-            seen.insert(low)
-            out.append(term)
-            if out.count >= 6 { break }
-        }
-        return out
-    }
-
-    private func highlightedSuggestionText(term: String, query: String) -> Text {
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty, let range = term.range(of: q, options: .caseInsensitive) else {
-            return Text(term).foregroundStyle(.primary)
-        }
-        let before = String(term[..<range.lowerBound])
-        let match = String(term[range])
-        let after = String(term[range.upperBound...])
-        return Text(before).foregroundStyle(.secondary)
-            + Text(match).bold().foregroundStyle(.primary)
-            + Text(after).foregroundStyle(.secondary)
-    }
-
-    private static func isLikelyExplicitURL(_ raw: String) -> Bool {
-        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !s.isEmpty, !s.contains(" ") else { return false }
-        let low = s.lowercased()
-        if low.contains("://") || low.hasPrefix("localhost") || low.hasPrefix("127.0.0.1") {
-            return true
-        }
-        if let dot = low.firstIndex(of: "."), dot != low.startIndex, dot < low.index(before: low.endIndex) {
-            return true
-        }
-        return false
-    }
-
-    private static func evaluateMathExpression(_ raw: String) -> String? {
-        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "×", with: "*")
-            .replacingOccurrences(of: "÷", with: "/")
-        guard s.count >= 3 && s.count <= 64 else { return nil }
-        var hasOperator = false
-        var hasDigit = false
-        for ch in s {
-            if ch.isNumber {
-                hasDigit = true
-            } else if ch == "+" || ch == "-" || ch == "*" || ch == "/" || ch == "%" {
-                hasOperator = true
-            } else if ch == "." || ch == "(" || ch == ")" || ch == " " {
-                continue
-            } else {
-                return nil
-            }
-        }
-        guard hasDigit && hasOperator else { return nil }
-        let chars = Array(s.filter { $0 != " " })
-        var idx = 0
-
-        func parseExpr() -> Double? {
-            guard var val = parseTerm() else { return nil }
-            while idx < chars.count {
-                let op = chars[idx]
-                guard op == "+" || op == "-" else { break }
-                idx += 1
-                guard let rhs = parseTerm() else { return nil }
-                val = (op == "+") ? (val + rhs) : (val - rhs)
-            }
-            return val
-        }
-
-        func parseTerm() -> Double? {
-            guard var val = parseFactor() else { return nil }
-            while idx < chars.count {
-                let op = chars[idx]
-                guard op == "*" || op == "/" || op == "%" else { break }
-                idx += 1
-                guard let rhs = parseFactor() else { return nil }
-                if op == "*" {
-                    val *= rhs
-                } else {
-                    if rhs == 0 { return nil }
-                    val = (op == "/") ? (val / rhs) : val.truncatingRemainder(dividingBy: rhs)
-                }
-            }
-            return val
-        }
-
-        func parseFactor() -> Double? {
-            guard idx < chars.count else { return nil }
-            if chars[idx] == "+" {
-                idx += 1
-                return parseFactor()
-            }
-            if chars[idx] == "-" {
-                idx += 1
-                guard let inner = parseFactor() else { return nil }
-                return -inner
-            }
-            if chars[idx] == "(" {
-                idx += 1
-                guard let inner = parseExpr(), idx < chars.count, chars[idx] == ")" else { return nil }
-                idx += 1
-                return inner
-            }
-            let start = idx
-            var sawDot = false
-            var sawDigit = false
-            while idx < chars.count {
-                let c = chars[idx]
-                if c >= "0" && c <= "9" {
-                    sawDigit = true
-                    idx += 1
-                } else if c == "." && !sawDot {
-                    sawDot = true
-                    idx += 1
-                } else {
-                    break
-                }
-            }
-            guard sawDigit, let num = Double(String(chars[start..<idx])) else { return nil }
-            return num
-        }
-
-        guard let result = parseExpr(), idx == chars.count, result.isFinite else { return nil }
-        if result.rounded(.towardZero) == result && abs(result) < 1e15 {
-            return String(Int64(result))
-        }
-        let formatted = String(format: "%.6f", result)
-            .replacingOccurrences(of: #"0+$"#, with: "", options: .regularExpression)
-            .replacingOccurrences(of: #"\.$"#, with: "", options: .regularExpression)
-        return formatted
-    }
-
-    private func normalizeKey(_ raw: String) -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
-        let host = hostOnly(trimmed)
-        if let schemeRange = trimmed.range(of: "://") {
-            let afterScheme = trimmed[schemeRange.upperBound...]
-            if let slashIdx = afterScheme.firstIndex(of: "/") {
-                let tail = String(afterScheme[slashIdx...])
-                return tail == "/" ? host : "\(host)\(tail)"
-            }
-            if let qIdx = afterScheme.firstIndex(of: "?") {
-                return "\(host)\(afterScheme[qIdx...])"
-            }
-            return host
-        }
-        return trimmed.lowercased()
-    }
-
-    private func isRootURL(_ raw: String) -> Bool {
-        guard let schemeRange = raw.range(of: "://") else { return false }
-        let afterScheme = raw[schemeRange.upperBound...]
-        if afterScheme.contains("?") { return false }
-        guard let slashIdx = afterScheme.firstIndex(of: "/") else { return true }
-        return slashIdx == afterScheme.index(before: afterScheme.endIndex)
-    }
-
-    private func hostOnly(_ raw: String) -> String {
-        let s: Substring
-        if let schemeRange = raw.range(of: "://") {
-            s = raw[schemeRange.upperBound...]
-        } else {
-            s = Substring(raw)
-        }
-        let end = s.firstIndex(where: { $0 == "/" || $0 == "?" || $0 == "#" || $0 == ":" }) ?? s.endIndex
-        var host = String(s[..<end]).lowercased()
-        if host.hasPrefix("www.") {
-            host = String(host.dropFirst(4))
-        }
-        return host.isEmpty ? raw : host
-    }
-
-    private func relativeTime(_ visitedAtMs: Double) -> String {
-        let sec = max(0, Date().timeIntervalSince1970 - visitedAtMs / 1000.0)
-        if sec < 60 { return L10n.t("刚刚曾访问", "Visited just now") }
-        let mins = Int(sec / 60)
-        if mins < 60 { return L10n.t("\(mins)分钟前曾访问", "Visited \(mins)m ago") }
-        let hours = Int(sec / 3600)
-        if hours < 24 { return L10n.t("\(hours)小时前曾访问", "Visited \(hours)h ago") }
-        let days = Int(sec / 86400)
-        if days < 14 { return L10n.t("\(days)天前曾访问", "Visited \(days)d ago") }
-        let weeks = Int(days / 7)
-        return L10n.t("\(weeks)周前曾访问", "Visited \(weeks)w ago")
-    }
-
-    private func scoreMatch(queryLower: String, tokens: [String], title: String, url: String) -> Int {
-        let titleLow = title.lowercased()
-        let urlLow = url.lowercased()
-        let hostLow = hostOnly(url)
-        for tok in tokens {
-            if !titleLow.contains(tok) && !urlLow.contains(tok) {
-                return 0
-            }
-        }
-        var score = 15
-        if hostLow == queryLower || titleLow == queryLower { score += 130 }
-        else if hostLow.hasPrefix(queryLower) { score += 100 }
-        else if titleLow.hasPrefix(queryLower) { score += 85 }
-        else if urlLow.contains("://\(queryLower)") || urlLow.contains(".\(queryLower)") { score += 60 }
-        else if titleLow.contains(queryLower) { score += 35 }
-        else if urlLow.contains(queryLower) { score += 25 }
-
-        // Safari prioritizes clean domain landing pages over deep subpages for Top Hit
-        if isRootURL(url) && score >= 95 {
-            score += 45
-        }
-        return score
-    }
-
-    private func buildLocalCandidates(queryLower: String, tokens: [String]) -> (topHit: OmniboxCandidateEntry?, tabs: [OmniboxCandidateEntry], library: [OmniboxCandidateEntry]) {
-        var seen = Set<String>()
-        let activeId = activeTab?.id
-
-        if queryLower.isEmpty {
-            var tabEntries: [OmniboxCandidateEntry] = []
-            for t in tabs where !t.isNewTab && t.id != activeId {
-                let k = normalizeKey(t.urlString)
-                if seen.contains(k) { continue }
-                seen.insert(k)
-                let host = hostOnly(t.urlString)
-                tabEntries.append(OmniboxCandidateEntry(
-                    id: "tab-\(t.id.uuidString)",
-                    title: t.title.isEmpty ? host : t.title,
-                    url: t.urlString,
-                    subtitle: "\(host) · \(L10n.t("打开的标签页", "Open Tab"))",
-                    isBookmark: false,
-                    tabId: t.id,
-                    score: 50,
-                    visitedAt: 0
-                ))
-                if tabEntries.count >= 3 { break }
-            }
-            var libEntries: [OmniboxCandidateEntry] = []
-            for h in history {
-                let k = normalizeKey(h.url)
-                if seen.contains(k) { continue }
-                seen.insert(k)
-                let host = hostOnly(h.url)
-                libEntries.append(OmniboxCandidateEntry(
-                    id: "hist-\(h.id)",
-                    title: h.title.isEmpty ? host : h.title,
-                    url: h.url,
-                    subtitle: "\(host) · \(relativeTime(h.visitedAt))",
-                    isBookmark: false,
-                    tabId: nil,
-                    score: 20,
-                    visitedAt: h.visitedAt
-                ))
-                if libEntries.count >= 8 { break }
-            }
-            for bm in bookmarks where bm.type != "folder" {
-                if libEntries.count >= 10 { break }
-                let k = normalizeKey(bm.url)
-                if seen.contains(k) { continue }
-                seen.insert(k)
-                let host = hostOnly(bm.url)
-                libEntries.append(OmniboxCandidateEntry(
-                    id: "bm-\(bm.id)",
-                    title: bm.title.isEmpty ? host : bm.title,
-                    url: bm.url,
-                    subtitle: "\(host) · \(L10n.t("书签", "Bookmark"))",
-                    isBookmark: true,
-                    tabId: nil,
-                    score: 20,
-                    visitedAt: bm.createdAt
-                ))
-            }
-            return (nil, tabEntries, libEntries)
-        }
-
-        // Aggregate history frequency per normalized URL so repeated sites surface like Safari
-        var visitFreq: [String: Int] = [:]
-        var latestByKey: [String: HistoryItem] = [:]
-        for h in history {
-            let k = normalizeKey(h.url)
-            visitFreq[k, default: 0] += 1
-            if let cur = latestByKey[k] {
-                if h.visitedAt > cur.visitedAt { latestByKey[k] = h }
-            } else {
-                latestByKey[k] = h
-            }
-        }
-
-        var scoredSites: [OmniboxCandidateEntry] = []
-        var tabMatches: [OmniboxCandidateEntry] = []
-        let nowMs = Date().timeIntervalSince1970 * 1000.0
-
-        for t in tabs where !t.isNewTab {
-            let s = scoreMatch(queryLower: queryLower, tokens: tokens, title: t.title, url: t.urlString)
-            if s > 0 {
-                let host = hostOnly(t.urlString)
-                tabMatches.append(OmniboxCandidateEntry(
-                    id: "tab-\(t.id.uuidString)",
-                    title: t.title.isEmpty ? host : t.title,
-                    url: t.urlString,
-                    subtitle: "\(host) · \(L10n.t("打开的标签页", "Open Tab"))",
-                    isBookmark: false,
-                    tabId: t.id,
-                    score: s + 8,
-                    visitedAt: nowMs
-                ))
-            }
-        }
-        tabMatches.sort { $0.score > $1.score }
-
-        for bm in bookmarks where bm.type != "folder" {
-            let s = scoreMatch(queryLower: queryLower, tokens: tokens, title: bm.title, url: bm.url)
-            if s > 0 {
-                let host = hostOnly(bm.url)
-                let freqBoost = min(28, (visitFreq[normalizeKey(bm.url)] ?? 0) * 5)
-                scoredSites.append(OmniboxCandidateEntry(
-                    id: "bm-\(bm.id)",
-                    title: bm.title.isEmpty ? host : bm.title,
-                    url: bm.url,
-                    subtitle: host,
-                    isBookmark: true,
-                    tabId: nil,
-                    score: s + 18 + freqBoost,
-                    visitedAt: bm.createdAt
-                ))
-            }
-        }
-        for sc in shortcuts {
-            let s = scoreMatch(queryLower: queryLower, tokens: tokens, title: sc.title, url: sc.url)
-            if s > 0 {
-                let host = hostOnly(sc.url)
-                scoredSites.append(OmniboxCandidateEntry(
-                    id: "sc-\(sc.id)",
-                    title: sc.title.isEmpty ? host : sc.title,
-                    url: sc.url,
-                    subtitle: host,
-                    isBookmark: true,
-                    tabId: nil,
-                    score: s + 14,
-                    visitedAt: 0
-                ))
-            }
-        }
-        for (k, h) in latestByKey {
-            let s = scoreMatch(queryLower: queryLower, tokens: tokens, title: h.title, url: h.url)
-            if s > 0 {
-                let host = hostOnly(h.url)
-                let freqBoost = min(35, (visitFreq[k] ?? 1) * 6)
-                let ageSec = max(0, (nowMs - h.visitedAt) / 1000.0)
-                let recencyBoost = ageSec < 86400 ? 16 : (ageSec < 604800 ? 9 : 0)
-                scoredSites.append(OmniboxCandidateEntry(
-                    id: "hist-\(h.id)",
-                    title: h.title.isEmpty ? host : h.title,
-                    url: h.url,
-                    subtitle: "\(host) · \(relativeTime(h.visitedAt))",
-                    isBookmark: false,
-                    tabId: nil,
-                    score: s + freqBoost + recencyBoost,
-                    visitedAt: h.visitedAt
-                ))
-            }
-        }
-        scoredSites.sort {
-            if $0.score != $1.score { return $0.score > $1.score }
-            return $0.visitedAt > $1.visitedAt
-        }
-
-        var topHit: OmniboxCandidateEntry? = nil
-        if let best = scoredSites.first, best.score >= 85 {
-            let host = hostOnly(best.url)
-            topHit = OmniboxCandidateEntry(
-                id: "top-\(best.id)",
-                title: best.title,
-                url: best.url,
-                subtitle: host,
-                isBookmark: best.isBookmark,
-                tabId: nil,
-                score: best.score,
-                visitedAt: best.visitedAt
-            )
-            seen.insert(normalizeKey(best.url))
-        }
-
-        var outTabs: [OmniboxCandidateEntry] = []
-        for t in tabMatches where t.tabId != activeId {
-            let k = normalizeKey(t.url)
-            if seen.contains(k) && topHit?.title.lowercased() == t.title.lowercased() { continue }
-            outTabs.append(t)
-            seen.insert(k)
-            if outTabs.count >= 2 { break }
-        }
-
-        var outLib: [OmniboxCandidateEntry] = []
-        for item in scoredSites {
-            let k = normalizeKey(item.url)
-            if seen.contains(k) { continue }
-            seen.insert(k)
-            let subtitle = item.isBookmark ? "\(hostOnly(item.url)) · \(L10n.t("书签", "Bookmark"))" : item.subtitle
-            outLib.append(OmniboxCandidateEntry(
-                id: item.id,
-                title: item.title,
-                url: item.url,
-                subtitle: subtitle,
-                isBookmark: item.isBookmark,
-                tabId: nil,
-                score: item.score,
-                visitedAt: item.visitedAt
-            ))
-            if outLib.count >= 6 { break }
-        }
-
-        return (topHit, outTabs, outLib)
     }
 }
 
@@ -1706,19 +944,53 @@ private struct PrismTactileButtonStyle: ButtonStyle {
     }
 }
 
+extension BrowserRootView {
+    @MainActor
+    static func presentSystemShareSheet(items: [Any]) {
+        let vc = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first,
+              let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController ?? scene.windows.first?.rootViewController else {
+            return
+        }
+        var presenter = root
+        while let presented = presenter.presentedViewController {
+            presenter = presented
+        }
+        if let pop = vc.popoverPresentationController {
+            pop.sourceView = presenter.view
+            pop.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.maxY - 60, width: 0, height: 0)
+            pop.permittedArrowDirections = []
+        }
+        presenter.present(vc, animated: true)
+    }
+}
+
 private struct VideoMiniStrip: View {
+    enum SendState { case idle, sending, sent }
+
     @ObservedObject var tab: BrowserTab
     @ObservedObject var handoffService: HandoffService
     @ObservedObject var syncEngine: SyncEngine
     @ObservedObject var tabManager: TabManager
     let onRequireAccount: () -> Void
+    var onVideoScrub: ((CGFloat, Bool) -> Void)? = nil
+
+    @State private var sendState: SendState = .idle
+    @State private var displayTick: Int = 0
+
+    private let videoClockTimer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
         Button {
+            guard sendState == .idle else { return }
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
             guard syncEngine.loggedIn else {
                 tabManager.showToast(L10n.t("请先登录 Prism Account 使用桌面续播", "Sign in to Prism Account to continue on desktop"))
                 onRequireAccount()
                 return
+            }
+            withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                sendState = .sending
             }
             Task {
                 let ok = await handoffService.push(
@@ -1728,26 +1000,83 @@ private struct VideoMiniStrip: View {
                     videoSeconds: tab.hasVideo ? tab.videoSeconds : 0,
                     syncEngine: syncEngine
                 )
-                tabManager.showToast(
-                    ok
-                        ? (tab.hasVideo
-                            ? L10n.t("已带进度接力至桌面端", "Sent video to desktop")
-                            : L10n.t("已推送当前网页至桌面端", "Sent page to desktop"))
-                        : L10n.t("发送失败", "Failed")
-                )
+                if ok {
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                        sendState = .sent
+                    }
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                } else {
+                    tabManager.showToast(L10n.t("发送失败", "Failed"))
+                }
+                withAnimation(.easeOut(duration: 0.2)) {
+                    sendState = .idle
+                }
             }
         } label: {
-            Label(L10n.t("桌面续播", "Continue on Desktop"), systemImage: "laptopcomputer")
-                .font(.caption.weight(.semibold))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(.ultraThinMaterial, in: Capsule())
-                .overlay(
-                    Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 1)
-                )
-                .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+            HStack(spacing: 6) {
+                switch sendState {
+                case .idle:
+                    Image(systemName: "laptopcomputer")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Text(idleLabelText)
+                        .font(.caption.weight(.semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(.primary)
+                case .sending:
+                    ProgressView()
+                        .scaleEffect(0.68)
+                        .frame(width: 14, height: 14)
+                    Text(L10n.t("正在同步...", "Sending..."))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                case .sent:
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                    Text(L10n.t("已发送至电脑", "Sent to Desktop"))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(
+                Capsule().stroke(sendState == .sent ? Color.green.opacity(0.35) : Color.primary.opacity(0.08), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
         }
         .buttonStyle(PrismTactileButtonStyle())
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 16)
+                .onChanged { val in
+                    guard tab.hasVideo, abs(val.translation.width) > abs(val.translation.height) else { return }
+                    onVideoScrub?(val.translation.width, false)
+                }
+                .onEnded { val in
+                    guard tab.hasVideo, abs(val.translation.width) > abs(val.translation.height) else { return }
+                    onVideoScrub?(val.translation.width, true)
+                }
+        )
+        .onReceive(videoClockTimer) { _ in
+            if tab.hasVideo && !tab.videoPaused && tab.videoDuration > 0 {
+                displayTick += 1
+            }
+        }
+    }
+
+    private var idleLabelText: String {
+        _ = displayTick
+        let base = L10n.t("桌面续播", "Continue on Desktop")
+        if tab.hasVideo && tab.videoDuration > 0 {
+            let sec = max(0, Int(tab.videoSeconds.rounded()))
+            let mins = sec / 60
+            let rem = sec % 60
+            return "\(base) · \(String(format: "%02d:%02d", mins, rem))"
+        }
+        return base
     }
 }
 
@@ -1820,20 +1149,33 @@ private struct BlockedAppJumpBanner: View {
     let onDismiss: () -> Void
 
     var body: some View {
-        HStack {
-            Image(systemName: "hand.raised.shield.fill").foregroundStyle(.orange)
-            Text(L10n.t("已拦截自动跳转外部 App", "Blocked external app jump"))
+        let appName = AppJumpShield.friendlyAppName(for: url)
+        HStack(spacing: 8) {
+            Image(systemName: "hand.raised.shield.fill")
+                .foregroundStyle(.orange)
+            Text(L10n.t("已拦截跳转至 \(appName)", "Blocked jump to \(appName)"))
                 .font(.caption.weight(.medium))
-            Spacer()
+                .lineLimit(1)
+            Spacer(minLength: 4)
             Button(L10n.t("允许一次", "Allow Once"), action: onAllowOnce)
                 .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.orange.opacity(0.12), in: Capsule())
             Button(action: onDismiss) {
-                Image(systemName: "xmark").font(.caption)
+                Image(systemName: "xmark")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(.regularMaterial, in: Capsule())
+        .overlay(
+            Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 2)
     }
 }
 

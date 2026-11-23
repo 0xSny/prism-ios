@@ -11,40 +11,49 @@ final class AdBlockManager: ObservableObject {
         ("prism-annoyances-privacy-v1.0.8", "prism_annoyances_privacy")
     ]
 
-    static let blockedAppSchemes: Set<String> = [
-        "itms-apps", "itms-appss", "itms",
-        "tbopen", "taobao", "tmall",
-        "bilibili", "snssdk", "snssdk1128", "aweme",
-        "weixin", "wechat", "alipays", "alipay",
-        "pinduoduo", "openapp.jdmobile", "jdmobile",
-        "baiduboxapp", "zhihu", "xhsdiscover", "weibo", "sinaweibo"
-    ]
-
-    static let blockedStoreHosts: Set<String> = [
-        "apps.apple.com", "itunes.apple.com"
-    ]
-
     func prepareRules() async {
         guard let store = WKContentRuleListStore.default() else {
             self.compiledRuleLists = []
             return
         }
+
         var loaded: [WKContentRuleList] = []
+        var missingPacks: [(identifier: String, resource: String)] = []
+
+        // Fast path: mount already-compiled rules directly from WebKit C++ cache without reading bundle JSON
         for pack in Self.rulePacks {
             if let existing = try? await store.contentRuleList(forIdentifier: pack.identifier) {
                 loaded.append(existing)
-                continue
+            } else {
+                missingPacks.append(pack)
             }
-            guard let url = Bundle.main.url(forResource: pack.resource, withExtension: "json"),
-                  let jsonStr = try? String(contentsOf: url, encoding: .utf8),
-                  let compiled = try? await store.compileContentRuleList(
-                      forIdentifier: pack.identifier,
-                      encodedContentRuleList: jsonStr
-                  ) else {
-                continue
-            }
-            loaded.append(compiled)
         }
+
+        if !missingPacks.isEmpty {
+            // Read multi-megabyte JSON rule packs on a background utility thread to avoid main-thread cold-start hitches
+            let packsToLoad = missingPacks
+            let rawPayloads: [(identifier: String, json: String)] = await Task.detached(priority: .utility) {
+                var results: [(identifier: String, json: String)] = []
+                for pack in packsToLoad {
+                    guard let url = Bundle.main.url(forResource: pack.resource, withExtension: "json"),
+                          let jsonStr = try? String(contentsOf: url, encoding: .utf8) else {
+                        continue
+                    }
+                    results.append((pack.identifier, jsonStr))
+                }
+                return results
+            }.value
+
+            for item in rawPayloads {
+                if let compiled = try? await store.compileContentRuleList(
+                    forIdentifier: item.identifier,
+                    encodedContentRuleList: item.json
+                ) {
+                    loaded.append(compiled)
+                }
+            }
+        }
+
         self.compiledRuleLists = loaded
     }
 
@@ -58,15 +67,6 @@ final class AdBlockManager: ObservableObject {
     }
 
     static func shouldInterceptNavigation(_ url: URL) -> Bool {
-        guard let scheme = url.scheme?.lowercased() else { return false }
-        if blockedAppSchemes.contains(scheme) {
-            return true
-        }
-        if (scheme == "http" || scheme == "https"),
-           let host = url.host?.lowercased(),
-           blockedStoreHosts.contains(host) {
-            return true
-        }
-        return false
+        AppJumpShield.isBlockedSchemeOrAppStore(url) || AppJumpShield.isGatewayURL(url)
     }
 }

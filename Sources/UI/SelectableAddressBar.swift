@@ -20,6 +20,7 @@ private final class AutofocusAddressField: UITextField {
 struct SelectableAddressBar: UIViewRepresentable {
     @Binding var text: String
     var placeholder: String
+    var preferGoKey: Bool = false
     var onSubmit: (String) -> Void
     var onPasteAndGo: ((String) -> Void)?
 
@@ -34,12 +35,13 @@ struct SelectableAddressBar: UIViewRepresentable {
         tf.font = .systemFont(ofSize: 15, weight: .regular)
         tf.keyboardType = .default
         tf.textContentType = nil
-        tf.returnKeyType = .search
+        tf.returnKeyType = preferGoKey ? .go : .search
         tf.autocapitalizationType = .none
         tf.autocorrectionType = .no
         tf.smartQuotesType = .no
         tf.smartDashesType = .no
-        tf.clearButtonMode = .whileEditing
+        // Never show UIKit's built-in clear button; the outer capsule provides one unified [×] button
+        tf.clearButtonMode = .never
         tf.borderStyle = .none
         tf.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         tf.addTarget(context.coordinator, action: #selector(Coordinator.textChanged(_:)), for: .editingChanged)
@@ -81,6 +83,15 @@ struct SelectableAddressBar: UIViewRepresentable {
     func updateUIView(_ uiView: UITextField, context: Context) {
         if uiView.text != text {
             uiView.text = text
+            let end = uiView.endOfDocument
+            uiView.selectedTextRange = uiView.textRange(from: end, to: end)
+        }
+        let targetReturn: UIReturnKeyType = preferGoKey ? .go : .search
+        if uiView.returnKeyType != targetReturn {
+            uiView.returnKeyType = targetReturn
+            if uiView.isFirstResponder {
+                uiView.reloadInputViews()
+            }
         }
         context.coordinator.parent = self
     }

@@ -13,8 +13,8 @@ jobs:
   build-ios:
     runs-on: macos-15
     env:
-      APP_VERSION: "1.0.8"
-      BUILD_NUMBER: "1008"
+      APP_VERSION: "1.0.9"
+      BUILD_NUMBER: "1009"
       BUNDLE_ID: "com.zzaoo.prism.mobile"
     steps:
       - name: Checkout repository
@@ -75,7 +75,7 @@ jobs:
                 "bundleIdentifier": "${BUNDLE_ID}",
                 "developerName": "Prism Team",
                 "subtitle": "零知识云同步与指纹容器隔离浏览器",
-                "localizedDescription": "Prism v${APP_VERSION} 原生 SwiftUI 移动客户端：微信输入法默认中文键盘修复、5,000+ 去广告规则、双向 3 秒极速接力、桌面 ⇄ iOS 隔空投送、实时天气胶囊、Face ID 密码库填充、iOS 17 代理隔离容器与媒体嗅探。",
+                "localizedDescription": "Prism v${APP_VERSION} 原生 SwiftUI 移动客户端：四层防强跳 App 引擎与剪贴板投毒免疫、Safari 分组卡片智能搜索（拼音/快捷搜索/实时换算与色彩）、120Hz 滚动底栏沉浸、标签页会话持久化与懒加载。",
                 "iconURL": "https://prism.zzaoo.com/ios/icon.png",
                 "tintColor": "#4285F4",
                 "versions": [
@@ -86,7 +86,7 @@ jobs:
                     "size": ${IPA_SIZE},
                     "minOSVersion": "17.0",
                     "downloadURL": "https://prism.zzaoo.com/releases/Prism-${APP_VERSION}.ipa",
-                    "localizedDescription": "v${APP_VERSION}：微信输入法默认中文键盘修复、5000+ 去广告规则、双向 3 秒极速接力、统一品牌 Prism、网页顶部下拉刷新与全平台密码库同步。"
+                    "localizedDescription": "v${APP_VERSION}：四层防强跳其他 App 护盾（掐断 Universal Links / 中转网关剥离 / 剪贴板口令拦截 / 免 App 展开）、Safari 级五维智能 Omnibox 搜索与即时答案、底栏 120Hz 滚动沉浸与长按历史、标签页会话持久化与后台懒加载。"
                   }
                 ]
               }
