@@ -158,6 +158,24 @@ struct MenuSheetView: View {
 
                     Button {
                         dismiss()
+                        onOpenSubSheet(.reader)
+                    } label: {
+                        Label(L10n.t("沉浸式阅读模式", "Reader Mode"), systemImage: "doc.plaintext")
+                    }
+                    .disabled(tabManager.activeTab?.isNewTab != false)
+
+                    Button {
+                        dismiss()
+                        onOpenSubSheet(.downloads)
+                    } label: {
+                        Label(
+                            L10n.t("下载管理 (\(tabManager.downloads.count))", "Downloads (\(tabManager.downloads.count))"),
+                            systemImage: "arrow.down.circle"
+                        )
+                    }
+
+                    Button {
+                        dismiss()
                         onOpenSubSheet(.devtools)
                     } label: {
                         Label(L10n.t("移动端 DevTools 调试器", "Mobile DevTools"), systemImage: "wrench.and.screwdriver")
@@ -167,6 +185,7 @@ struct MenuSheetView: View {
                 Section(L10n.t("防护与偏好", "Protection & Preferences")) {
                     Toggle(L10n.t("屏蔽追踪与广告", "Ad & Tracker Blocker"), isOn: $tabManager.adblockEnabled)
                     Toggle(L10n.t("拦截强跳 App Store / 外部App", "Block Rogue App Jumps"), isOn: $tabManager.blockRogueAppJumps)
+                    Toggle(L10n.t("地址栏回车直达首位命中站点", "Enter Opens Top Hit in Address Bar"), isOn: $tabManager.omniboxEnterTopHitEnabled)
                     Toggle(L10n.t("深色模式下自动将网页变暗", "Auto-Darken Webpages in Dark Mode"), isOn: $tabManager.webDarkModeFollowTheme)
                     if !tabManager.webDarkModeWhitelistHosts.isEmpty {
                         Button(role: .destructive) {
@@ -199,7 +218,7 @@ struct MenuSheetView: View {
                     }
                 }
             }
-            .navigationTitle("Prism v1.0.7")
+            .navigationTitle("Prism v1.0.8")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -691,25 +710,65 @@ struct MobileDevToolsSheetView: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
+        if let activeTab = tab {
+            MobileDevToolsContent(
+                tab: activeTab,
+                syncEngine: syncEngine,
+                handoffService: handoffService,
+                tabManager: tabManager,
+                selectedTab: $selectedTab,
+                storageText: $storageText,
+                onDismiss: { dismiss() }
+            )
+            .onAppear { tabManager.setDevToolsActive(true) }
+            .onDisappear { tabManager.setDevToolsActive(false) }
+        } else {
+            NavigationStack {
+                ContentUnavailableView(
+                    L10n.t("无活动标签页", "No Active Tab"),
+                    systemImage: "wrench.and.screwdriver"
+                )
+                .navigationTitle("Mobile DevTools")
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button(L10n.t("完成", "Done")) { dismiss() }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct MobileDevToolsContent: View {
+    @ObservedObject var tab: BrowserTab
+    @ObservedObject var syncEngine: SyncEngine
+    @ObservedObject var handoffService: HandoffService
+    @ObservedObject var tabManager: TabManager
+    @Binding var selectedTab: Int
+    @Binding var storageText: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        let _ = tab.devToolsRevision
         NavigationStack {
             VStack(spacing: 0) {
                 Picker("", selection: $selectedTab) {
-                    Text("Console (\(tab?.consoleLogs.count ?? 0))").tag(0)
-                    Text("Network (\(tab?.networkLogs.count ?? 0))").tag(1)
+                    Text("Console (\(tab.consoleLogs.count))").tag(0)
+                    Text("Network (\(tab.networkLogs.count))").tag(1)
                     Text("Storage").tag(2)
                 }
                 .pickerStyle(.segmented)
                 .padding()
 
                 if selectedTab == 0 {
-                    List(tab?.consoleLogs ?? []) { log in
+                    List(tab.consoleLogs) { log in
                         VStack(alignment: .leading, spacing: 2) {
                             Text(log.level.uppercased()).font(.caption2.bold()).foregroundStyle(log.level == "error" ? .red : .blue)
                             Text(log.message).font(.caption.monospaced())
                         }
                     }
                 } else if selectedTab == 1 {
-                    List(tab?.networkLogs ?? []) { req in
+                    List(tab.networkLogs) { req in
                         VStack(alignment: .leading, spacing: 2) {
                             HStack {
                                 Text("\(req.method) \(req.status)").font(.caption2.bold())
@@ -732,7 +791,7 @@ struct MobileDevToolsSheetView: View {
                             Button(L10n.t("加密推送至桌面", "Push to Desktop")) {
                                 Task {
                                     guard !storageText.isEmpty else { return }
-                                    let ok = await handoffService.push(kind: "clipboard", title: "Session Storage", url: tab?.urlString, text: storageText, syncEngine: syncEngine)
+                                    let ok = await handoffService.push(kind: "clipboard", title: "Session Storage", url: tab.urlString, text: storageText, syncEngine: syncEngine)
                                     tabManager.showToast(ok ? L10n.t("已通过零知识通道推送至桌面", "Pushed encrypted storage") : L10n.t("需先登录 Prism Account", "Sign in required"))
                                 }
                             }
@@ -754,7 +813,7 @@ struct MobileDevToolsSheetView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(L10n.t("完成", "Done")) { dismiss() }
+                    Button(L10n.t("完成", "Done")) { onDismiss() }
                 }
             }
             .onAppear { fetchStorage() }
@@ -765,10 +824,218 @@ struct MobileDevToolsSheetView: View {
         let js = """
         JSON.stringify({ cookie: document.cookie, localStorage: Object.assign({}, window.localStorage) }, null, 2);
         """
-        tab?.webView?.evaluateJavaScript(js) { res, _ in
+        tab.webView?.evaluateJavaScript(js) { res, _ in
             if let s = res as? String {
                 Task { @MainActor in storageText = s }
             }
+        }
+    }
+}
+
+// MARK: - Reader Mode Sheet
+
+struct ReaderModeSheetView: View {
+    @ObservedObject var tabManager: TabManager
+    @Environment(\.dismiss) private var dismiss
+
+    enum ReaderTheme: String, CaseIterable, Identifiable {
+        case paper, sepia, dark
+        var id: String { rawValue }
+        var bg: Color {
+            switch self {
+            case .paper: return Color(red: 1.0, green: 0.992, blue: 0.976)
+            case .sepia: return Color(red: 0.965, green: 0.933, blue: 0.859)
+            case .dark: return Color(red: 0.094, green: 0.102, blue: 0.118)
+            }
+        }
+        var fg: Color {
+            switch self {
+            case .paper, .sepia: return Color(red: 0.13, green: 0.14, blue: 0.16)
+            case .dark: return Color(red: 0.89, green: 0.90, blue: 0.92)
+            }
+        }
+        var label: String {
+            switch self {
+            case .paper: return L10n.t("纯净白", "Paper")
+            case .sepia: return L10n.t("护眼黄", "Sepia")
+            case .dark: return L10n.t("夜间黑", "Dark")
+            }
+        }
+    }
+
+    @State private var article: ReaderArticle?
+    @State private var isLoading = true
+    @State private var fontSize: Double = 17
+    @State private var theme: ReaderTheme = .paper
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if isLoading {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text(L10n.t("正在提取正文排版...", "Extracting article..."))
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let article, !article.paragraphs.isEmpty {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 18) {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(article.siteHost)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(theme == .dark ? .gray : .secondary)
+                                Text(article.title)
+                                    .font(.system(size: fontSize + 7, weight: .bold, design: .serif))
+                                    .foregroundStyle(theme.fg)
+                                if !article.byline.isEmpty {
+                                    Text(article.byline)
+                                        .font(.caption)
+                                        .foregroundStyle(theme == .dark ? .gray : .secondary)
+                                }
+                            }
+                            Divider()
+                            ForEach(Array(article.paragraphs.enumerated()), id: \.offset) { _, p in
+                                Text(p)
+                                    .font(.system(size: fontSize, design: .serif))
+                                    .lineSpacing(fontSize * 0.42)
+                                    .foregroundStyle(theme.fg)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                        .padding(.horizontal, 22)
+                        .padding(.vertical, 20)
+                    }
+                    .background(theme.bg.ignoresSafeArea())
+                } else {
+                    ContentUnavailableView(
+                        L10n.t("当前页面暂无可提取的正文", "No Readable Article Found"),
+                        systemImage: "doc.plaintext",
+                        description: Text(L10n.t("请先打开文章、博客或新闻详情页再启用阅读模式。", "Open an article or blog post to read cleanly."))
+                    )
+                }
+            }
+            .navigationTitle(L10n.t("阅读模式", "Reader"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItemGroup(placement: .topBarLeading) {
+                    Button { fontSize = max(14, fontSize - 1) } label: { Text("A-").font(.subheadline.weight(.semibold)) }
+                    Button { fontSize = min(26, fontSize + 1) } label: { Text("A+").font(.subheadline.weight(.semibold)) }
+                }
+                ToolbarItem(placement: .principal) {
+                    Picker("", selection: $theme) {
+                        ForEach(ReaderTheme.allCases) { t in
+                            Text(t.label).tag(t)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 190)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(L10n.t("完成", "Done")) { dismiss() }
+                }
+            }
+            .onAppear {
+                if tabManager.isEffectiveAppDark { theme = .dark }
+                tabManager.extractReaderArticle { extracted in
+                    self.article = extracted
+                    self.isLoading = false
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Downloads Sheet
+
+struct DownloadsSheetView: View {
+    @ObservedObject var tabManager: TabManager
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if tabManager.downloads.isEmpty {
+                    ContentUnavailableView(
+                        L10n.t("暂无下载记录", "No Downloads Yet"),
+                        systemImage: "arrow.down.circle",
+                        description: Text(L10n.t("浏览网页触发文件下载时，会在此自动接管并保存。", "File downloads triggered in webpages appear here."))
+                    )
+                } else {
+                    List {
+                        ForEach(tabManager.downloads) { item in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text(item.filename)
+                                        .font(.subheadline.weight(.semibold))
+                                        .lineLimit(1)
+                                    Spacer()
+                                    if item.status == .downloading {
+                                        ProgressView()
+                                            .scaleEffect(0.8)
+                                    } else if item.status == .completed, let fileURL = item.localURL {
+                                        ShareLink(item: fileURL) {
+                                            Image(systemName: "square.and.arrow.up")
+                                                .font(.subheadline)
+                                        }
+                                    } else if item.status == .failed {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .foregroundStyle(.red)
+                                    }
+                                }
+                                HStack {
+                                    Text(statusText(item))
+                                        .font(.caption)
+                                        .foregroundStyle(item.status == .failed ? .red : .secondary)
+                                    Spacer()
+                                    if item.byteCount > 0 {
+                                        Text(ByteCountFormatter.string(fromByteCount: item.byteCount, countStyle: .file))
+                                            .font(.caption.monospacedDigit())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                        .onDelete { offsets in
+                            for idx in offsets {
+                                if let url = tabManager.downloads[idx].localURL {
+                                    try? FileManager.default.removeItem(at: url)
+                                }
+                            }
+                            tabManager.downloads.remove(atOffsets: offsets)
+                        }
+                    }
+                }
+            }
+            .navigationTitle(L10n.t("下载管理", "Downloads"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if !tabManager.downloads.isEmpty {
+                        Button(role: .destructive) {
+                            for d in tabManager.downloads {
+                                if let url = d.localURL { try? FileManager.default.removeItem(at: url) }
+                            }
+                            tabManager.downloads.removeAll()
+                        } label: {
+                            Text(L10n.t("清空", "Clear"))
+                        }
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(L10n.t("完成", "Done")) { dismiss() }
+                }
+            }
+        }
+    }
+
+    private func statusText(_ item: DownloadRecord) -> String {
+        switch item.status {
+        case .downloading: return L10n.t("下载中...", "Downloading...")
+        case .completed: return L10n.t("已保存 · 点击右侧可分享至“文件”", "Saved · Share to Files")
+        case .failed: return item.errorMessage ?? L10n.t("下载失败", "Download failed")
         }
     }
 }

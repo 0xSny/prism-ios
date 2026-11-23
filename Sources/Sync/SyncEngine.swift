@@ -164,7 +164,7 @@ final class SyncEngine: ObservableObject {
                 "authKey": derived.authKey,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.0.7",
+                "appVersion": "1.0.8",
             ])
 
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -229,7 +229,7 @@ final class SyncEngine: ObservableObject {
                 "authKey": derived.authKey,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.0.7",
+                "appVersion": "1.0.8",
             ])
 
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -366,7 +366,7 @@ final class SyncEngine: ObservableObject {
                 "wipeOldCiphertext": true,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.0.7",
+                "appVersion": "1.0.8",
             ]
 
             let cleanRec = recoveryKey.trimmingCharacters(in: .whitespacesAndNewlines)

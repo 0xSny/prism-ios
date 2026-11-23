@@ -22,21 +22,30 @@ final class BrowserTab: ObservableObject, Identifiable {
     @Published var blockedCount: Int = 0
     @Published var isTranslated: Bool = false
     @Published var hasVideo: Bool = false
-    @Published var videoSeconds: Double = 0
-    @Published var videoDuration: Double = 0
     @Published var videoPaused: Bool = true
     @Published var playbackRate: Double = 1.0
     @Published var sniffedMedia: [SniffedMediaItem] = []
-    @Published var consoleLogs: [ConsoleLogEntry] = []
-    @Published var networkLogs: [NetworkLogEntry] = []
+    @Published var devToolsRevision: Int = 0
     @Published var matchedPasswords: [PasswordEntry] = []
     @Published var showAutofillBar: Bool = false
     @Published var pendingPasswordSave: (origin: String, username: String, password: String)?
     @Published var blockedAppJumpURL: URL?
+    @Published var snapshot: UIImage?
+
+    var videoSeconds: Double = 0
+    var videoDuration: Double = 0
+    var consoleLogs: [ConsoleLogEntry] = []
+    var networkLogs: [NetworkLogEntry] = []
 
     var webView: WKWebView?
     var topBackdropColor: UIColor?
     var themeColorObservation: NSKeyValueObservation?
+    var progressObservation: NSKeyValueObservation?
+    var loadingObservation: NSKeyValueObservation?
+    var titleObservation: NSKeyValueObservation?
+    var urlObservation: NSKeyValueObservation?
+    var backObservation: NSKeyValueObservation?
+    var forwardObservation: NSKeyValueObservation?
 
     init(id: UUID = UUID(), profileId: String, initialURL: URL? = nil) {
         self.id = id
@@ -49,10 +58,36 @@ final class BrowserTab: ObservableObject, Identifiable {
             self.title = L10n.t("新标签页", "New Tab")
         }
     }
+
+    func teardown() {
+        themeColorObservation?.invalidate()
+        progressObservation?.invalidate()
+        loadingObservation?.invalidate()
+        titleObservation?.invalidate()
+        urlObservation?.invalidate()
+        backObservation?.invalidate()
+        forwardObservation?.invalidate()
+        themeColorObservation = nil
+        progressObservation = nil
+        loadingObservation = nil
+        titleObservation = nil
+        urlObservation = nil
+        backObservation = nil
+        forwardObservation = nil
+        if let wv = webView {
+            wv.stopLoading()
+            wv.navigationDelegate = nil
+            wv.uiDelegate = nil
+            wv.configuration.userContentController.removeAllScriptMessageHandlers()
+            wv.removeFromSuperview()
+        }
+        webView = nil
+        snapshot = nil
+    }
 }
 
 @MainActor
-final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, WKDownloadDelegate {
     static let standardDarkBackdropColor = UIColor(red: 0x20 / 255.0, green: 0x21 / 255.0, blue: 0x24 / 255.0, alpha: 1.0)
     static let standardLightBackdropColor = UIColor.white
     static let dynamicSystemBackdropColor = UIColor { trait in
@@ -86,9 +121,20 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             applyWebDarkModeToAllTabs()
         }
     }
-    @Published var adblockEnabled: Bool = true
+    @Published var adblockEnabled: Bool = true {
+        didSet {
+            UserDefaults.standard.set(adblockEnabled, forKey: "prism.adblockEnabled")
+            applyAdblockToAllTabs()
+        }
+    }
     @Published var blockRogueAppJumps: Bool = true
     @Published var desktopMode: Bool = false
+    @Published var omniboxEnterTopHitEnabled: Bool = false {
+        didSet {
+            UserDefaults.standard.set(omniboxEnterTopHitEnabled, forKey: "prism.omniboxEnterTopHitEnabled")
+        }
+    }
+    @Published var downloads: [DownloadRecord] = []
 
     weak var syncEngine: SyncEngine?
     weak var handoffService: HandoffService?
@@ -97,9 +143,12 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     private var lastPromptedClipboard: String = ""
     private var allowedOnceJumpURL: URL?
     private var systemIsDark: Bool = UITraitCollection.current.userInterfaceStyle == .dark
+    private var devToolsActive: Bool = false
+    private var downloadMap: [ObjectIdentifier: UUID] = [:]
 
     override init() {
         super.init()
+        URLCache.shared = URLCache(memoryCapacity: 32 * 1024 * 1024, diskCapacity: 160 * 1024 * 1024)
         if let rawEngine = UserDefaults.standard.string(forKey: "prism.searchEngine"),
            let eng = SearchEngineOption(rawValue: rawEngine) {
             self.searchEngine = eng
@@ -107,6 +156,12 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         if let rawTheme = UserDefaults.standard.string(forKey: "prism.theme"),
            let theme = AppTheme(rawValue: rawTheme) {
             self.appTheme = theme
+        }
+        if UserDefaults.standard.object(forKey: "prism.adblockEnabled") != nil {
+            self.adblockEnabled = UserDefaults.standard.bool(forKey: "prism.adblockEnabled")
+        }
+        if UserDefaults.standard.object(forKey: "prism.omniboxEnterTopHitEnabled") != nil {
+            self.omniboxEnterTopHitEnabled = UserDefaults.standard.bool(forKey: "prism.omniboxEnterTopHitEnabled")
         }
         if UserDefaults.standard.object(forKey: "prism.webDarkModeFollowTheme") != nil {
             self.webDarkModeFollowTheme = UserDefaults.standard.bool(forKey: "prism.webDarkModeFollowTheme")
@@ -194,6 +249,9 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
 
     @discardableResult
     func createTab(url: URL? = nil, profileId: String? = nil, activate: Bool = true, seekSeconds: Double? = nil) -> BrowserTab {
+        if activate {
+            captureActiveSnapshot()
+        }
         let pid = profileId ?? activeProfile.id
         let tab = BrowserTab(profileId: pid, initialURL: url)
         tabs.append(tab)
@@ -208,7 +266,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
 
     func closeTab(_ id: UUID) {
         guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
-        tabs[idx].webView?.stopLoading()
+        tabs[idx].teardown()
         tabs.remove(at: idx)
         if tabs.isEmpty {
             createTab(url: nil, activate: true)
@@ -220,16 +278,81 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         }
     }
 
+    func closeAllTabs() {
+        for tab in tabs {
+            tab.teardown()
+        }
+        tabs.removeAll()
+        createTab(url: nil, activate: true)
+    }
+
     func switchTab(byOffset offset: Int) {
         guard tabs.count > 1, let curId = activeTabId,
               let curIdx = tabs.firstIndex(where: { $0.id == curId }) else { return }
+        captureActiveSnapshot()
         let nextIdx = (curIdx + offset + tabs.count) % tabs.count
         activeTabId = tabs[nextIdx].id
     }
 
     func activateTab(id: UUID) {
         guard tabs.contains(where: { $0.id == id }) else { return }
-        activeTabId = id
+        if activeTabId != id {
+            captureActiveSnapshot()
+            activeTabId = id
+        }
+    }
+
+    func captureActiveSnapshot() {
+        guard let tab = activeTab, !tab.isNewTab, let webView = tab.webView else { return }
+        guard webView.bounds.width > 10, webView.bounds.height > 10 else { return }
+        let config = WKSnapshotConfiguration()
+        config.afterScreenUpdates = false
+        config.snapshotWidth = 360
+        webView.takeSnapshot(with: config) { [weak tab] image, _ in
+            guard let image, let tab else { return }
+            Task { @MainActor in
+                tab.snapshot = image
+            }
+        }
+    }
+
+    func setDevToolsActive(_ active: Bool) {
+        devToolsActive = active
+        let jsFlag = active ? "true" : "false"
+        for tab in tabs {
+            tab.webView?.evaluateJavaScript("window.__prismDevToolsEnabled = \(jsFlag);", completionHandler: nil)
+        }
+    }
+
+    func applyAdblockToAllTabs() {
+        let profiles = syncEngine?.profiles ?? [.defaultProfile]
+        for tab in tabs {
+            guard let webView = tab.webView else { continue }
+            let profile = profiles.first(where: { $0.id == tab.profileId }) ?? .defaultProfile
+            AdBlockManager.shared.apply(to: webView.configuration.userContentController, enabled: adblockEnabled && profile.fingerprint.blockTrackers)
+        }
+    }
+
+    func extractReaderArticle(completion: @escaping (ReaderArticle?) -> Void) {
+        guard let tab = activeTab, !tab.isNewTab, let webView = tab.webView else {
+            completion(nil)
+            return
+        }
+        webView.evaluateJavaScript(MediaSnifferScripts.extractReaderJS) { result, _ in
+            guard let dict = result as? [String: Any],
+                  let paragraphs = dict["paragraphs"] as? [String],
+                  !paragraphs.isEmpty else {
+                Task { @MainActor in completion(nil) }
+                return
+            }
+            let article = ReaderArticle(
+                title: (dict["title"] as? String) ?? tab.title,
+                byline: (dict["byline"] as? String) ?? "",
+                siteHost: (dict["siteHost"] as? String) ?? "",
+                paragraphs: paragraphs
+            )
+            Task { @MainActor in completion(article) }
+        }
     }
 
     func findInActivePage(_ query: String) {
@@ -290,6 +413,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
+        webView.allowsLinkPreview = true
         webView.isFindInteractionEnabled = true
         if desktopMode {
             webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
@@ -297,6 +421,56 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             webView.customUserAgent = customUA
         }
         tab.webView = webView
+
+        tab.progressObservation = webView.observe(\.estimatedProgress, options: [.new]) { [weak tab, weak webView] _, _ in
+            Task { @MainActor [weak tab, weak webView] in
+                guard let tab, let webView else { return }
+                let p = webView.estimatedProgress
+                if abs(tab.estimatedProgress - p) > 0.015 || p >= 1.0 || p <= 0.01 {
+                    tab.estimatedProgress = p
+                }
+            }
+        }
+        tab.loadingObservation = webView.observe(\.isLoading, options: [.new]) { [weak tab, weak webView] _, _ in
+            Task { @MainActor [weak tab, weak webView] in
+                guard let tab, let webView else { return }
+                if tab.isLoading != webView.isLoading {
+                    tab.isLoading = webView.isLoading
+                }
+            }
+        }
+        tab.titleObservation = webView.observe(\.title, options: [.new]) { [weak tab, weak webView] _, _ in
+            Task { @MainActor [weak tab, weak webView] in
+                guard let tab, let webView else { return }
+                if let nextTitle = webView.title, !nextTitle.isEmpty, tab.title != nextTitle {
+                    tab.title = nextTitle
+                }
+            }
+        }
+        tab.urlObservation = webView.observe(\.url, options: [.new]) { [weak tab, weak webView] _, _ in
+            Task { @MainActor [weak tab, weak webView] in
+                guard let tab, let webView else { return }
+                if let nextUrl = webView.url?.absoluteString, !nextUrl.isEmpty, tab.urlString != nextUrl {
+                    tab.urlString = nextUrl
+                }
+            }
+        }
+        tab.backObservation = webView.observe(\.canGoBack, options: [.new]) { [weak tab, weak webView] _, _ in
+            Task { @MainActor [weak tab, weak webView] in
+                guard let tab, let webView else { return }
+                if tab.canGoBack != webView.canGoBack {
+                    tab.canGoBack = webView.canGoBack
+                }
+            }
+        }
+        tab.forwardObservation = webView.observe(\.canGoForward, options: [.new]) { [weak tab, weak webView] _, _ in
+            Task { @MainActor [weak tab, weak webView] in
+                guard let tab, let webView else { return }
+                if tab.canGoForward != webView.canGoForward {
+                    tab.canGoForward = webView.canGoForward
+                }
+            }
+        }
         tab.themeColorObservation = webView.observe(\.themeColor, options: [.new]) { [weak self, weak tab, weak webView] _, _ in
             Task { @MainActor [weak self, weak tab, weak webView] in
                 guard let self, let tab, let webView else { return }
@@ -314,6 +488,9 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     private func configureUserScripts(on ucc: WKUserContentController, profile: BrowserProfile, initialURL: URL?) {
         ucc.removeAllUserScripts()
         ucc.addUserScript(WKUserScript(source: MediaSnifferScripts.injectScriptSource, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        if devToolsActive {
+            ucc.addUserScript(WKUserScript(source: "window.__prismDevToolsEnabled = true;", injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        }
         if let fpScript = ProfileDataStoreRegistry.shared.fingerprintUserScript(for: profile) {
             ucc.addUserScript(fpScript)
         }
@@ -504,8 +681,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     func switchProfileForActiveTab(_ profileId: String) {
         guard let tab = activeTab else { return }
         let currentUrl = URL(string: tab.urlString)
-        tab.webView?.stopLoading()
-        tab.webView = nil
+        tab.teardown()
         tab.profileId = profileId
         if !tab.isNewTab, let currentUrl {
             load(url: currentUrl, in: tab)
@@ -711,6 +887,93 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         return nil
     }
 
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        if !navigationResponse.canShowMIMEType {
+            decisionHandler(.download)
+            return
+        }
+        if let http = navigationResponse.response as? HTTPURLResponse,
+           let disp = http.value(forHTTPHeaderField: "Content-Disposition")?.lowercased(),
+           disp.contains("attachment") {
+            decisionHandler(.download)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    nonisolated func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let dir = docs.appendingPathComponent("Downloads", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let cleanName = suggestedFilename.isEmpty ? "download-\(Int(Date().timeIntervalSince1970))" : suggestedFilename
+        var dest = dir.appendingPathComponent(cleanName)
+        if FileManager.default.fileExists(atPath: dest.path) {
+            let stem = dest.deletingPathExtension().lastPathComponent
+            let ext = dest.pathExtension
+            let stamped = ext.isEmpty ? "\(stem)-\(Int(Date().timeIntervalSince1970))" : "\(stem)-\(Int(Date().timeIntervalSince1970)).\(ext)"
+            dest = dir.appendingPathComponent(stamped)
+        }
+        let dlKey = ObjectIdentifier(download)
+        let sourceUrl = response.url?.absoluteString ?? ""
+        let expectedLen = response.expectedContentLength
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let recId = UUID()
+            self.downloadMap[dlKey] = recId
+            self.downloads.insert(
+                DownloadRecord(
+                    id: recId,
+                    filename: dest.lastPathComponent,
+                    sourceURL: sourceUrl,
+                    localURL: dest,
+                    byteCount: expectedLen > 0 ? expectedLen : 0,
+                    status: .downloading,
+                    errorMessage: nil,
+                    createdAt: Date()
+                ),
+                at: 0
+            )
+            self.showToast(L10n.t("开始下载：\(dest.lastPathComponent)", "Downloading: \(dest.lastPathComponent)"))
+        }
+        completionHandler(dest)
+    }
+
+    nonisolated func downloadDidFinish(_ download: WKDownload) {
+        let dlKey = ObjectIdentifier(download)
+        Task { @MainActor [weak self] in
+            guard let self, let recId = self.downloadMap.removeValue(forKey: dlKey),
+                  let idx = self.downloads.firstIndex(where: { $0.id == recId }) else { return }
+            self.downloads[idx].status = .completed
+            if let path = self.downloads[idx].localURL?.path,
+               let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+               let size = attrs[.size] as? NSNumber {
+                self.downloads[idx].byteCount = size.int64Value
+            }
+            self.showToast(L10n.t("下载完成：\(self.downloads[idx].filename)", "Downloaded: \(self.downloads[idx].filename)"))
+        }
+    }
+
+    nonisolated func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        let dlKey = ObjectIdentifier(download)
+        let errText = error.localizedDescription
+        Task { @MainActor [weak self] in
+            guard let self, let recId = self.downloadMap.removeValue(forKey: dlKey),
+                  let idx = self.downloads.firstIndex(where: { $0.id == recId }) else { return }
+            self.downloads[idx].status = .failed
+            self.downloads[idx].errorMessage = errText
+            self.showToast(L10n.t("下载失败：\(self.downloads[idx].filename)", "Download failed: \(self.downloads[idx].filename)"))
+        }
+    }
+
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         applyWebDarkAppearance(to: webView, url: webView.url)
         syncWebViewState(webView)
@@ -816,6 +1079,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             let msg = (payload["message"] as? String) ?? ""
             tab.consoleLogs.append(ConsoleLogEntry(level: level, message: msg))
             if tab.consoleLogs.count > 200 { tab.consoleLogs.removeFirst() }
+            if devToolsActive { tab.devToolsRevision += 1 }
         case "network":
             let method = (payload["method"] as? String) ?? "GET"
             let url = (payload["url"] as? String) ?? ""
@@ -823,26 +1087,41 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             let duration = (payload["durationMs"] as? Int) ?? 0
             tab.networkLogs.insert(NetworkLogEntry(method: method, url: url, status: status, durationMs: duration), at: 0)
             if tab.networkLogs.count > 200 { tab.networkLogs.removeLast() }
+            if devToolsActive { tab.devToolsRevision += 1 }
         case "videoState":
-            tab.hasVideo = (payload["hasVideo"] as? Bool) ?? false
-            tab.videoPaused = (payload["paused"] as? Bool) ?? true
+            let nextHasVideo = (payload["hasVideo"] as? Bool) ?? false
+            let nextPaused = (payload["paused"] as? Bool) ?? true
+            let nextRate = (payload["rate"] as? Double) ?? 1.0
             tab.videoSeconds = (payload["currentTime"] as? Double) ?? 0
             tab.videoDuration = (payload["duration"] as? Double) ?? 0
-            tab.playbackRate = (payload["rate"] as? Double) ?? 1.0
-            let host = URL(string: tab.urlString)?.host ?? "Prism"
-            BackgroundMediaController.shared.updateNowPlaying(
-                title: tab.title,
-                host: host,
-                duration: tab.videoDuration,
-                elapsed: tab.videoSeconds,
-                playing: !tab.videoPaused
-            )
+            if tab.hasVideo != nextHasVideo { tab.hasVideo = nextHasVideo }
+            if tab.videoPaused != nextPaused { tab.videoPaused = nextPaused }
+            if tab.playbackRate != nextRate { tab.playbackRate = nextRate }
+            if nextHasVideo {
+                let host = URL(string: tab.urlString)?.host ?? "Prism"
+                BackgroundMediaController.shared.updateNowPlaying(
+                    title: tab.title,
+                    host: host,
+                    duration: tab.videoDuration,
+                    elapsed: tab.videoSeconds,
+                    playing: !nextPaused
+                )
+            }
         case "passwordFocus":
             guard let origin = payload["origin"] as? String, let syncEngine else { return }
             let host = URL(string: origin)?.host ?? origin
             let matches = syncEngine.passwords.filter { $0.origin.contains(host) || origin.contains($0.origin) }
             tab.matchedPasswords = matches
-            tab.showAutofillBar = !matches.isEmpty
+            let shouldShow = !matches.isEmpty
+            if tab.showAutofillBar != shouldShow {
+                // Slight delay ensures WKContentView finishes first-responder keyboard presentation uninterrupted
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak tab] in
+                    guard let tab else { return }
+                    if tab.showAutofillBar != !tab.matchedPasswords.isEmpty {
+                        tab.showAutofillBar = !tab.matchedPasswords.isEmpty
+                    }
+                }
+            }
         case "passwordCapture":
             guard let origin = payload["origin"] as? String,
                   let password = payload["password"] as? String,
@@ -955,8 +1234,7 @@ private enum WebDarkModeScripts {
               html[data-prism-dark="1"] video,
               html[data-prism-dark="1"] picture,
               html[data-prism-dark="1"] canvas,
-              html[data-prism-dark="1"] iframe,
-              html[data-prism-dark="1"] [style*="background-image"]:not(body):not(html) {
+              html[data-prism-dark="1"] iframe {
                 filter: invert(1) hue-rotate(180deg) contrast(1.04) !important;
               }
               html[data-prism-dark="1"]:has(:fullscreen),
@@ -1235,8 +1513,7 @@ private enum WebDarkModeScripts {
           if (typeof requestAnimationFrame === 'function') {
             requestAnimationFrame(() => evaluateAndApply(true));
           }
-          setTimeout(() => evaluateAndApply(false), 250);
-          setTimeout(() => evaluateAndApply(false), 950);
+          setTimeout(() => evaluateAndApply(false), 350);
 
           if (window.matchMedia) {
             const darkMQ = window.matchMedia('(prefers-color-scheme: dark)');
@@ -1250,49 +1527,20 @@ private enum WebDarkModeScripts {
             }
           }
 
-          let scrollRafPending = false;
-          window.addEventListener('scroll', () => {
-            if (scrollRafPending) return;
-            scrollRafPending = true;
-            requestAnimationFrame(() => {
-              scrollRafPending = false;
-              sampleAndPostTopColor(false);
-            });
-          }, { passive: true });
-
           let debounceTimer = null;
-          const scheduleReeval = () => {
+          const scheduleHeadReeval = () => {
             if (debounceTimer) clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(() => evaluateAndApply(false), 120);
+            debounceTimer = setTimeout(() => sampleAndPostTopColor(false), 180);
           };
 
-          if (typeof MutationObserver === 'function' && document.documentElement) {
-            const mo = new MutationObserver((mutations) => {
-              for (let i = 0; i < mutations.length; i += 1) {
-                const m = mutations[i];
-                if (m.attributeName === 'data-prism-dark') continue;
-                scheduleReeval();
-                break;
-              }
-            });
-            mo.observe(document.documentElement, {
+          if (typeof MutationObserver === 'function' && document.head) {
+            const mo = new MutationObserver(() => scheduleHeadReeval());
+            mo.observe(document.head, {
+              childList: true,
+              subtree: true,
               attributes: true,
-              attributeFilter: ['class', 'style', 'data-color-mode', 'data-theme']
+              attributeFilter: ['content', 'media']
             });
-            if (document.body) {
-              mo.observe(document.body, {
-                attributes: true,
-                attributeFilter: ['class', 'style', 'data-theme']
-              });
-            }
-            if (document.head) {
-              mo.observe(document.head, {
-                childList: true,
-                subtree: true,
-                attributes: true,
-                attributeFilter: ['content', 'media']
-              });
-            }
           }
         })();
         """

@@ -17,10 +17,14 @@ enum MediaSnifferScripts {
         } catch (e) {}
       };
 
+      // Gate verbose Console & Network DevTools IPC behind explicit activation so browsing stays 120Hz crisp
+      window.__prismDevToolsEnabled = Boolean(window.__prismDevToolsEnabled);
+
       const mediaExtRegex = /\\.(mp4|m3u8|webm|mov|m4v|mp3|m4a)(\\?|#|$)/i;
       const reportedMedia = new Set();
       const reportMedia = (rawUrl) => {
         if (!rawUrl || typeof rawUrl !== 'string') return;
+        if (!mediaExtRegex.test(rawUrl)) return;
         let abs = rawUrl;
         try { abs = new URL(rawUrl, location.href).href; } catch (e) {}
         if (!/^https?:/i.test(abs)) return;
@@ -30,31 +34,38 @@ enum MediaSnifferScripts {
         post('media', { url: abs, ext: m[1].toLowerCase(), title: document.title || location.hostname });
       };
 
-      // Console Capture -> Mobile DevTools
+      // Console Capture -> Mobile DevTools (zero-overhead fast path when DevTools closed)
       ['log', 'warn', 'error', 'info'].forEach((lvl) => {
         const orig = console[lvl];
         console[lvl] = function(...args) {
-          try {
-            const msg = args.map((a) => {
-              if (typeof a === 'string') return a;
-              try { return JSON.stringify(a); } catch (e) { return String(a); }
-            }).join(' ');
-            post('console', { level: lvl, message: msg.slice(0, 600) });
-          } catch (e) {}
+          if (window.__prismDevToolsEnabled) {
+            try {
+              const msg = args.map((a) => {
+                if (typeof a === 'string') return a;
+                try { return JSON.stringify(a); } catch (e) { return String(a); }
+              }).join(' ');
+              post('console', { level: lvl, message: msg.slice(0, 600) });
+            } catch (e) {}
+          }
           return orig.apply(console, args);
         };
       });
       window.addEventListener('error', (e) => {
-        post('console', { level: 'error', message: (e.message || 'Script error').slice(0, 600) });
+        if (window.__prismDevToolsEnabled) {
+          post('console', { level: 'error', message: (e.message || 'Script error').slice(0, 600) });
+        }
       });
 
-      // Fetch / XHR Hook -> Network DevTools + Media Sniffer
+      // Fetch / XHR Hook -> Media Sniffer (fast regex check) + Network DevTools on demand
       const origFetch = window.fetch;
       window.fetch = function(input, init) {
-        const start = performance.now();
         const url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
-        const method = (init && init.method) ? init.method.toUpperCase() : 'GET';
         reportMedia(url);
+        if (!window.__prismDevToolsEnabled) {
+          return origFetch.apply(this, arguments);
+        }
+        const start = performance.now();
+        const method = (init && init.method) ? init.method.toUpperCase() : 'GET';
         return origFetch.apply(this, arguments).then((res) => {
           post('network', { method, url, status: res.status || 200, durationMs: Math.round(performance.now() - start) });
           return res;
@@ -67,51 +78,65 @@ enum MediaSnifferScripts {
       const origOpen = XMLHttpRequest.prototype.open;
       const origSend = XMLHttpRequest.prototype.send;
       XMLHttpRequest.prototype.open = function(method, url) {
-        this.__prismMethod = (method || 'GET').toUpperCase();
         this.__prismUrl = url || '';
         reportMedia(this.__prismUrl);
+        if (window.__prismDevToolsEnabled) {
+          this.__prismMethod = (method || 'GET').toUpperCase();
+        }
         return origOpen.apply(this, arguments);
       };
       XMLHttpRequest.prototype.send = function() {
-        const start = performance.now();
-        this.addEventListener('loadend', () => {
-          post('network', { method: this.__prismMethod || 'GET', url: this.__prismUrl || '', status: this.status || 0, durationMs: Math.round(performance.now() - start) });
-        });
+        if (window.__prismDevToolsEnabled) {
+          const start = performance.now();
+          this.addEventListener('loadend', () => {
+            post('network', { method: this.__prismMethod || 'GET', url: this.__prismUrl || '', status: this.status || 0, durationMs: Math.round(performance.now() - start) });
+          }, { once: true });
+        }
         return origSend.apply(this, arguments);
       };
 
-      // Video scanning & metadata
-      const scanVideos = () => {
-        document.querySelectorAll('video, source').forEach((el) => {
+      // O(1) Live video tracking — only emit when video state changes or playing progress advances
+      let lastVideoKey = '';
+      let lastVideoTime = -1;
+      const liveVideoCollection = document.getElementsByTagName('video');
+      const scanVideos = (forceEmit) => {
+        const len = liveVideoCollection.length;
+        if (len === 0) {
+          if (window === window.top && lastVideoKey !== 'none') {
+            lastVideoKey = 'none';
+            lastVideoTime = -1;
+            post('videoState', { hasVideo: false, paused: true, currentTime: 0, duration: 0, rate: 1 });
+          }
+          return;
+        }
+        let target = liveVideoCollection[0];
+        for (let i = 0; i < len; i += 1) {
+          const el = liveVideoCollection[i];
           if (el.currentSrc) reportMedia(el.currentSrc);
           if (el.src) reportMedia(el.src);
-        });
-        const videos = Array.from(document.querySelectorAll('video'));
-        const v = videos.find((el) => el.readyState > 0 || el.currentSrc || el.src) || videos[0];
-        if (v) {
-          post('videoState', {
-            hasVideo: true,
-            paused: v.paused,
-            currentTime: Number.isFinite(v.currentTime) ? v.currentTime : 0,
-            duration: Number.isFinite(v.duration) ? v.duration : 0,
-            rate: v.playbackRate || 1
-          });
-        } else if (window === window.top) {
-          post('videoState', {
-            hasVideo: false,
-            paused: true,
-            currentTime: 0,
-            duration: 0,
-            rate: 1
-          });
+          if (el.readyState > 0 || !el.paused) target = el;
+        }
+        const ct = Number.isFinite(target.currentTime) ? target.currentTime : 0;
+        const dur = Number.isFinite(target.duration) ? target.duration : 0;
+        const rate = target.playbackRate || 1;
+        const stateKey = '1|' + (target.paused ? 'p' : 'r') + '|' + rate;
+        if (forceEmit || stateKey !== lastVideoKey || (!target.paused && Math.abs(ct - lastVideoTime) >= 2.0)) {
+          lastVideoKey = stateKey;
+          lastVideoTime = ct;
+          post('videoState', { hasVideo: true, paused: target.paused, currentTime: ct, duration: dur, rate });
         }
       };
-      if (document.readyState !== 'loading') scanVideos();
-      else document.addEventListener('DOMContentLoaded', scanVideos, { once: true });
-      document.addEventListener('play', scanVideos, true);
-      document.addEventListener('playing', scanVideos, true);
-      document.addEventListener('loadedmetadata', scanVideos, true);
-      setInterval(scanVideos, 1500);
+      if (document.readyState !== 'loading') scanVideos(true);
+      else document.addEventListener('DOMContentLoaded', () => scanVideos(true), { once: true });
+      document.addEventListener('play', () => scanVideos(true), true);
+      document.addEventListener('pause', () => scanVideos(true), true);
+      document.addEventListener('playing', () => scanVideos(true), true);
+      document.addEventListener('loadedmetadata', () => scanVideos(true), true);
+      setInterval(() => {
+        if (!document.hidden && (liveVideoCollection.length > 0 || lastVideoKey !== 'none')) {
+          scanVideos(false);
+        }
+      }, 2000);
 
       // Video Controls API exposed to Swift
       window.__prismVideoControl = function(cmd, val) {
@@ -150,6 +175,7 @@ enum MediaSnifferScripts {
 
       // Bulletproof Password field focus, input tracking & capture (eye-toggle & multi-step friendly)
       const knownPwInputs = new WeakSet();
+      let sawPasswordActivity = false;
       let liveCred = { origin: location.origin, username: '', password: '', updatedAt: 0 };
 
       const readSavedUser = () => {
@@ -199,7 +225,10 @@ enum MediaSnifferScripts {
       document.addEventListener('focusin', (e) => {
         const t = e.target;
         if (!t || t.tagName !== 'INPUT') return;
-        if (t.type === 'password') knownPwInputs.add(t);
+        if (t.type === 'password') {
+          knownPwInputs.add(t);
+          sawPasswordActivity = true;
+        }
         if (t.type === 'password' || knownPwInputs.has(t) || /user|email|login/i.test((t.name || '') + (t.id || '') + (t.autocomplete || ''))) {
           post('passwordFocus', { origin: location.origin });
         }
@@ -210,6 +239,7 @@ enum MediaSnifferScripts {
         if (!t || t.tagName !== 'INPUT') return;
         if (t.type === 'password' || knownPwInputs.has(t)) {
           knownPwInputs.add(t);
+          sawPasswordActivity = true;
           if (t.value) {
             liveCred = {
               origin: location.origin,
@@ -224,15 +254,20 @@ enum MediaSnifferScripts {
         }
       }, true);
 
-      document.addEventListener('submit', (e) => { flushCredential(e.target); }, true);
+      document.addEventListener('submit', (e) => {
+        if (sawPasswordActivity || liveCred.password) flushCredential(e.target);
+      }, true);
       document.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && e.target && e.target.tagName === 'INPUT') flushCredential(e.target);
+        if (e.key === 'Enter' && e.target && e.target.tagName === 'INPUT' && (sawPasswordActivity || liveCred.password)) flushCredential(e.target);
       }, true);
       document.addEventListener('click', (e) => {
+        if (!sawPasswordActivity && !liveCred.password) return;
         const btn = e.target && e.target.closest && e.target.closest('button, input[type="submit"], input[type="button"], [role="button"], a[href^="javascript"]');
         if (btn) flushCredential(btn);
       }, true);
-      window.addEventListener('pagehide', () => { flushCredential(null); }, true);
+      window.addEventListener('pagehide', () => {
+        if (sawPasswordActivity || liveCred.password) flushCredential(null);
+      }, true);
     })();
     """
 
@@ -257,6 +292,43 @@ enum MediaSnifferScripts {
         })();
         """
     }
+
+    static let extractReaderJS = """
+    (() => {
+      const pickRoot = () => {
+        const selectors = ['article', 'main', '[role="main"]', '.post-content', '.article-content', '.entry-content', '#content', '#article'];
+        let best = null;
+        let bestLen = 0;
+        for (const sel of selectors) {
+          for (const el of document.querySelectorAll(sel)) {
+            const txtLen = (el.innerText || '').trim().length;
+            if (txtLen > bestLen) { bestLen = txtLen; best = el; }
+          }
+        }
+        return best || document.body;
+      };
+      const root = pickRoot();
+      if (!root) return null;
+      const blocks = [];
+      const seen = new Set();
+      for (const el of root.querySelectorAll('h1, h2, h3, p, blockquote, li')) {
+        if (el.closest('nav, header, footer, aside, [role="navigation"], [aria-hidden="true"]')) continue;
+        const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+        if (text.length < 18 || seen.has(text)) continue;
+        seen.add(text);
+        blocks.push(text);
+        if (blocks.length >= 160) break;
+      }
+      const title = (document.querySelector('h1')?.innerText || document.title || '').trim();
+      const byline = (document.querySelector('meta[name="author"]')?.getAttribute('content') || '').trim();
+      return {
+        title: title || location.hostname,
+        byline,
+        siteHost: location.hostname || '',
+        paragraphs: blocks
+      };
+    })()
+    """
 }
 
 @MainActor

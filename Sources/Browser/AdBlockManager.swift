@@ -4,9 +4,12 @@ import WebKit
 @MainActor
 final class AdBlockManager: ObservableObject {
     static let shared = AdBlockManager()
-    @Published private(set) var compiledRuleList: WKContentRuleList?
+    @Published private(set) var compiledRuleLists: [WKContentRuleList] = []
 
-    private static let ruleIdentifier = "prism-easylist-adguard-cn-v1.0.0"
+    private static let rulePacks: [(identifier: String, resource: String)] = [
+        ("prism-easylist-adguard-cn-v1.0.0", "easylist_adguard_cn"),
+        ("prism-annoyances-privacy-v1.0.8", "prism_annoyances_privacy")
+    ]
 
     static let blockedAppSchemes: Set<String> = [
         "itms-apps", "itms-appss", "itms",
@@ -22,26 +25,32 @@ final class AdBlockManager: ObservableObject {
     ]
 
     func prepareRules() async {
-        if let existing = try? await WKContentRuleListStore.default().contentRuleList(forIdentifier: Self.ruleIdentifier) {
-            self.compiledRuleList = existing
-            return
+        var loaded: [WKContentRuleList] = []
+        let store = WKContentRuleListStore.default()
+        for pack in Self.rulePacks {
+            if let existing = try? await store.contentRuleList(forIdentifier: pack.identifier) {
+                loaded.append(existing)
+                continue
+            }
+            guard let url = Bundle.main.url(forResource: pack.resource, withExtension: "json"),
+                  let jsonStr = try? String(contentsOf: url, encoding: .utf8),
+                  let compiled = try? await store.compileContentRuleList(
+                      forIdentifier: pack.identifier,
+                      encodedContentRuleList: jsonStr
+                  ) else {
+                continue
+            }
+            loaded.append(compiled)
         }
-        guard let url = Bundle.main.url(forResource: "easylist_adguard_cn", withExtension: "json"),
-              let jsonStr = try? String(contentsOf: url, encoding: .utf8) else {
-            return
-        }
-        if let compiled = try? await WKContentRuleListStore.default().compileContentRuleList(
-            forIdentifier: Self.ruleIdentifier,
-            encodedContentRuleList: jsonStr
-        ) {
-            self.compiledRuleList = compiled
-        }
+        self.compiledRuleLists = loaded
     }
 
     func apply(to userContentController: WKUserContentController, enabled: Bool) {
         userContentController.removeAllContentRuleLists()
-        if enabled, let compiledRuleList {
-            userContentController.add(compiledRuleList)
+        if enabled {
+            for ruleList in compiledRuleLists {
+                userContentController.add(ruleList)
+            }
         }
     }
 

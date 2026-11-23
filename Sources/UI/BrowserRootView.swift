@@ -20,7 +20,7 @@ struct BrowserRootView: View {
     @State private var topToastDismissTask: Task<Void, Never>?
 
     enum ActiveSheet: Identifiable {
-        case menu, account, profiles, vault, sniffer, devtools
+        case menu, account, profiles, vault, sniffer, devtools, reader, downloads
         var id: Self { self }
     }
 
@@ -32,8 +32,9 @@ struct BrowserRootView: View {
                     if tab.isNewTab {
                         HomeNewTabView(syncEngine: syncEngine, tabManager: tabManager)
                     } else {
-                        WebViewRepresentable(tab: tab, tabManager: tabManager)
+                        WebViewControllerRepresentable(tabId: tab.id, tab: tab, tabManager: tabManager)
                             .ignoresSafeArea(.container, edges: [.top, .bottom])
+                            .ignoresSafeArea(.keyboard, edges: .bottom)
                             .transaction { $0.animation = nil }
 
                         // Right-edge Long Press 2.0x Gesture Strip (unobtrusive 28pt edge)
@@ -55,11 +56,9 @@ struct BrowserRootView: View {
                     }
                 }
 
-                // Slim Loading Bar
-                if let tab = currentTab, tab.isLoading && !tab.isNewTab {
-                    ProgressView(value: tab.estimatedProgress)
-                        .progressViewStyle(.linear)
-                        .tint(.blue)
+                // Slim Smooth Loading Bar (isolated leaf view so progress updates don't diff root tree)
+                if let tab = currentTab, !tab.isNewTab {
+                    TabLoadingProgressBar(tab: tab)
                 }
 
                 // 2.0x Pill Indicator
@@ -123,28 +122,8 @@ struct BrowserRootView: View {
                     }
                 }
 
-                if let tab = currentTab, let blockedUrl = tab.blockedAppJumpURL {
-                    BlockedAppJumpBanner(url: blockedUrl) {
-                        tabManager.allowOnceAppJump(blockedUrl)
-                    } onDismiss: {
-                        tab.blockedAppJumpURL = nil
-                    }
-                }
-
-                if let tab = currentTab, let pending = tab.pendingPasswordSave {
-                    SavePasswordBanner(initialUsername: pending.username) { editedUser in
-                        tabManager.savePendingPassword(usernameOverride: editedUser)
-                    } onDismiss: {
-                        tab.pendingPasswordSave = nil
-                    }
-                }
-
-                if let tab = currentTab, tab.showAutofillBar, let firstCred = tab.matchedPasswords.first {
-                    AutofillBar(entries: tab.matchedPasswords, primary: firstCred) { chosen in
-                        tabManager.autofillWithFaceID(entry: chosen)
-                    } onDismiss: {
-                        tab.showAutofillBar = false
-                    }
+                if let tab = currentTab {
+                    ActiveTabBannersView(tab: tab, tabManager: tabManager)
                 }
 
                 // Always-visible Floating Handoff Pill above Dock on every non-newTab webpage
@@ -166,7 +145,10 @@ struct BrowserRootView: View {
                             showOmniboxEditor = true
                         }
                     },
-                    onOpenTabs: { showTabSwitcher = true },
+                    onOpenTabs: {
+                        tabManager.captureActiveSnapshot()
+                        showTabSwitcher = true
+                    },
                     onOpenProfiles: { activeSheet = .profiles },
                     onOpenMenu: { activeSheet = .menu },
                     onRequireAccount: { activeSheet = .account },
@@ -197,17 +179,13 @@ struct BrowserRootView: View {
                         }
                     },
                     onPullUpTabs: {
+                        tabManager.captureActiveSnapshot()
                         showTabSwitcher = true
                     }
                 )
             }
             .padding(.horizontal, 12)
             .padding(.bottom, 8)
-            .animation(.spring(response: 0.32, dampingFraction: 0.84), value: currentTab?.hasVideo)
-            .animation(.spring(response: 0.32, dampingFraction: 0.84), value: handoffService.latestIncoming != nil)
-            .animation(.spring(response: 0.32, dampingFraction: 0.84), value: tabManager.activeToast?.id)
-            .animation(.spring(response: 0.32, dampingFraction: 0.84), value: currentTab?.showAutofillBar)
-            .animation(.spring(response: 0.32, dampingFraction: 0.84), value: currentTab?.pendingPasswordSave != nil)
 
             // Top Capsule Toast Overlay for Instant Handoff & Clipboard Sync
             VStack {
@@ -244,6 +222,7 @@ struct BrowserRootView: View {
                     activeTab: currentTab,
                     shortcuts: syncEngine.homeConfig.shortcuts,
                     searchEngine: tabManager.searchEngine,
+                    enterTopHitEnabled: $tabManager.omniboxEnterTopHitEnabled,
                     canFindInPage: !(currentTab?.isNewTab ?? true),
                     onSubmit: { target in
                         tabManager.navigateActive(target)
@@ -300,6 +279,10 @@ struct BrowserRootView: View {
                 SnifferSheetView(tab: tabManager.activeTab)
             case .devtools:
                 MobileDevToolsSheetView(tab: tabManager.activeTab, syncEngine: syncEngine, handoffService: handoffService, tabManager: tabManager)
+            case .reader:
+                ReaderModeSheetView(tabManager: tabManager)
+            case .downloads:
+                DownloadsSheetView(tabManager: tabManager)
             }
         }
         .preferredColorScheme(
@@ -542,50 +525,118 @@ final class PrismWebContainerView: UIView, PrismTopColorHost {
     }
 }
 
-struct WebViewRepresentable: UIViewRepresentable {
+private struct ActiveTabBannersView: View {
     @ObservedObject var tab: BrowserTab
-    @ObservedObject var tabManager: TabManager
+    let tabManager: TabManager
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
+    var body: some View {
+        Group {
+            if let blockedUrl = tab.blockedAppJumpURL {
+                BlockedAppJumpBanner(url: blockedUrl) {
+                    tabManager.allowOnceAppJump(blockedUrl)
+                } onDismiss: {
+                    tab.blockedAppJumpURL = nil
+                }
+            }
+
+            if let pending = tab.pendingPasswordSave {
+                SavePasswordBanner(initialUsername: pending.username) { editedUser in
+                    tabManager.savePendingPassword(usernameOverride: editedUser)
+                } onDismiss: {
+                    tab.pendingPasswordSave = nil
+                }
+            }
+
+            if tab.showAutofillBar, let firstCred = tab.matchedPasswords.first {
+                AutofillBar(entries: tab.matchedPasswords, primary: firstCred) { chosen in
+                    tabManager.autofillWithFaceID(entry: chosen)
+                } onDismiss: {
+                    tab.showAutofillBar = false
+                }
+            }
+        }
+    }
+}
+
+private struct TabLoadingProgressBar: View {
+    @ObservedObject var tab: BrowserTab
+
+    var body: some View {
+        let progress = max(0.0, min(1.0, tab.estimatedProgress))
+        if tab.isLoading && progress < 0.995 {
+            GeometryReader { geo in
+                RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [.blue, .cyan],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(width: max(18, geo.size.width * CGFloat(progress)), height: 2.5)
+                    .animation(.linear(duration: 0.12), value: progress)
+            }
+            .frame(height: 2.5)
+            .allowsHitTesting(false)
+            .ignoresSafeArea(edges: .horizontal)
+        }
+    }
+}
+
+@MainActor
+final class PrismWebViewController: UIViewController {
+    let containerView = PrismWebContainerView(frame: .zero)
+    private var attachedTabId: UUID?
+    private weak var refreshWebView: WKWebView?
+
+    override func loadView() {
+        view = containerView
     }
 
-    func makeUIView(context: Context) -> PrismWebContainerView {
-        let container = PrismWebContainerView(frame: .zero)
-        let wv = tabManager.ensureWebView(for: tab)
-        container.attachWebView(wv, tabManager: tabManager, targetURL: wv.url ?? URL(string: tab.urlString))
-        attachRefreshControl(to: wv, coordinator: context.coordinator)
-        return container
-    }
-
-    func updateUIView(_ uiView: PrismWebContainerView, context: Context) {
+    func attach(tab: BrowserTab, tabManager: TabManager) {
         let target = tabManager.ensureWebView(for: tab)
-        uiView.attachWebView(target, tabManager: tabManager, targetURL: target.url ?? URL(string: tab.urlString))
-        attachRefreshControl(to: target, coordinator: context.coordinator)
+        if attachedTabId == tab.id, containerView.hostedWebView === target {
+            return
+        }
+        attachedTabId = tab.id
+        containerView.attachWebView(target, tabManager: tabManager, targetURL: target.url ?? URL(string: tab.urlString))
+        attachRefreshControl(to: target)
     }
 
-    private func attachRefreshControl(to webView: WKWebView, coordinator: Coordinator) {
-        coordinator.webView = webView
+    private func attachRefreshControl(to webView: WKWebView) {
+        refreshWebView = webView
         webView.scrollView.bounces = true
         if webView.scrollView.refreshControl == nil {
             let rc = UIRefreshControl()
-            rc.addTarget(coordinator, action: #selector(Coordinator.handlePullToRefresh(_:)), for: .valueChanged)
+            rc.addTarget(self, action: #selector(handlePullToRefresh(_:)), for: .valueChanged)
             webView.scrollView.refreshControl = rc
         }
     }
 
-    final class Coordinator: NSObject {
-        weak var webView: WKWebView?
-
-        @objc func handlePullToRefresh(_ sender: UIRefreshControl) {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            webView?.reload()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) {
-                if sender.isRefreshing {
-                    sender.endRefreshing()
-                }
+    @objc private func handlePullToRefresh(_ sender: UIRefreshControl) {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        refreshWebView?.reload()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) {
+            if sender.isRefreshing {
+                sender.endRefreshing()
             }
         }
+    }
+}
+
+struct WebViewControllerRepresentable: UIViewControllerRepresentable {
+    let tabId: UUID
+    let tab: BrowserTab
+    let tabManager: TabManager
+
+    func makeUIViewController(context: Context) -> PrismWebViewController {
+        let vc = PrismWebViewController()
+        vc.attach(tab: tab, tabManager: tabManager)
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: PrismWebViewController, context: Context) {
+        uiViewController.attach(tab: tab, tabManager: tabManager)
     }
 }
 
@@ -691,6 +742,7 @@ private struct OmniboxInlineOverlay: View {
     let activeTab: BrowserTab?
     let shortcuts: [HomeShortcut]
     let searchEngine: SearchEngineOption
+    @Binding var enterTopHitEnabled: Bool
     let canFindInPage: Bool
     let onSubmit: (String) -> Void
     let onSelectTab: (UUID) -> Void
@@ -735,6 +787,9 @@ private struct OmniboxInlineOverlay: View {
         let matchedTabs = ranked.tabs
         let libraryItems = ranked.library
         let remoteList = buildRemoteSearchList(trimmed: trimmed, rawLower: q, remote: remoteSuggester.suggestions)
+        let mathResult = !trimmed.isEmpty ? Self.evaluateMathExpression(trimmed) : nil
+        let isExplicitURL = Self.isLikelyExplicitURL(trimmed)
+        let enterOpensTopHit = enterTopHitEnabled && !isExplicitURL && topHit != nil
 
         return ZStack(alignment: .bottom) {
             Rectangle()
@@ -746,10 +801,77 @@ private struct OmniboxInlineOverlay: View {
             VStack(spacing: 0) {
                 ScrollView(.vertical, showsIndicators: true) {
                     LazyVStack(alignment: .leading, spacing: 14) {
+                        // 0. Instant Math Calculator
+                        if let calc = mathResult {
+                            Button {
+                                UIPasteboard.general.string = calc
+                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                text = calc
+                            } label: {
+                                HStack(spacing: 12) {
+                                    ZStack {
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .fill(Color.green.opacity(0.16))
+                                            .frame(width: 34, height: 34)
+                                        Image(systemName: "equal")
+                                            .font(.system(size: 15, weight: .bold))
+                                            .foregroundStyle(.green)
+                                    }
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("= \(calc)")
+                                            .font(.system(size: 18, weight: .bold).monospacedDigit())
+                                            .foregroundStyle(.primary)
+                                        Text(L10n.t("轻点复制计算结果", "Tap to copy result"))
+                                            .font(.system(size: 11.5))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer(minLength: 0)
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 9)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                        .fill(Color(.secondarySystemGroupedBackground))
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+
                         // 1. Pinned Top Hit + Open Matching Tabs directly below
                         if topHit != nil || (!q.isEmpty && !matchedTabs.isEmpty) {
-                            VStack(spacing: 2) {
+                            VStack(spacing: 4) {
                                 if let hit = topHit {
+                                    HStack {
+                                        Text(L10n.t("最佳匹配", "Top Hit"))
+                                            .font(.system(size: 12, weight: .semibold))
+                                            .foregroundStyle(.secondary)
+                                        Spacer()
+                                        if !isExplicitURL {
+                                            Button {
+                                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                                enterTopHitEnabled.toggle()
+                                            } label: {
+                                                HStack(spacing: 4) {
+                                                    Image(systemName: enterTopHitEnabled ? "return" : "magnifyingglass")
+                                                        .font(.system(size: 10, weight: .semibold))
+                                                    Text(enterTopHitEnabled
+                                                         ? L10n.t("回车直达：开", "Enter → Site: On")
+                                                         : L10n.t("回车直达：关", "Enter → Search"))
+                                                        .font(.system(size: 11, weight: .medium))
+                                                }
+                                                .foregroundStyle(enterTopHitEnabled ? Color.blue : Color.secondary)
+                                                .padding(.horizontal, 8)
+                                                .padding(.vertical, 3)
+                                                .background(
+                                                    Capsule()
+                                                        .fill(enterTopHitEnabled ? Color.blue.opacity(0.12) : Color(.tertiarySystemFill))
+                                                )
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                    .padding(.horizontal, 12)
+
                                     Button {
                                         if let tid = hit.tabId {
                                             triggerSmoothClose { onSelectTab(tid) }
@@ -760,11 +882,11 @@ private struct OmniboxInlineOverlay: View {
                                         HStack(spacing: 12) {
                                             ZStack {
                                                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                    .fill(Color.primary.opacity(0.08))
+                                                    .fill(enterOpensTopHit ? Color.blue.opacity(0.15) : Color.primary.opacity(0.08))
                                                     .frame(width: 34, height: 34)
                                                 Image(systemName: hit.tabId != nil ? "macwindow" : (hit.isBookmark ? "bookmark.fill" : "globe"))
                                                     .font(.system(size: 15, weight: .semibold))
-                                                    .foregroundStyle(.primary)
+                                                    .foregroundStyle(enterOpensTopHit ? Color.blue : Color.primary)
                                             }
                                             VStack(alignment: .leading, spacing: 2) {
                                                 Text(hit.title)
@@ -777,12 +899,24 @@ private struct OmniboxInlineOverlay: View {
                                                     .lineLimit(1)
                                             }
                                             Spacer(minLength: 0)
+                                            if enterOpensTopHit {
+                                                Text("↵")
+                                                    .font(.system(size: 12, weight: .bold))
+                                                    .foregroundStyle(.blue)
+                                                    .padding(.horizontal, 7)
+                                                    .padding(.vertical, 3)
+                                                    .background(Color.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                            }
                                         }
                                         .padding(.horizontal, 12)
                                         .padding(.vertical, 10)
                                         .background(
                                             RoundedRectangle(cornerRadius: 14, style: .continuous)
                                                 .fill(Color(.secondarySystemGroupedBackground))
+                                        )
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                                .stroke(enterOpensTopHit ? Color.blue.opacity(0.35) : Color.clear, lineWidth: 1)
                                         )
                                     }
                                     .buttonStyle(.plain)
@@ -878,7 +1012,8 @@ private struct OmniboxInlineOverlay: View {
                                     .foregroundStyle(.secondary)
                                     .padding(.horizontal, 12)
 
-                                ForEach(remoteList, id: \.self) { term in
+                                ForEach(Array(remoteList.enumerated()), id: \.element) { idx, term in
+                                    let isDefaultSearchRow = (idx == 0 && !enterOpensTopHit)
                                     HStack(spacing: 10) {
                                         Button {
                                             triggerSmoothClose { onSubmit(term) }
@@ -886,16 +1021,24 @@ private struct OmniboxInlineOverlay: View {
                                             HStack(spacing: 12) {
                                                 ZStack {
                                                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                        .fill(Color(.tertiarySystemFill))
+                                                        .fill(isDefaultSearchRow ? Color.blue.opacity(0.14) : Color(.tertiarySystemFill))
                                                         .frame(width: 32, height: 32)
                                                     Image(systemName: "magnifyingglass")
                                                         .font(.system(size: 14))
-                                                        .foregroundStyle(.secondary)
+                                                        .foregroundStyle(isDefaultSearchRow ? Color.blue : Color.secondary)
                                                 }
                                                 highlightedSuggestionText(term: term, query: trimmed)
                                                     .font(.system(size: 16))
                                                     .lineLimit(1)
                                                 Spacer(minLength: 0)
+                                                if isDefaultSearchRow {
+                                                    Text("↵")
+                                                        .font(.system(size: 12, weight: .bold))
+                                                        .foregroundStyle(.blue)
+                                                        .padding(.horizontal, 7)
+                                                        .padding(.vertical, 3)
+                                                        .background(Color.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                                }
                                             }
                                             .contentShape(Rectangle())
                                         }
@@ -1021,7 +1164,16 @@ private struct OmniboxInlineOverlay: View {
                             text: $text,
                             placeholder: L10n.t("搜索或输入网址", "Search or enter website name"),
                             onSubmit: { target in
-                                triggerSmoothClose { onSubmit(target) }
+                                let t = target.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if enterTopHitEnabled && !Self.isLikelyExplicitURL(t) && t.lowercased() == q, let hit = topHit {
+                                    if let tid = hit.tabId {
+                                        triggerSmoothClose { onSelectTab(tid) }
+                                    } else {
+                                        triggerSmoothClose { onSubmit(hit.url) }
+                                    }
+                                } else {
+                                    triggerSmoothClose { onSubmit(target) }
+                                }
                             },
                             onPasteAndGo: { target in
                                 triggerSmoothClose { onSubmit(target) }
@@ -1156,26 +1308,155 @@ private struct OmniboxInlineOverlay: View {
             + Text(after).foregroundStyle(.secondary)
     }
 
-    private func normalizeKey(_ raw: String) -> String {
-        guard let u = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
-            return raw.lowercased()
+    private static func isLikelyExplicitURL(_ raw: String) -> Bool {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty, !s.contains(" ") else { return false }
+        let low = s.lowercased()
+        if low.contains("://") || low.hasPrefix("localhost") || low.hasPrefix("127.0.0.1") {
+            return true
         }
-        let host = (u.host ?? "").lowercased()
-        let normalizedHost = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
-        let path = (u.path == "/" || u.path.isEmpty) && u.query == nil ? "" : u.path
-        return "\(normalizedHost)\(path)\(u.query.map { "?\($0)" } ?? "")"
+        if let dot = low.firstIndex(of: "."), dot != low.startIndex, dot < low.index(before: low.endIndex) {
+            return true
+        }
+        return false
+    }
+
+    private static func evaluateMathExpression(_ raw: String) -> String? {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "×", with: "*")
+            .replacingOccurrences(of: "÷", with: "/")
+        guard s.count >= 3 && s.count <= 64 else { return nil }
+        var hasOperator = false
+        var hasDigit = false
+        for ch in s {
+            if ch.isNumber {
+                hasDigit = true
+            } else if ch == "+" || ch == "-" || ch == "*" || ch == "/" || ch == "%" {
+                hasOperator = true
+            } else if ch == "." || ch == "(" || ch == ")" || ch == " " {
+                continue
+            } else {
+                return nil
+            }
+        }
+        guard hasDigit && hasOperator else { return nil }
+        let chars = Array(s.filter { $0 != " " })
+        var idx = 0
+
+        func parseExpr() -> Double? {
+            guard var val = parseTerm() else { return nil }
+            while idx < chars.count {
+                let op = chars[idx]
+                guard op == "+" || op == "-" else { break }
+                idx += 1
+                guard let rhs = parseTerm() else { return nil }
+                val = (op == "+") ? (val + rhs) : (val - rhs)
+            }
+            return val
+        }
+
+        func parseTerm() -> Double? {
+            guard var val = parseFactor() else { return nil }
+            while idx < chars.count {
+                let op = chars[idx]
+                guard op == "*" || op == "/" || op == "%" else { break }
+                idx += 1
+                guard let rhs = parseFactor() else { return nil }
+                if op == "*" {
+                    val *= rhs
+                } else {
+                    if rhs == 0 { return nil }
+                    val = (op == "/") ? (val / rhs) : val.truncatingRemainder(dividingBy: rhs)
+                }
+            }
+            return val
+        }
+
+        func parseFactor() -> Double? {
+            guard idx < chars.count else { return nil }
+            if chars[idx] == "+" {
+                idx += 1
+                return parseFactor()
+            }
+            if chars[idx] == "-" {
+                idx += 1
+                guard let inner = parseFactor() else { return nil }
+                return -inner
+            }
+            if chars[idx] == "(" {
+                idx += 1
+                guard let inner = parseExpr(), idx < chars.count, chars[idx] == ")" else { return nil }
+                idx += 1
+                return inner
+            }
+            let start = idx
+            var sawDot = false
+            var sawDigit = false
+            while idx < chars.count {
+                let c = chars[idx]
+                if c >= "0" && c <= "9" {
+                    sawDigit = true
+                    idx += 1
+                } else if c == "." && !sawDot {
+                    sawDot = true
+                    idx += 1
+                } else {
+                    break
+                }
+            }
+            guard sawDigit, let num = Double(String(chars[start..<idx])) else { return nil }
+            return num
+        }
+
+        guard let result = parseExpr(), idx == chars.count, result.isFinite else { return nil }
+        if result.rounded(.towardZero) == result && abs(result) < 1e15 {
+            return String(Int64(result))
+        }
+        let formatted = String(format: "%.6f", result)
+            .replacingOccurrences(of: #"0+$"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\.$"#, with: "", options: .regularExpression)
+        return formatted
+    }
+
+    private func normalizeKey(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let host = hostOnly(trimmed)
+        if let schemeRange = trimmed.range(of: "://") {
+            let afterScheme = trimmed[schemeRange.upperBound...]
+            if let slashIdx = afterScheme.firstIndex(of: "/") {
+                let tail = String(afterScheme[slashIdx...])
+                return tail == "/" ? host : "\(host)\(tail)"
+            }
+            if let qIdx = afterScheme.firstIndex(of: "?") {
+                return "\(host)\(afterScheme[qIdx...])"
+            }
+            return host
+        }
+        return trimmed.lowercased()
     }
 
     private func isRootURL(_ raw: String) -> Bool {
-        guard let u = URL(string: raw) else { return false }
-        return (u.path.isEmpty || u.path == "/") && (u.query == nil || u.query?.isEmpty == true)
+        guard let schemeRange = raw.range(of: "://") else { return false }
+        let afterScheme = raw[schemeRange.upperBound...]
+        if afterScheme.contains("?") { return false }
+        guard let slashIdx = afterScheme.firstIndex(of: "/") else { return true }
+        return slashIdx == afterScheme.index(before: afterScheme.endIndex)
     }
 
     private func hostOnly(_ raw: String) -> String {
-        if let host = URL(string: raw)?.host?.lowercased() {
-            return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        let s: Substring
+        if let schemeRange = raw.range(of: "://") {
+            s = raw[schemeRange.upperBound...]
+        } else {
+            s = Substring(raw)
         }
-        return raw
+        let end = s.firstIndex(where: { $0 == "/" || $0 == "?" || $0 == "#" || $0 == ":" }) ?? s.endIndex
+        var host = String(s[..<end]).lowercased()
+        if host.hasPrefix("www.") {
+            host = String(host.dropFirst(4))
+        }
+        return host.isEmpty ? raw : host
     }
 
     private func relativeTime(_ visitedAtMs: Double) -> String {

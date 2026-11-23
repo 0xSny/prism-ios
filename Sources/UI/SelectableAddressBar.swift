@@ -1,6 +1,22 @@
 import SwiftUI
 import UIKit
 
+private final class AutofocusAddressField: UITextField {
+    var autoFocusOnWindow = true
+    private var didAutoFocus = false
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if autoFocusOnWindow && !didAutoFocus && window != nil {
+            didAutoFocus = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.window != nil, !self.isFirstResponder else { return }
+                _ = self.becomeFirstResponder()
+            }
+        }
+    }
+}
+
 struct SelectableAddressBar: UIViewRepresentable {
     @Binding var text: String
     var placeholder: String
@@ -12,7 +28,7 @@ struct SelectableAddressBar: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> UITextField {
-        let tf = UITextField(frame: .zero)
+        let tf = AutofocusAddressField(frame: .zero)
         tf.delegate = context.coordinator
         tf.placeholder = placeholder
         tf.font = .systemFont(ofSize: 15, weight: .regular)
@@ -29,7 +45,8 @@ struct SelectableAddressBar: UIViewRepresentable {
         tf.addTarget(context.coordinator, action: #selector(Coordinator.textChanged(_:)), for: .editingChanged)
 
         // 40pt Keyboard Quick Input Accessory Bar
-        let bar = UIToolbar(frame: CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: 40))
+        let bar = UIToolbar(frame: CGRect(x: 0, y: 0, width: 320, height: 40))
+        bar.autoresizingMask = [.flexibleWidth]
         bar.barStyle = .default
         bar.isTranslucent = true
 
@@ -58,9 +75,6 @@ struct SelectableAddressBar: UIViewRepresentable {
         bar.items = items
         tf.inputAccessoryView = bar
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-            tf.becomeFirstResponder()
-        }
         return tf
     }
 

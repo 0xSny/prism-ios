@@ -46,7 +46,19 @@ struct TabSwitcherView: View {
                 ToolbarItem(placement: .topBarLeading) {
                     Button(L10n.t("关闭", "Done")) { dismiss() }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if tabManager.tabs.count > 1 {
+                        Button(role: .destructive) {
+                            withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
+                                tabManager.closeAllTabs()
+                            }
+                            dismiss()
+                        } label: {
+                            Text(L10n.t("清空", "Clear"))
+                                .font(.subheadline)
+                                .foregroundStyle(.red)
+                        }
+                    }
                     Button {
                         tabManager.createTab(url: nil, activate: true)
                         dismiss()
@@ -69,14 +81,14 @@ private struct TabGridCard: View {
 
     var body: some View {
         Button(action: onSelect) {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 6) {
                     Circle()
                         .fill(profile.swiftColor)
                         .frame(width: 8, height: 8)
-                    Text(profile.name)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                    Text(tab.title.isEmpty ? L10n.t("新标签页", "New Tab") : tab.title)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.primary)
                         .lineLimit(1)
                     Spacer()
                     Button(action: onClose) {
@@ -85,30 +97,63 @@ private struct TabGridCard: View {
                             .font(.system(size: 16))
                     }
                 }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(Color(.secondarySystemBackground))
 
-                Text(tab.title.isEmpty ? L10n.t("新标签页", "New Tab") : tab.title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
+                ZStack(alignment: .bottomLeading) {
+                    if let snap = tab.snapshot, !tab.isNewTab {
+                        Image(uiImage: snap)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(maxWidth: .infinity, maxHeight: 132, alignment: .top)
+                            .clipped()
+                    } else {
+                        ZStack {
+                            LinearGradient(
+                                colors: [
+                                    profile.swiftColor.opacity(0.18),
+                                    Color(.tertiarySystemBackground)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                            VStack(spacing: 6) {
+                                Image(systemName: tab.isNewTab ? "safari" : "globe")
+                                    .font(.system(size: 24, weight: .light))
+                                    .foregroundStyle(profile.swiftColor)
+                                Text(tab.isNewTab ? "Prism" : (URL(string: tab.urlString)?.host ?? tab.urlString))
+                                    .font(.caption2.weight(.medium))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 10)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: 132)
+                    }
 
-                Spacer(minLength: 16)
-
-                Text(tab.isNewTab ? "prism://newtab" : (URL(string: tab.urlString)?.host ?? tab.urlString))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    Text(tab.isNewTab ? "prism://newtab" : (URL(string: tab.urlString)?.host ?? tab.urlString))
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(.black.opacity(0.55), in: Capsule())
+                        .padding(7)
+                }
+                .frame(height: 132)
+                .clipped()
             }
-            .padding(12)
-            .frame(height: 124, alignment: .topLeading)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .background(
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .fill(Color(.secondarySystemBackground))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .stroke(isActive ? Color.accentColor : Color.clear, lineWidth: 2)
+                    .stroke(isActive ? Color.accentColor : Color.primary.opacity(0.08), lineWidth: isActive ? 2.2 : 0.8)
             )
+            .shadow(color: Color.black.opacity(isActive ? 0.16 : 0.06), radius: 6, y: 2)
         }
         .buttonStyle(.plain)
     }

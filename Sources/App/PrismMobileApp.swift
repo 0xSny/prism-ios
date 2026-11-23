@@ -63,6 +63,7 @@ final class PrismAppStateContainer {
         tabManager.handoffService = handoffService
         Task {
             await AdBlockManager.shared.prepareRules()
+            tabManager.applyAdblockToAllTabs()
         }
         handoffService.startPolling(syncEngine: syncEngine)
         tabManager.checkClipboardForURL()

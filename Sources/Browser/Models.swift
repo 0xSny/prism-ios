@@ -292,6 +292,31 @@ struct ToastNotice: Identifiable, Equatable {
     var handoff: HandoffPayload?
 }
 
+struct ReaderArticle: Identifiable, Equatable {
+    let id = UUID()
+    var title: String
+    var byline: String
+    var siteHost: String
+    var paragraphs: [String]
+}
+
+struct DownloadRecord: Identifiable, Equatable {
+    let id: UUID
+    var filename: String
+    var sourceURL: String
+    var localURL: URL?
+    var byteCount: Int64
+    var status: DownloadStatus
+    var errorMessage: String?
+    var createdAt: Date
+
+    enum DownloadStatus: String, Equatable {
+        case downloading
+        case completed
+        case failed
+    }
+}
+
 extension Color {
     init?(hex: String) {
         let cleaned = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
