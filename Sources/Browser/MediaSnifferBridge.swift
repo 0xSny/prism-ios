@@ -317,46 +317,125 @@ enum MediaSnifferScripts {
       window.__prismImeHealerInstalled = true;
 
       const composingTargets = new WeakSet();
-      const inputTimers = new WeakMap();
+      const recentComposedTargets = new WeakSet();
+      const quietSyncTimers = new WeakMap();
       const ZWS_RE = /[\\u200B\\uFEFF]/g;
-
-      function hasActiveCompositionInside(root) {
-        if (!root) return false;
-        const active = document.activeElement;
-        if (active && root.contains(active) && composingTargets.has(active)) {
-          return true;
-        }
-        return composingTargets.has(root);
-      }
 
       function stripZws(str) {
         return (str || '').replace(ZWS_RE, '');
       }
 
-      function collectTextSkipping(node, skipSelector, out) {
-        if (!node) return;
-        if (node.nodeType === 3) {
-          const clean = stripZws(node.nodeValue);
-          if (clean) out.push(clean);
-          return;
+      function markRecentComposed(el) {
+        if (!el) return;
+        recentComposedTargets.add(el);
+        const cm5 = el.closest ? el.closest('.CodeMirror') : null;
+        if (cm5) recentComposedTargets.add(cm5);
+        const cm6 = el.closest ? el.closest('.cm-editor') : null;
+        if (cm6) recentComposedTargets.add(cm6);
+      }
+
+      function isEditableElement(el) {
+        if (!el || el.nodeType !== 1) return false;
+        const tag = el.tagName;
+        if (tag === 'TEXTAREA') return !el.readOnly && !el.disabled;
+        if (tag === 'INPUT') {
+          const t = (el.type || 'text').toLowerCase();
+          if (['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'image', 'range', 'color', 'hidden'].includes(t)) {
+            return false;
+          }
+          return !el.readOnly && !el.disabled;
         }
-        if (node.nodeType !== 1) return;
-        if (skipSelector && node.matches && node.matches(skipSelector)) return;
-        const children = node.childNodes;
-        for (let i = 0; i < children.length; i++) {
-          collectTextSkipping(children[i], skipSelector, out);
+        return !!el.isContentEditable;
+      }
+
+      function getEditorScope(el) {
+        if (!el || !el.closest) return el;
+        return el.closest('.CodeMirror, .cm-editor') || el;
+      }
+
+      function extractCodeMirror5DomText(wrapper) {
+        const codeEl = wrapper && wrapper.querySelector('.CodeMirror-code');
+        if (!codeEl) return '';
+        const clone = codeEl.cloneNode(true);
+        const noise = clone.querySelectorAll(
+          '.CodeMirror-placeholder, .CodeMirror-linenumber, .CodeMirror-gutter-elt, .CodeMirror-cursors, .CodeMirror-selected, .CodeMirror-gutter-wrapper'
+        );
+        for (let i = 0; i < noise.length; i++) {
+          noise[i].remove();
         }
-        if (node.matches && node.matches('.CodeMirror-line, .cm-line, div, p, pre')) {
-          out.push('\\n');
+        const lineNodes = clone.querySelectorAll('.CodeMirror-line');
+        if (lineNodes.length > 0) {
+          const lines = [];
+          for (let i = 0; i < lineNodes.length; i++) {
+            lines.push(stripZws(lineNodes[i].textContent || '').replace(/[\\r\\n]+$/, ''));
+          }
+          let extraOrphan = '';
+          for (let i = 0; i < clone.childNodes.length; i++) {
+            const c = clone.childNodes[i];
+            if (c.nodeType === 3) {
+              extraOrphan += stripZws(c.nodeValue || '');
+            }
+          }
+          let joined = lines.join('\\n');
+          if (extraOrphan.trim()) {
+            joined = joined ? (joined + extraOrphan) : extraOrphan;
+          }
+          return joined;
         }
+        return stripZws(clone.textContent || '');
+      }
+
+      function extractCodeMirror6DomText(editor) {
+        const content = editor && editor.querySelector('.cm-content');
+        if (!content) return '';
+        const clone = content.cloneNode(true);
+        const phs = clone.querySelectorAll('.cm-placeholder');
+        for (let i = 0; i < phs.length; i++) {
+          phs[i].remove();
+        }
+        const lineNodes = clone.querySelectorAll('.cm-line');
+        if (lineNodes.length > 0) {
+          const lines = [];
+          for (let i = 0; i < lineNodes.length; i++) {
+            lines.push(stripZws(lineNodes[i].textContent || '').replace(/[\\r\\n]+$/, ''));
+          }
+          return lines.join('\\n');
+        }
+        return stripZws(clone.textContent || '');
+      }
+
+      function updatePlaceholderVisibility(target) {
+        try {
+          const el = target && target.nodeType === 1 ? target : (target && target.parentElement);
+          if (!el || !el.closest) return;
+
+          const cm5 = el.closest('.CodeMirror');
+          if (cm5) {
+            const ph = cm5.querySelector('.CodeMirror-placeholder');
+            if (ph) {
+              const cmVal = cm5.CodeMirror && typeof cm5.CodeMirror.getValue === 'function' ? cm5.CodeMirror.getValue() : '';
+              const domText = extractCodeMirror5DomText(cm5);
+              const hasText = stripZws(cmVal).length > 0 || stripZws(domText).length > 0;
+              ph.style.opacity = hasText ? '0' : '';
+            }
+          }
+
+          const cm6 = el.closest('.cm-editor');
+          if (cm6) {
+            const ph = cm6.querySelector('.cm-placeholder');
+            if (ph) {
+              const domText = extractCodeMirror6DomText(cm6);
+              ph.style.opacity = stripZws(domText).length > 0 ? '0' : '';
+            }
+          }
+        } catch (_) {}
       }
 
       function removeDirectOrphanTextNodes(el) {
         if (!el || !el.childNodes) return;
         for (let i = el.childNodes.length - 1; i >= 0; i--) {
-          const child = el.childNodes[i];
-          if (child.nodeType === 3) {
-            el.removeChild(child);
+          if (el.childNodes[i].nodeType === 3) {
+            el.removeChild(el.childNodes[i]);
           }
         }
       }
@@ -378,58 +457,80 @@ enum MediaSnifferScripts {
         } catch (_) {}
       }
 
-      function healCodeMirror5(wrapper, restoreFocus) {
+      function dispatchEndAndSyncEvents(el, textVal) {
         try {
-          if (!wrapper || !wrapper.CodeMirror || hasActiveCompositionInside(wrapper)) return false;
-          const cm = wrapper.CodeMirror;
-          if (typeof cm.getValue !== 'function' || typeof cm.setValue !== 'function') return false;
-          const currentVal = cm.getValue() || '';
-          const ph = wrapper.querySelector('.CodeMirror-placeholder');
-          const phVisible = !!(ph && ph.offsetParent !== null && getComputedStyle(ph).display !== 'none');
-          if (currentVal !== '' && !phVisible) return false;
-
-          const codeEl = wrapper.querySelector('.CodeMirror-code');
-          if (!codeEl) return false;
-
-          const parts = [];
-          const skipSel = '.CodeMirror-placeholder, .CodeMirror-linenumber, .CodeMirror-gutter-elt, .CodeMirror-cursors, .CodeMirror-selected, .CodeMirror-gutter-wrapper';
-          collectTextSkipping(codeEl, skipSel, parts);
-          let rescued = parts.join('');
-          rescued = rescued.replace(/\\n+$/, '');
-          if (!stripZws(rescued).trim()) return false;
-          if (rescued === currentVal) return false;
-
-          removeDirectOrphanTextNodes(codeEl);
-          const sizer = wrapper.querySelector('.CodeMirror-sizer');
-          const lines = wrapper.querySelector('.CodeMirror-lines');
-          removeDirectOrphanTextNodes(sizer);
-          removeDirectOrphanTextNodes(lines);
-
-          cm.setValue(rescued);
-          const lastLine = Math.max(0, (typeof cm.lineCount === 'function' ? cm.lineCount() : 1) - 1);
-          const lastText = typeof cm.getLine === 'function' ? (cm.getLine(lastLine) || '') : rescued;
-          if (typeof cm.setCursor === 'function') {
-            cm.setCursor({ line: lastLine, ch: lastText.length });
-          }
-          if (typeof cm.refresh === 'function') {
-            cm.refresh();
-          }
-          if (restoreFocus && typeof cm.focus === 'function') {
-            cm.focus();
-          }
-          return true;
-        } catch (_) {
-          return false;
-        }
+          el.composing = false;
+        } catch (_) {}
+        try {
+          el.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: textVal || '' }));
+        } catch (_) {}
+        try {
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        } catch (_) {}
       }
 
-      function healCodeMirror6(editor, restoreFocus) {
+      function flushCodeMirror5(wrap, preserveFocus) {
         try {
-          if (!editor || hasActiveCompositionInside(editor)) return false;
-          const content = editor.querySelector('.cm-content');
-          if (!content) return false;
-          const hasPlaceholder = !!editor.querySelector('.cm-placeholder');
-          if (!hasPlaceholder) return false;
+          const cm = wrap && wrap.CodeMirror;
+          if (!cm) return;
+
+          const codeEl = wrap.querySelector('.CodeMirror-code');
+          if (cm.display && cm.display.input) {
+            const inp = cm.display.input;
+            if (inp.composing && typeof inp.composing === 'object') {
+              inp.composing.done = true;
+            }
+            if (typeof cm.operation === 'function') {
+              cm.operation(() => {
+                if (typeof inp.pollContent === 'function') {
+                  inp.pollContent();
+                }
+              });
+            }
+            inp.composing = null;
+            if (inp.textarea) {
+              try { inp.textarea.composing = false; } catch (_) {}
+            }
+          }
+
+          removeDirectOrphanTextNodes(codeEl);
+          removeDirectOrphanTextNodes(wrap.querySelector('.CodeMirror-sizer'));
+          removeDirectOrphanTextNodes(wrap.querySelector('.CodeMirror-lines'));
+
+          const domText = extractCodeMirror5DomText(wrap);
+          if (domText.length > 0 && typeof cm.getValue === 'function' && domText !== cm.getValue() && typeof cm.setValue === 'function') {
+            cm.setValue(domText);
+            const lastLine = Math.max(0, (typeof cm.lineCount === 'function' ? cm.lineCount() : 1) - 1);
+            const lastText = typeof cm.getLine === 'function' ? (cm.getLine(lastLine) || '') : domText;
+            if (typeof cm.setCursor === 'function') {
+              cm.setCursor({ line: lastLine, ch: lastText.length });
+            }
+            if (typeof cm.refresh === 'function') {
+              cm.refresh();
+            }
+            if (preserveFocus && typeof cm.focus === 'function') {
+              cm.focus();
+            }
+          }
+          updatePlaceholderVisibility(wrap);
+        } catch (_) {}
+      }
+
+      function flushCodeMirror6(editor, preserveFocus) {
+        try {
+          const content = editor && editor.querySelector('.cm-content');
+          if (!content) return;
+
+          try {
+            content.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: content.textContent || '' }));
+          } catch (_) {}
+
+          const viewObs = (content.cmView && content.cmView.view && content.cmView.view.observer)
+            || (editor.cmView && editor.cmView.view && editor.cmView.view.observer);
+          if (viewObs && typeof viewObs.flush === 'function') {
+            viewObs.flush();
+          }
 
           let orphanParts = [];
           for (let i = content.childNodes.length - 1; i >= 0; i--) {
@@ -440,93 +541,115 @@ enum MediaSnifferScripts {
               content.removeChild(child);
             }
           }
-          let rescued = orphanParts.join('');
-          if (!rescued) {
-            const collected = [];
-            collectTextSkipping(content, '.cm-placeholder', collected);
-            const candidate = collected.join('').replace(/\\n+$/, '');
-            if (!stripZws(candidate).trim()) return false;
-            rescued = candidate;
-            const firstLine = content.querySelector('.cm-line');
-            if (firstLine) {
-              firstLine.textContent = '';
-            }
-          }
-
-          if (!rescued) return false;
-          content.focus({ preventScroll: true });
-          const targetLine = content.querySelector('.cm-line') || content;
-          anchorSelectionInsideLine(targetLine);
-          let inserted = false;
-          try {
-            inserted = document.execCommand('insertText', false, rescued);
-          } catch (_) {
-            inserted = false;
-          }
-          if (!inserted) {
+          const rescued = orphanParts.join('');
+          if (rescued) {
+            const prevFocus = document.activeElement;
+            content.focus({ preventScroll: true });
+            const line = content.querySelector('.cm-line') || content;
+            anchorSelectionInsideLine(line);
+            let inserted = false;
             try {
-              const bi = new InputEvent('beforeinput', {
-                bubbles: true,
-                cancelable: true,
-                inputType: 'insertText',
-                data: rescued
-              });
-              content.dispatchEvent(bi);
-              content.dispatchEvent(new InputEvent('input', {
-                bubbles: true,
-                inputType: 'insertText',
-                data: rescued
-              }));
+              inserted = document.execCommand('insertText', false, rescued);
             } catch (_) {
-              content.dispatchEvent(new Event('input', { bubbles: true }));
+              inserted = false;
+            }
+            if (!inserted) {
+              try {
+                content.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: rescued }));
+              } catch (_) {
+                content.dispatchEvent(new Event('input', { bubbles: true }));
+              }
+            }
+            if (!preserveFocus && prevFocus !== content && document.activeElement === content) {
+              content.blur();
             }
           }
-          if (!restoreFocus && document.activeElement === content) {
-            content.blur();
-          }
-          return true;
-        } catch (_) {
-          return false;
-        }
+          updatePlaceholderVisibility(editor);
+        } catch (_) {}
       }
 
-      function healVueComposingFlag(el) {
+      function flushEditableState(el, preserveFocus) {
         try {
-          if (!el || composingTargets.has(el)) return false;
-          if (el.composing === true) {
-            el.composing = false;
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            return true;
+          if (!el) return;
+          const node = el.nodeType === 1 ? el : el.parentElement;
+          if (!node) return;
+          composingTargets.delete(node);
+
+          const cm5 = node.closest ? node.closest('.CodeMirror') : null;
+          if (cm5) {
+            composingTargets.delete(cm5);
+            flushCodeMirror5(cm5, preserveFocus);
+            return;
+          }
+
+          const cm6 = node.closest ? node.closest('.cm-editor') : null;
+          if (cm6) {
+            composingTargets.delete(cm6);
+            flushCodeMirror6(cm6, preserveFocus);
+            return;
+          }
+
+          const field = (node.matches && node.matches('textarea, input'))
+            ? node
+            : (node.closest ? node.closest('textarea, input') : null);
+          if (field) {
+            composingTargets.delete(field);
+            dispatchEndAndSyncEvents(field, field.value || '');
+            return;
+          }
+
+          if (node.isContentEditable) {
+            dispatchEndAndSyncEvents(node, node.textContent || '');
           }
         } catch (_) {}
-        return false;
       }
 
-      function healForTarget(target, restoreFocus) {
-        if (!target || composingTargets.has(target)) return;
-        const el = target.nodeType === 1 ? target : target.parentElement;
-        if (!el) return;
+      function silentWindowSync(target) {
+        try {
+          if (!target) return;
+          const node = target.nodeType === 1 ? target : target.parentElement;
+          if (!node) return;
+          updatePlaceholderVisibility(node);
 
-        const cm5 = el.closest ? el.closest('.CodeMirror') : null;
-        if (cm5) healCodeMirror5(cm5, restoreFocus);
+          const cm5 = node.closest ? node.closest('.CodeMirror') : null;
+          if (cm5 && cm5.CodeMirror) {
+            const cm = cm5.CodeMirror;
+            const inp = cm.display && cm.display.input;
+            if (inp && inp.composing) {
+              inp.composing.done = true;
+              if (typeof cm.operation === 'function') {
+                cm.operation(() => { if (typeof inp.pollContent === 'function') inp.pollContent(); });
+              }
+              inp.composing = null;
+            }
+            const domText = extractCodeMirror5DomText(cm5);
+            if (domText.length > 0 && typeof cm.getValue === 'function' && domText !== cm.getValue()) {
+              cm.setValue(domText);
+              const lastLine = Math.max(0, (typeof cm.lineCount === 'function' ? cm.lineCount() : 1) - 1);
+              const lastText = typeof cm.getLine === 'function' ? (cm.getLine(lastLine) || '') : domText;
+              if (typeof cm.setCursor === 'function') {
+                cm.setCursor({ line: lastLine, ch: lastText.length });
+              }
+              cm.refresh && cm.refresh();
+              cm.focus && cm.focus();
+            }
+            return;
+          }
 
-        const cm6 = el.closest ? el.closest('.cm-editor') : null;
-        if (cm6) healCodeMirror6(cm6, restoreFocus);
+          const cm6 = node.closest ? node.closest('.cm-editor') : null;
+          if (cm6) {
+            flushCodeMirror6(cm6, true);
+            return;
+          }
 
-        const field = el.closest ? el.closest('input, textarea, [contenteditable]') : null;
-        if (field) healVueComposingFlag(field);
-      }
-
-      function scheduleHeal(target, delayMs, restoreFocus) {
-        const el = target && target.nodeType === 1 ? target : (target && target.parentElement);
-        if (!el) return;
-        const prev = inputTimers.get(el);
-        if (prev) clearTimeout(prev);
-        const timer = setTimeout(() => {
-          inputTimers.delete(el);
-          healForTarget(el, restoreFocus);
-        }, delayMs);
-        inputTimers.set(el, timer);
+          const field = (node.matches && node.matches('textarea, input'))
+            ? node
+            : (node.closest ? node.closest('textarea, input') : null);
+          if (field && field.composing === true) {
+            field.composing = false;
+            field.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+        } catch (_) {}
       }
 
       function handleTouchOrClickFocus(e) {
@@ -563,10 +686,20 @@ enum MediaSnifferScripts {
 
       document.addEventListener('touchstart', (e) => {
         const t = e.touches && e.touches[0];
-        if (!t) return;
-        touchStartX = t.clientX;
-        touchStartY = t.clientY;
-        lastTouchMoved = false;
+        if (t) {
+          touchStartX = t.clientX;
+          touchStartY = t.clientY;
+          lastTouchMoved = false;
+        }
+        try {
+          const activeEl = document.activeElement;
+          if (activeEl && (isEditableElement(activeEl) || (activeEl.closest && activeEl.closest('.CodeMirror, .cm-editor')))) {
+            const scope = getEditorScope(activeEl);
+            if (scope && e.target && !scope.contains(e.target)) {
+              flushEditableState(activeEl, false);
+            }
+          }
+        } catch (_) {}
       }, { capture: true, passive: true });
 
       document.addEventListener('touchmove', (e) => {
@@ -578,46 +711,77 @@ enum MediaSnifferScripts {
         }
       }, { capture: true, passive: true });
 
+      document.addEventListener('pointerdown', (e) => {
+        try {
+          const activeEl = document.activeElement;
+          if (activeEl && (isEditableElement(activeEl) || (activeEl.closest && activeEl.closest('.CodeMirror, .cm-editor')))) {
+            const scope = getEditorScope(activeEl);
+            if (scope && e.target && !scope.contains(e.target)) {
+              flushEditableState(activeEl, false);
+            }
+          }
+        } catch (_) {}
+      }, true);
+
       document.addEventListener('touchend', handleTouchOrClickFocus, true);
       document.addEventListener('click', handleTouchOrClickFocus, true);
 
       document.addEventListener('compositionstart', (e) => {
-        if (e.target) composingTargets.add(e.target);
+        if (e.target) {
+          composingTargets.add(e.target);
+          markRecentComposed(e.target);
+          const scope = getEditorScope(e.target);
+          const prev = scope && quietSyncTimers.get(scope);
+          if (prev) clearTimeout(prev);
+        }
       }, true);
 
       document.addEventListener('compositionend', (e) => {
         const t = e.target;
-        if (t) composingTargets.delete(t);
-        scheduleHeal(t, 20, true);
+        if (t) {
+          composingTargets.delete(t);
+          markRecentComposed(t);
+        }
+        updatePlaceholderVisibility(t);
+        setTimeout(() => {
+          flushEditableState(t, true);
+        }, 16);
       }, true);
 
-      document.addEventListener('blur', (e) => {
-        if (e.target) composingTargets.delete(e.target);
-      }, true);
+      function handleBlurOrFocusOut(e) {
+        const t = e.target;
+        if (!t) return;
+        if (isEditableElement(t) || (t.closest && t.closest('.CodeMirror, .cm-editor'))) {
+          flushEditableState(t, false);
+          setTimeout(() => {
+            flushEditableState(t, false);
+          }, 40);
+        }
+      }
+
+      document.addEventListener('focusout', handleBlurOrFocusOut, true);
+      document.addEventListener('blur', handleBlurOrFocusOut, true);
 
       document.addEventListener('input', (e) => {
-        if (e.isComposing || (e.target && composingTargets.has(e.target))) return;
-        healVueComposingFlag(e.target);
-        scheduleHeal(e.target, 80, true);
-      }, true);
+        const t = e.target;
+        updatePlaceholderVisibility(t);
+        const scope = getEditorScope(t);
+        if (!scope) return;
+        const prev = quietSyncTimers.get(scope);
+        if (prev) clearTimeout(prev);
 
-      document.addEventListener('pointerdown', (e) => {
-        try {
-          const btn = e.target && e.target.closest ? e.target.closest('button, [type="submit"], [role="button"]') : null;
-          if (!btn) return;
-          const fields = document.querySelectorAll('input, textarea, [contenteditable]');
-          for (let i = 0; i < fields.length; i++) {
-            healVueComposingFlag(fields[i]);
-          }
-          const cm5s = document.querySelectorAll('.CodeMirror');
-          for (let i = 0; i < cm5s.length; i++) {
-            healCodeMirror5(cm5s[i], false);
-          }
-          const cm6s = document.querySelectorAll('.cm-editor');
-          for (let i = 0; i < cm6s.length; i++) {
-            healCodeMirror6(cm6s[i], false);
-          }
-        } catch (_) {}
+        const isActivePinyin = e.isComposing && typeof e.data === 'string' && /[a-zA-Z'\\u00B4]/.test(e.data);
+        if (isActivePinyin) return;
+
+        const shouldWindowSync = !e.isComposing
+          || (typeof e.data === 'string' && e.data.length > 0 && !/[a-zA-Z'\\u00B4]/.test(e.data));
+        if (!shouldWindowSync) return;
+
+        const timer = setTimeout(() => {
+          quietSyncTimers.delete(scope);
+          silentWindowSync(t);
+        }, 120);
+        quietSyncTimers.set(scope, timer);
       }, true);
     })();
     """

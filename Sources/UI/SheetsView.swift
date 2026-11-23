@@ -302,7 +302,7 @@ struct MenuSheetView: View {
                     }
                 }
             }
-            .navigationTitle("Prism v1.1.2")
+            .navigationTitle("Prism v1.1.3")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {

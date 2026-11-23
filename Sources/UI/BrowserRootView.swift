@@ -29,6 +29,7 @@ struct BrowserRootView: View {
     @State private var scrubOffsetSec: Double = 0
     @State private var isScrubbingVideo = false
     @State private var isChromeCollapsed = false
+    @State private var isWebKeyboardVisible = false
     @State private var topCapsuleToast: ToastNotice?
     @State private var topToastDismissTask: Task<Void, Never>?
 
@@ -40,6 +41,7 @@ struct BrowserRootView: View {
     var body: some View {
         let currentTab = tabManager.activeTab
         let showFullDock = (currentTab?.isNewTab ?? true) || !isChromeCollapsed
+        let hideDockForWebKeyboard = isWebKeyboardVisible && !showOmniboxEditor
 
         ZStack(alignment: .bottom) {
             ZStack(alignment: .top) {
@@ -56,7 +58,7 @@ struct BrowserRootView: View {
                             tabId: tab.id,
                             tab: tab,
                             tabManager: tabManager,
-                            bottomChromeInset: isChromeCollapsed ? 36 : 96,
+                            bottomChromeInset: hideDockForWebKeyboard ? 0 : (isChromeCollapsed ? 36 : 96),
                             onScrollCollapsedChange: { collapsed in
                                 guard isChromeCollapsed != collapsed else { return }
                                 withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
@@ -186,7 +188,7 @@ struct BrowserRootView: View {
                 }
 
                 // Always-visible Floating Handoff Pill above Dock on every non-newTab webpage
-                if let tab = currentTab, !tab.isNewTab, showFullDock {
+                if let tab = currentTab, !tab.isNewTab, showFullDock, !hideDockForWebKeyboard {
                     VideoMiniStrip(
                         tab: tab,
                         handoffService: handoffService,
@@ -213,7 +215,7 @@ struct BrowserRootView: View {
                 }
 
                 // Single-Hand 52pt Bottom Thumb Dock or 24pt Immersive Domain Pill
-                if showFullDock {
+                if showFullDock && !hideDockForWebKeyboard {
                     BottomThumbDock(
                         syncEngine: syncEngine,
                         tabManager: tabManager,
@@ -244,7 +246,7 @@ struct BrowserRootView: View {
                         }
                     )
                     .transition(.move(edge: .bottom).combined(with: .opacity))
-                } else if let tab = currentTab, !tab.isNewTab {
+                } else if let tab = currentTab, !tab.isNewTab, !hideDockForWebKeyboard {
                     CollapsedDomainPill(tab: tab) {
                         withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
                             isChromeCollapsed = false
@@ -254,7 +256,7 @@ struct BrowserRootView: View {
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.bottom, showFullDock ? 8 : 4)
+            .padding(.bottom, hideDockForWebKeyboard ? 6 : (showFullDock ? 8 : 4))
             .onChange(of: tabManager.activeTabId) { _, _ in
                 if isChromeCollapsed {
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
@@ -336,6 +338,16 @@ struct BrowserRootView: View {
         }
         .onAppear {
             handleIncomingHandoff(handoffService.latestIncoming)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            withAnimation(.easeOut(duration: 0.22)) {
+                isWebKeyboardVisible = true
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            withAnimation(.easeOut(duration: 0.22)) {
+                isWebKeyboardVisible = false
+            }
         }
         .onChange(of: handoffService.latestIncoming) { _, incoming in
             handleIncomingHandoff(incoming)
