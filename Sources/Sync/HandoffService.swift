@@ -9,6 +9,7 @@ final class HandoffService: ObservableObject {
 
     private var lastPolledAt: Double = UserDefaults.standard.double(forKey: "prism.handoff.lastPolledAt")
     private var seenIds = Set<String>()
+    private var seenIdOrder: [String] = []
     private var pollTimer: Task<Void, Never>?
     private var sseTask: Task<Void, Never>?
     private var sseConnected: Bool = false
@@ -354,6 +355,18 @@ final class HandoffService: ObservableObject {
         return false
     }
 
+    private func markSeenId(_ id: String) {
+        guard seenIds.insert(id).inserted else { return }
+        seenIdOrder.append(id)
+        if seenIds.count > 500, seenIdOrder.count > 400 {
+            let removeCount = seenIdOrder.count - 400
+            for oldId in seenIdOrder.prefix(removeCount) {
+                seenIds.remove(oldId)
+            }
+            seenIdOrder.removeFirst(removeCount)
+        }
+    }
+
     func pollOnce(syncEngine: SyncEngine) async {
         guard !isPolling else { return }
         guard let token = syncEngine.currentToken,
@@ -368,7 +381,12 @@ final class HandoffService: ObservableObject {
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return }
+            guard let http = resp as? HTTPURLResponse else { return }
+            if http.statusCode == 401 {
+                syncEngine.logout()
+                return
+            }
+            guard http.statusCode == 200 else { return }
             struct PollItem: Decodable {
                 let id: String
                 let fromDeviceId: String
@@ -387,9 +405,10 @@ final class HandoffService: ObservableObject {
                 let items: [PollItem]
             }
             let decoded = try JSONDecoder().decode(PollResp.self, from: data)
+            var newestIncoming: HandoffPayload?
             for item in decoded.items {
                 if item.fromDeviceId == decoded.currentDeviceId || seenIds.contains(item.id) { continue }
-                seenIds.insert(item.id)
+                markSeenId(item.id)
                 if var payload = try? CryptoVault.decryptJSON(HandoffPayload.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag) {
                     payload.id = item.id
                     if let imgData = payload.imageDataUrl, !imgData.isEmpty {
@@ -401,9 +420,13 @@ final class HandoffService: ObservableObject {
                     if item.createdAt > 0 {
                         payload.createdAt = item.createdAt
                     }
-                    latestIncoming = payload
-                    break
+                    if newestIncoming == nil || payload.createdAt >= newestIncoming!.createdAt {
+                        newestIncoming = payload
+                    }
                 }
+            }
+            if let newestIncoming {
+                latestIncoming = newestIncoming
             }
             if let serverTime = decoded.serverTime {
                 lastPolledAt = max(lastPolledAt, serverTime)

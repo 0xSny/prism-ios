@@ -340,6 +340,7 @@ struct BrowserRootView: View {
             handleIncomingHandoff(handoffService.latestIncoming)
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            guard activeSheet == nil && !showTabSwitcher && !showOmniboxEditor else { return }
             withAnimation(.easeOut(duration: 0.22)) {
                 isWebKeyboardVisible = true
             }
@@ -571,6 +572,8 @@ private struct BottomThumbDock: View {
     let onSwitchTabOffset: (Int) -> Void
     let onPullUpTabs: () -> Void
 
+    @State private var suppressNextTabOpenTap = false
+
     var body: some View {
         let activeTab = tabManager.activeTab
         let profile = tabManager.activeProfile
@@ -609,8 +612,14 @@ private struct BottomThumbDock: View {
                 )
             }
 
-            // Tab Count Badge
-            Button(action: onOpenTabs) {
+            // Tab Count Badge (Short tap: Tab Switcher; Long press: Create New Tab immediately)
+            Button {
+                if suppressNextTabOpenTap {
+                    suppressNextTabOpenTap = false
+                    return
+                }
+                onOpenTabs()
+            } label: {
                 Text("\(tabManager.tabs.count)")
                     .font(.system(size: 12, weight: .bold, design: .rounded))
                     .frame(width: 24, height: 24)
@@ -619,7 +628,19 @@ private struct BottomThumbDock: View {
                             .stroke(Color.primary, lineWidth: 1.5)
                     )
                     .frame(width: 32, height: 36)
+                    .contentShape(Rectangle())
             }
+            .highPriorityGesture(
+                LongPressGesture(minimumDuration: 0.32)
+                    .onEnded { _ in
+                        suppressNextTabOpenTap = true
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        tabManager.createTab(url: nil, activate: true)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            suppressNextTabOpenTap = false
+                        }
+                    }
+            )
 
             // More Sheet
             Button(action: onOpenMenu) {
@@ -694,10 +715,15 @@ private struct DockAddressPill: View {
     let onPullUpTabs: () -> Void
 
     @State private var swipeOffsetX: CGFloat = 0
+    @State private var dragAxis: Axis? = nil
+    @State private var lastDragEndedAt: TimeInterval = 0
 
     var body: some View {
         HStack(spacing: 0) {
-            Button(action: onTapOmnibox) {
+            Button {
+                guard dragAxis == nil, Date().timeIntervalSince1970 - lastDragEndedAt > 0.18 else { return }
+                onTapOmnibox()
+            } label: {
                 HStack(spacing: 6) {
                     if !tab.isNewTab, tab.urlString.hasPrefix("https://") {
                         Image(systemName: "lock.fill")
@@ -720,6 +746,7 @@ private struct DockAddressPill: View {
 
             if !tab.isNewTab {
                 Button {
+                    guard dragAxis == nil, Date().timeIntervalSince1970 - lastDragEndedAt > 0.18 else { return }
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     if tab.isLoading {
                         tab.webView?.stopLoading()
@@ -805,26 +832,44 @@ private struct DockAddressPill: View {
                 Label(L10n.t("📋 发送剪贴板至电脑", "📋 Send Clipboard to Desktop"), systemImage: "doc.on.clipboard")
             }
         }
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 18)
+        .highPriorityGesture(
+            DragGesture(minimumDistance: 10, coordinateSpace: .local)
                 .onChanged { val in
-                    if abs(val.translation.width) > abs(val.translation.height) && tabManager.tabs.count > 1 {
-                        let raw = val.translation.width
-                        swipeOffsetX = max(-30, min(30, raw * 0.35))
+                    let dx = val.translation.width
+                    let dy = val.translation.height
+                    if dragAxis == nil {
+                        if abs(dx) >= abs(dy) * 1.15 {
+                            dragAxis = .horizontal
+                        } else if abs(dy) > abs(dx) * 1.15 {
+                            dragAxis = .vertical
+                        }
+                    }
+                    if dragAxis == .horizontal {
+                        if tabManager.tabs.count > 1 {
+                            swipeOffsetX = max(-30, min(30, dx * 0.35))
+                        } else {
+                            swipeOffsetX = max(-8, min(8, dx * 0.12))
+                        }
                     }
                 }
                 .onEnded { val in
+                    let lockedAxis = dragAxis
+                    dragAxis = nil
+                    lastDragEndedAt = Date().timeIntervalSince1970
                     let dx = val.translation.width
                     let dy = val.translation.height
                     withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
                         swipeOffsetX = 0
                     }
-                    if dy < -45 && abs(dy) > abs(dx) {
-                        onPullUpTabs()
-                    } else if abs(dx) > abs(dy) {
-                        if dx < -50 {
+                    if lockedAxis == .vertical {
+                        if dy < -38 || (dy < -22 && val.predictedEndTranslation.height < -75) {
+                            onPullUpTabs()
+                        }
+                    } else if lockedAxis == .horizontal && tabManager.tabs.count > 1 {
+                        let predW = val.predictedEndTranslation.width
+                        if dx <= -38 || (dx <= -20 && predW <= -85) {
                             onSwitchTabOffset(1)
-                        } else if dx > 50 {
+                        } else if dx >= 38 || (dx >= 20 && predW >= 85) {
                             onSwitchTabOffset(-1)
                         }
                     }
@@ -1157,11 +1202,14 @@ private struct VideoMiniStrip: View {
 
     @State private var sendState: SendState = .idle
     @State private var displayTick: Int = 0
+    @State private var isScrubbingDragActive = false
+    @State private var lastScrubEndedAt: TimeInterval = 0
 
     private let videoClockTimer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
         Button {
+            guard !isScrubbingDragActive, Date().timeIntervalSince1970 - lastScrubEndedAt > 0.22 else { return }
             guard sendState == .idle else { return }
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             guard syncEngine.loggedIn else {
@@ -1250,16 +1298,25 @@ private struct VideoMiniStrip: View {
                 Label(L10n.t("📋 发送剪贴板至电脑", "📋 Send Clipboard to Desktop"), systemImage: "doc.on.clipboard")
             }
         }
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 16)
+        .highPriorityGesture(
+            DragGesture(minimumDistance: 14, coordinateSpace: .local)
                 .onChanged { val in
-                    guard tab.hasVideo, abs(val.translation.width) > abs(val.translation.height) else { return }
-                    onVideoScrub?(val.translation.width, false)
+                    guard tab.hasVideo else { return }
+                    let dx = val.translation.width
+                    let dy = val.translation.height
+                    if !isScrubbingDragActive {
+                        guard abs(dx) >= abs(dy) * 1.15 else { return }
+                        isScrubbingDragActive = true
+                    }
+                    onVideoScrub?(dx, false)
                 }
                 .onEnded { val in
-                    guard tab.hasVideo, abs(val.translation.width) > abs(val.translation.height) else { return }
+                    guard isScrubbingDragActive else { return }
+                    isScrubbingDragActive = false
+                    lastScrubEndedAt = Date().timeIntervalSince1970
                     onVideoScrub?(val.translation.width, true)
-                }
+                },
+            including: tab.hasVideo ? .all : .subviews
         )
         .onReceive(videoClockTimer) { _ in
             if tab.hasVideo && !tab.videoPaused && tab.videoDuration > 0 {

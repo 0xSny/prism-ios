@@ -32,6 +32,7 @@ final class BrowserTab: ObservableObject, Identifiable {
     @Published var canGoBack: Bool = false
     @Published var canGoForward: Bool = false
     @Published var isNewTab: Bool = true
+    @Published var isDesktopMode: Bool = false
     @Published var blockedCount: Int = 0
     @Published var isTranslated: Bool = false
     @Published var hasVideo: Bool = false
@@ -121,7 +122,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     @Published var activeTabId: UUID? {
         didSet {
             guard !isRestoringSession else { return }
-            if let nextId = activeTabId, nextId != oldValue {
+            if let nextId = activeTabId, nextId != oldValue, nextId != skipAutoLazyLoadTabId {
                 loadLazyWebViewIfNeeded(for: tabs.first(where: { $0.id == nextId }))
             }
             scheduleSessionSave()
@@ -130,7 +131,14 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     @Published var activeToast: ToastNotice?
     @Published var recentlyClosedTabs: [PersistedTabItem] = []
     @Published var hasClipboardWebURL: Bool = false
-    @Published var searchEngine: SearchEngineOption = .google
+    @Published var searchEngine: SearchEngineOption = .google {
+        didSet {
+            UserDefaults.standard.set(searchEngine.rawValue, forKey: "prism.searchEngine")
+            if !isApplyingRemoteSettings {
+                syncEngine?.notifyScopeDirty("settings")
+            }
+        }
+    }
     @Published var appTheme: AppTheme = .system {
         didSet {
             UserDefaults.standard.set(appTheme.rawValue, forKey: "prism.theme")
@@ -140,6 +148,9 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             case .system: StatusBarStyleManager.shared.applyWindowOverride(.unspecified)
             }
             applyWebDarkModeToAllTabs()
+            if !isApplyingRemoteSettings {
+                syncEngine?.notifyScopeDirty("settings")
+            }
         }
     }
     @Published var webDarkModeFollowTheme: Bool = true {
@@ -175,10 +186,20 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             syncAppJumpShieldToAllTabs()
         }
     }
-    @Published var desktopMode: Bool = false
+    var desktopMode: Bool {
+        get { activeTab?.isDesktopMode ?? false }
+        set {
+            guard let tab = activeTab else { return }
+            tab.isDesktopMode = newValue
+            objectWillChange.send()
+        }
+    }
     @Published var omniboxEnterTopHitEnabled: Bool = false {
         didSet {
             UserDefaults.standard.set(omniboxEnterTopHitEnabled, forKey: "prism.omniboxEnterTopHitEnabled")
+            if !isApplyingRemoteSettings {
+                syncEngine?.notifyScopeDirty("settings")
+            }
         }
     }
     @Published var downloads: [DownloadRecord] = []
@@ -569,6 +590,16 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     }
 
     func applyRemotePortableSettings(_ remote: PortableSettings) {
+        if let theme = remote.theme, appTheme != theme {
+            isApplyingRemoteSettings = true
+            appTheme = theme
+            isApplyingRemoteSettings = false
+        }
+        if let engine = remote.searchEngine, searchEngine != engine {
+            isApplyingRemoteSettings = true
+            searchEngine = engine
+            isApplyingRemoteSettings = false
+        }
         if let blockJumps = remote.blockRogueAppJumps, blockRogueAppJumps != blockJumps {
             isApplyingRemoteSettings = true
             blockRogueAppJumps = blockJumps
@@ -681,7 +712,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         webView.allowsBackForwardNavigationGestures = true
         webView.allowsLinkPreview = true
         webView.isFindInteractionEnabled = true
-        if desktopMode {
+        if tab.isDesktopMode {
             webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
         } else if let customUA = profile.fingerprint.userAgent, !customUA.isEmpty {
             webView.customUserAgent = customUA
@@ -959,12 +990,15 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     }
 
     func toggleDesktopUserAgent() {
-        desktopMode.toggle()
-        guard let tab = activeTab, let webView = tab.webView else { return }
-        if desktopMode {
+        guard let tab = activeTab else { return }
+        tab.isDesktopMode.toggle()
+        objectWillChange.send()
+        guard let webView = tab.webView else { return }
+        if tab.isDesktopMode {
             webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
         } else {
-            let ua = activeProfile.fingerprint.userAgent
+            let profile = (syncEngine?.profiles ?? [.defaultProfile]).first(where: { $0.id == tab.profileId }) ?? .defaultProfile
+            let ua = profile.fingerprint.userAgent
             webView.customUserAgent = (ua?.isEmpty == false) ? ua : nil
         }
         webView.reload()
@@ -1333,7 +1367,8 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         preferences: WKWebpagePreferences,
         decisionHandler: @escaping (WKNavigationActionPolicy, WKWebpagePreferences) -> Void
     ) {
-        preferences.preferredContentMode = desktopMode ? .desktop : .mobile
+        let tab = tabs.first(where: { $0.webView === webView })
+        preferences.preferredContentMode = (tab?.isDesktopMode == true) ? .desktop : .mobile
         guard let url = navigationAction.request.url else {
             decisionHandler(.allow, preferences)
             return
@@ -1575,6 +1610,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
            let pendingSeek = tab.pendingSeekSeconds,
            pendingSeek > 0 {
             postLoadJS += " window.__prismScheduleSeek && window.__prismScheduleSeek(\(pendingSeek));"
+            tab.pendingSeekSeconds = nil
         }
         webView.evaluateJavaScript(postLoadJS, completionHandler: nil)
         syncWebViewState(webView)
@@ -1590,12 +1626,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
                 profileId: tab.profileId,
                 visitedAt: Date().timeIntervalSince1970 * 1000
             )
-            syncEngine.history.removeAll(where: { $0.url == urlStr })
-            syncEngine.history.insert(item, at: 0)
-            if syncEngine.history.count > 500 {
-                syncEngine.history = Array(syncEngine.history.prefix(500))
-            }
-            syncEngine.notifyScopeDirty("history")
+            syncEngine.recordHistoryVisit(item)
         }
     }
 

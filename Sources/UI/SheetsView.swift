@@ -14,7 +14,7 @@ struct MenuSheetView: View {
         NavigationStack {
             List {
                 Section {
-                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 5), spacing: 8) {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4), spacing: 10) {
                         QuickMenuTile(
                             title: L10n.t("新标签", "New Tab"),
                             icon: "plus.square",
@@ -46,26 +46,6 @@ struct MenuSheetView: View {
                         ) {
                             tabManager.toggleDesktopUserAgent()
                             dismiss()
-                        }
-                        if let tab = tabManager.activeTab, !tab.isNewTab, let shareURL = URL(string: tab.urlString) {
-                            QuickMenuTile(
-                                title: L10n.t("分享本页", "Share"),
-                                icon: "square.and.arrow.up",
-                                color: .teal
-                            ) {
-                                dismiss()
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) {
-                                    BrowserRootView.presentSystemShareSheet(items: [shareURL])
-                                }
-                            }
-                        } else {
-                            QuickMenuTile(
-                                title: L10n.t("分享本页", "Share"),
-                                icon: "square.and.arrow.up",
-                                color: .teal
-                            ) {
-                                tabManager.showToast(L10n.t("请先打开网页再分享", "Open a webpage first"))
-                            }
                         }
                     }
                     .padding(.vertical, 4)
@@ -302,7 +282,7 @@ struct MenuSheetView: View {
                     }
                 }
             }
-            .navigationTitle("Prism v1.1.3")
+            .navigationTitle("Prism v1.1.4")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -1362,8 +1342,7 @@ struct BookmarksHistorySheetView: View {
                                 .buttonStyle(.plain)
                                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                                     Button(role: .destructive) {
-                                        syncEngine.history.removeAll(where: { $0.id == item.id })
-                                        syncEngine.notifyScopeDirty("history")
+                                        syncEngine.recordDeletedHistory(item)
                                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                                     } label: {
                                         Label(L10n.t("删除", "Delete"), systemImage: "trash")
@@ -1400,8 +1379,7 @@ struct BookmarksHistorySheetView: View {
                 titleVisibility: .visible
             ) {
                 Button(L10n.t("清空历史记录", "Clear All History"), role: .destructive) {
-                    syncEngine.history.removeAll()
-                    syncEngine.notifyScopeDirty("history")
+                    syncEngine.recordClearedHistory()
                 }
                 Button(L10n.t("取消", "Cancel"), role: .cancel) {}
             }

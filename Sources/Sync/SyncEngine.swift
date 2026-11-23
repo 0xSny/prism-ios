@@ -174,7 +174,7 @@ final class SyncEngine: ObservableObject {
                 "authKey": derived.authKey,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.1.3",
+                "appVersion": "1.1.4",
             ])
 
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -239,7 +239,7 @@ final class SyncEngine: ObservableObject {
                 "authKey": derived.authKey,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.1.3",
+                "appVersion": "1.1.4",
             ])
 
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -376,11 +376,19 @@ final class SyncEngine: ObservableObject {
                 "wipeOldCiphertext": true,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.1.3",
+                "appVersion": "1.1.4",
             ]
 
             let cleanRec = recoveryKey.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !cleanRec.isEmpty, let prepUrl = URL(string: "\(serverUrl)/api/auth/reset-prepare") {
+            if !cleanRec.isEmpty {
+                guard let normalizedRec = CryptoVault.normalizeRecoveryKey(cleanRec) else {
+                    lastError = L10n.t("恢复密钥格式无效（需 24 位字符），已中止重置以保护云端数据", "Invalid 24-character recovery key; reset aborted to protect cloud data")
+                    return false
+                }
+                guard let prepUrl = URL(string: "\(serverUrl)/api/auth/reset-prepare") else {
+                    lastError = L10n.t("服务器地址无效", "Invalid server URL")
+                    return false
+                }
                 var prepReq = URLRequest(url: prepUrl)
                 prepReq.httpMethod = "POST"
                 prepReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -400,45 +408,59 @@ final class SyncEngine: ObservableObject {
                 }
                 struct PrepResp: Decodable {
                     let ok: Bool
+                    let error: String?
                     let recoveryBlob: EncryptedEnvelope?
                     let items: [PrepItem]?
                 }
-                if let pHttp = pResp as? HTTPURLResponse, pHttp.statusCode == 200,
-                   let prep = try? JSONDecoder().decode(PrepResp.self, from: pData),
-                   let blob = prep.recoveryBlob {
-                    struct DecWrap: Decodable { let encKeyB64: String }
-                    struct EncWrap: Encodable { let encKeyB64: String; let v: Int }
-                    let wrapKey = CryptoVault.deriveRecoveryWrapKey(recoveryKey: cleanRec, email: cleanEmail)
-                    let dec = try CryptoVault.decryptJSON(DecWrap.self, encKey: wrapKey, ivB64: blob.iv, ciphertextB64: blob.ciphertext, tagB64: blob.tag)
-                    if let oldKey = Data(base64Encoded: dec.encKeyB64), oldKey.count == 32 {
-                        // Migrate encrypted sync items locally cleanly via AES-256-GCM
-                        var migrated: [[String: Any]] = []
-                        let nKey = SymmetricKey(data: newDerived.encKey)
-                        let oKey = SymmetricKey(data: oldKey)
-                        for it in (prep.items ?? []) {
-                            if let ivD = Data(base64Encoded: it.iv), let ctD = Data(base64Encoded: it.ciphertext), let tagD = Data(base64Encoded: it.tag),
-                               let nonce = try? AES.GCM.Nonce(data: ivD),
-                               let box = try? AES.GCM.SealedBox(nonce: nonce, ciphertext: ctD, tag: tagD),
-                               let plain = try? AES.GCM.open(box, using: oKey),
-                               let resealed = try? AES.GCM.seal(plain, using: nKey) {
-                                migrated.append([
-                                    "scope": it.scope,
-                                    "itemId": it.itemId,
-                                    "iv": resealed.nonce.withUnsafeBytes { Data($0) }.base64EncodedString(),
-                                    "ciphertext": resealed.ciphertext.base64EncodedString(),
-                                    "tag": resealed.tag.base64EncodedString(),
-                                    "deleted": it.deleted,
-                                    "updatedAt": it.updatedAt,
-                                ])
-                            }
-                        }
-                        if let newBlob = try? CryptoVault.encryptJSON(EncWrap(encKeyB64: newDerived.encKey.base64EncodedString(), v: 1), encKey: wrapKey) {
-                            bodyDict["newRecoveryBlob"] = ["iv": newBlob.iv, "ciphertext": newBlob.ciphertext, "tag": newBlob.tag]
-                        }
-                        bodyDict["migratedItems"] = migrated
-                        bodyDict["wipeOldCiphertext"] = false
+                guard let pHttp = pResp as? HTTPURLResponse,
+                      let prep = try? JSONDecoder().decode(PrepResp.self, from: pData) else {
+                    lastError = L10n.t("拉取云端恢复凭据失败，请稍后重试", "Failed to fetch cloud recovery credentials")
+                    return false
+                }
+                guard pHttp.statusCode == 200, prep.ok, let blob = prep.recoveryBlob else {
+                    lastError = prep.error ?? L10n.t("未找到云端恢复凭据或验证码错误，已中止重置", "Missing recovery blob or invalid code; reset aborted")
+                    return false
+                }
+                struct DecWrap: Decodable { let encKeyB64: String }
+                struct EncWrap: Encodable { let encKeyB64: String; let v: Int }
+                let wrapKey = CryptoVault.deriveRecoveryWrapKey(recoveryKey: normalizedRec, email: cleanEmail)
+                let dec: DecWrap
+                do {
+                    dec = try CryptoVault.decryptJSON(DecWrap.self, encKey: wrapKey, ivB64: blob.iv, ciphertextB64: blob.ciphertext, tagB64: blob.tag)
+                } catch {
+                    lastError = L10n.t("恢复密钥校验失败，无法解密云端密钥", "Recovery key mismatch; unable to unwrap cloud key")
+                    return false
+                }
+                guard let oldKey = Data(base64Encoded: dec.encKeyB64), oldKey.count == 32 else {
+                    lastError = L10n.t("云端恢复密钥载荷异常，已中止重置", "Corrupt recovery key payload; reset aborted")
+                    return false
+                }
+                // Migrate encrypted sync items locally cleanly via AES-256-GCM
+                var migrated: [[String: Any]] = []
+                let nKey = SymmetricKey(data: newDerived.encKey)
+                let oKey = SymmetricKey(data: oldKey)
+                for it in (prep.items ?? []) {
+                    if let ivD = Data(base64Encoded: it.iv), let ctD = Data(base64Encoded: it.ciphertext), let tagD = Data(base64Encoded: it.tag),
+                       let nonce = try? AES.GCM.Nonce(data: ivD),
+                       let box = try? AES.GCM.SealedBox(nonce: nonce, ciphertext: ctD, tag: tagD),
+                       let plain = try? AES.GCM.open(box, using: oKey),
+                       let resealed = try? AES.GCM.seal(plain, using: nKey) {
+                        migrated.append([
+                            "scope": it.scope,
+                            "itemId": it.itemId,
+                            "iv": resealed.nonce.withUnsafeBytes { Data($0) }.base64EncodedString(),
+                            "ciphertext": resealed.ciphertext.base64EncodedString(),
+                            "tag": resealed.tag.base64EncodedString(),
+                            "deleted": it.deleted,
+                            "updatedAt": it.updatedAt,
+                        ])
                     }
                 }
+                if let newBlob = try? CryptoVault.encryptJSON(EncWrap(encKeyB64: newDerived.encKey.base64EncodedString(), v: 1), encKey: wrapKey) {
+                    bodyDict["newRecoveryBlob"] = ["iv": newBlob.iv, "ciphertext": newBlob.ciphertext, "tag": newBlob.tag]
+                }
+                bodyDict["migratedItems"] = migrated
+                bodyDict["wipeOldCiphertext"] = false
             }
 
             guard let resetUrl = URL(string: "\(serverUrl)/api/auth/reset-password") else { return false }
@@ -532,8 +554,20 @@ final class SyncEngine: ObservableObject {
             let decoded = try JSONDecoder().decode(PullResponse.self, from: pullData)
             applyPulledItems(decoded.items, encKey: encKey)
 
-            let pushItems = buildOutboundItems(encKey: encKey)
-            if !pushItems.isEmpty, let pushUrl = URL(string: "\(serverUrl)/api/sync/push") {
+            let processedDirtyScopes = dirtyScopes
+            let processedDirtyBookmarkIds = dirtyBookmarkIds
+            let processedDirtyPasswordIds = dirtyPasswordIds
+            let pushItems = buildOutboundItems(
+                encKey: encKey,
+                targetScopes: processedDirtyScopes,
+                targetBookmarkIds: processedDirtyBookmarkIds,
+                targetPasswordIds: processedDirtyPasswordIds
+            )
+            if pushItems.isEmpty {
+                dirtyScopes.subtract(processedDirtyScopes)
+                dirtyBookmarkIds.subtract(processedDirtyBookmarkIds)
+                dirtyPasswordIds.subtract(processedDirtyPasswordIds)
+            } else if let pushUrl = URL(string: "\(serverUrl)/api/sync/push") {
                 var pushReq = URLRequest(url: pushUrl)
                 pushReq.httpMethod = "POST"
                 pushReq.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -542,9 +576,9 @@ final class SyncEngine: ObservableObject {
                 pushReq.httpBody = body
                 let (_, pushResp) = try await URLSession.shared.data(for: pushReq)
                 if let pHttp = pushResp as? HTTPURLResponse, pHttp.statusCode == 200 {
-                    dirtyScopes.removeAll()
-                    dirtyBookmarkIds.removeAll()
-                    dirtyPasswordIds.removeAll()
+                    dirtyScopes.subtract(processedDirtyScopes)
+                    dirtyBookmarkIds.subtract(processedDirtyBookmarkIds)
+                    dirtyPasswordIds.subtract(processedDirtyPasswordIds)
                     let pushedDeletedKeys = Set(pushItems.filter { $0.deleted }.map { "\($0.scope)|\($0.itemId)" })
                     if !pushedDeletedKeys.isEmpty {
                         pendingTombstones.removeAll { pushedDeletedKeys.contains("\($0.scope)|\($0.itemId)") }
@@ -623,12 +657,24 @@ final class SyncEngine: ObservableObject {
                     homeConfig = remoteHome
                 }
             case "profiles" where scopes.profiles:
-                if let prof = try? CryptoVault.decryptJSON(BrowserProfile.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag) {
+                if item.deleted {
+                    let rawId = item.itemId.hasPrefix("profile:")
+                        ? String(item.itemId.dropFirst("profile:".count))
+                        : item.itemId
+                    if rawId != "default", profMap.removeValue(forKey: rawId) != nil {
+                        profChanged = true
+                    }
+                } else if let prof = try? CryptoVault.decryptJSON(BrowserProfile.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag) {
                     profMap[prof.id] = prof
                     profChanged = true
                 }
-            case "history" where scopes.history && !item.deleted:
-                if let hist = try? CryptoVault.decryptJSON(HistoryItem.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag) {
+            case "history" where scopes.history:
+                if item.deleted {
+                    for (u, h) in histMap where historySyncId(url: u) == item.itemId && item.updatedAt >= h.visitedAt {
+                        histMap.removeValue(forKey: u)
+                        histChanged = true
+                    }
+                } else if let hist = try? CryptoVault.decryptJSON(HistoryItem.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag) {
                     if (histMap[hist.url]?.visitedAt ?? 0) < hist.visitedAt {
                         histMap[hist.url] = hist
                         histChanged = true
@@ -669,11 +715,16 @@ final class SyncEngine: ObservableObject {
         }
     }
 
-    private func buildOutboundItems(encKey: Data) -> [SyncItemPayload] {
+    private func buildOutboundItems(
+        encKey: Data,
+        targetScopes: Set<String>,
+        targetBookmarkIds: Set<String>,
+        targetPasswordIds: Set<String>
+    ) -> [SyncItemPayload] {
         var out: [SyncItemPayload] = []
         let nowMs = Date().timeIntervalSince1970 * 1000
 
-        if dirtyScopes.contains("home_shortcuts") && scopes.home_shortcuts {
+        if targetScopes.contains("home_shortcuts") && scopes.home_shortcuts {
             struct HomePayload: Encodable {
                 let homeConfig: HomeConfig
                 let updatedAt: Double
@@ -682,23 +733,46 @@ final class SyncEngine: ObservableObject {
                 out.append(SyncItemPayload(scope: "home_shortcuts", itemId: "home:config", iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: nowMs))
             }
         }
-        if dirtyScopes.contains("bookmarks") && scopes.bookmarks {
-            let targets: [BookmarkItem] = dirtyBookmarkIds.isEmpty
+        if targetScopes.contains("bookmarks") && scopes.bookmarks {
+            let targets: [BookmarkItem] = targetBookmarkIds.isEmpty
                 ? bookmarks
-                : bookmarks.filter { dirtyBookmarkIds.contains($0.id) || dirtyBookmarkIds.contains(bookmarkSyncId($0)) }
+                : bookmarks.filter { targetBookmarkIds.contains($0.id) || targetBookmarkIds.contains(bookmarkSyncId($0)) }
             for bm in targets {
                 if let env = try? CryptoVault.encryptJSON(bm, encKey: encKey) {
                     out.append(SyncItemPayload(scope: "bookmarks", itemId: bookmarkSyncId(bm), iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: bm.updatedAt ?? nowMs))
                 }
             }
         }
-        if dirtyScopes.contains("passwords") && scopes.passwords {
-            let targets: [PasswordEntry] = dirtyPasswordIds.isEmpty
+        if targetScopes.contains("passwords") && scopes.passwords {
+            let targets: [PasswordEntry] = targetPasswordIds.isEmpty
                 ? passwords
-                : passwords.filter { dirtyPasswordIds.contains($0.id) }
+                : passwords.filter { targetPasswordIds.contains($0.id) }
             for pw in targets {
                 if let env = try? CryptoVault.encryptJSON(pw, encKey: encKey) {
                     out.append(SyncItemPayload(scope: "passwords", itemId: "password:\(pw.id)", iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: pw.updatedAt))
+                }
+            }
+        }
+        if targetScopes.contains("history") && scopes.history {
+            let cutoffMs = nowMs - (30.0 * 24.0 * 60.0 * 60.0 * 1000.0)
+            var dedupedByUrl: [String: HistoryItem] = [:]
+            for h in history {
+                let cleanUrl = h.url.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !cleanUrl.isEmpty, h.visitedAt >= cutoffMs else { continue }
+                if let existing = dedupedByUrl[cleanUrl], existing.visitedAt >= h.visitedAt {
+                    continue
+                }
+                var copy = h
+                copy.url = cleanUrl
+                dedupedByUrl[cleanUrl] = copy
+            }
+            let recentUnique = dedupedByUrl.values
+                .sorted { $0.visitedAt > $1.visitedAt }
+                .prefix(500)
+            for h in recentUnique {
+                let itemId = historySyncId(url: h.url)
+                if let env = try? CryptoVault.encryptJSON(h, encKey: encKey) {
+                    out.append(SyncItemPayload(scope: "history", itemId: itemId, iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: h.visitedAt > 0 ? h.visitedAt : nowMs))
                 }
             }
         }
@@ -724,14 +798,14 @@ final class SyncEngine: ObservableObject {
                 out.append(SyncItemPayload(scope: tomb.scope, itemId: tomb.itemId, iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: true, updatedAt: tomb.updatedAt))
             }
         }
-        if dirtyScopes.contains("profiles") && scopes.profiles {
+        if targetScopes.contains("profiles") && scopes.profiles {
             for prof in profiles {
                 if let env = try? CryptoVault.encryptJSON(prof, encKey: encKey) {
                     out.append(SyncItemPayload(scope: "profiles", itemId: "profile:\(prof.id)", iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: nowMs))
                 }
             }
         }
-        if dirtyScopes.contains("settings") && scopes.settings {
+        if targetScopes.contains("settings") && scopes.settings {
             struct SettingsPayload: Encodable {
                 let settings: PortableSettings
                 let updatedAt: Double
@@ -741,11 +815,15 @@ final class SyncEngine: ObservableObject {
                 : true
             let storedEnterTopHit = UserDefaults.standard.object(forKey: "prism.omniboxEnterTopHitEnabled") != nil
                 ? UserDefaults.standard.bool(forKey: "prism.omniboxEnterTopHitEnabled")
-                : true
+                : false
+            let storedTheme = UserDefaults.standard.string(forKey: "prism.theme")
+                .flatMap { AppTheme(rawValue: $0) }
+            let storedEngine = UserDefaults.standard.string(forKey: "prism.searchEngine")
+                .flatMap { SearchEngineOption(rawValue: $0) }
             let portable = PortableSettings(
                 language: L10n.isEnglish ? .en : .zhCN,
-                theme: nil,
-                searchEngine: nil,
+                theme: storedTheme,
+                searchEngine: storedEngine,
                 defaultProxyMode: nil,
                 stripTrackingParams: nil,
                 autoSyncIntervalMinutes: autoSyncIntervalMinutes,
@@ -805,6 +883,52 @@ final class SyncEngine: ObservableObject {
         pendingTombstones.append(SyncTombstone(scope: "passwords", itemId: syncId, updatedAt: nowMs))
         saveLocalCache()
         notifyScopeDirty("passwords")
+    }
+
+    func recordHistoryVisit(_ item: HistoryItem) {
+        let cleanUrl = item.url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanUrl.isEmpty else { return }
+        let syncId = historySyncId(url: cleanUrl)
+        var normalized = item
+        normalized.url = cleanUrl
+        history.removeAll { $0.url.trimmingCharacters(in: .whitespacesAndNewlines) == cleanUrl }
+        history.insert(normalized, at: 0)
+        if history.count > 500 {
+            history = Array(history.prefix(500))
+        }
+        pendingTombstones.removeAll { $0.scope == "history" && $0.itemId == syncId }
+        notifyScopeDirty("history")
+    }
+
+    func recordDeletedHistory(_ item: HistoryItem) {
+        let cleanUrl = item.url.trimmingCharacters(in: .whitespacesAndNewlines)
+        let syncId = historySyncId(url: cleanUrl)
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        history.removeAll {
+            $0.id == item.id || $0.url.trimmingCharacters(in: .whitespacesAndNewlines) == cleanUrl
+        }
+        pendingTombstones.removeAll { $0.scope == "history" && $0.itemId == syncId }
+        pendingTombstones.append(SyncTombstone(scope: "history", itemId: syncId, updatedAt: nowMs))
+        saveLocalCache()
+        notifyScopeDirty("history")
+    }
+
+    func recordClearedHistory() {
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        let previous = history
+        history.removeAll()
+        for item in previous {
+            let syncId = historySyncId(url: item.url)
+            pendingTombstones.removeAll { $0.scope == "history" && $0.itemId == syncId }
+            pendingTombstones.append(SyncTombstone(scope: "history", itemId: syncId, updatedAt: nowMs))
+        }
+        saveLocalCache()
+        notifyScopeDirty("history")
+    }
+
+    private func historySyncId(url: String) -> String {
+        let clean = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "history:\(CryptoVault.sha1Hex(clean))"
     }
 
     private func bookmarkSyncId(_ bm: BookmarkItem) -> String {

@@ -119,20 +119,41 @@ enum CryptoVault {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
+    private static let crockfordAlphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+
     static func generateRecoveryKey24() -> String {
-        let alphabet = Array("ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
         var bytes = [UInt8](repeating: 0, count: 24)
         _ = SecRandomCopyBytes(kSecRandomDefault, 24, &bytes)
-        let raw = bytes.map { alphabet[Int($0) % alphabet.count] }
+        let raw = bytes.map { crockfordAlphabet[Int($0 & 31)] }
         return stride(from: 0, to: 24, by: 4)
             .map { String(raw[$0..<min($0 + 4, 24)]) }
             .joined(separator: "-")
     }
 
-    static func deriveRecoveryWrapKey(recoveryKey: String, email: String) -> Data {
-        let cleaned = recoveryKey
+    static func normalizeRecoveryKey(_ raw: String) -> String? {
+        let stripped = raw
             .uppercased()
-            .filter { $0.isLetter || $0.isNumber }
+            .filter { $0.isASCII && ($0.isLetter || $0.isNumber) }
+        var normalized = ""
+        normalized.reserveCapacity(24)
+        for ch in stripped {
+            let mapped: Character
+            switch ch {
+            case "O": mapped = "0"
+            case "I", "L": mapped = "1"
+            default: mapped = ch
+            }
+            guard crockfordAlphabet.contains(mapped) else {
+                return nil
+            }
+            normalized.append(mapped)
+        }
+        return normalized.count == 24 ? normalized : nil
+    }
+
+    static func deriveRecoveryWrapKey(recoveryKey: String, email: String) -> Data {
+        let cleaned = normalizeRecoveryKey(recoveryKey)
+            ?? recoveryKey.uppercased().filter { $0.isASCII && ($0.isLetter || $0.isNumber) }
         let sha = Data(SHA256.hash(data: Data(cleaned.utf8)))
         let sym = HKDF<SHA256>.deriveKey(
             inputKeyMaterial: SymmetricKey(data: sha),

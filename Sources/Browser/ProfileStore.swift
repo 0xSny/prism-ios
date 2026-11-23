@@ -36,31 +36,40 @@ final class ProfileDataStoreRegistry {
             return
         }
 
-        // Strip scheme prefixes like http=host:port;https=... or socks5://host:port
-        var candidate = raw.components(separatedBy: ";").first ?? raw
+        // Parse scheme/rule prefix like http=host:port;https=... or socks5://user:pass@host:port
+        var candidate = (raw.components(separatedBy: ";").first ?? raw)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var isSocks = false
         if let eqIdx = candidate.firstIndex(of: "=") {
+            let prefix = candidate[..<eqIdx].lowercased()
+            if prefix.contains("socks") {
+                isSocks = true
+            }
             candidate = String(candidate[candidate.index(after: eqIdx)...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         }
         let lower = candidate.lowercased()
-        let isSocks = lower.hasPrefix("socks5://") || lower.hasPrefix("socks://")
-        let stripped = candidate
-            .replacingOccurrences(of: "https://", with: "")
-            .replacingOccurrences(of: "http://", with: "")
-            .replacingOccurrences(of: "socks5://", with: "")
-            .replacingOccurrences(of: "socks://", with: "")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+        if lower.hasPrefix("socks5://") || lower.hasPrefix("socks://") {
+            isSocks = true
+        }
 
-        let parts = stripped.split(separator: ":", maxSplits: 1).map(String.init)
-        guard parts.count == 2,
-              let portNum = UInt16(parts[1]),
+        let normalizedURLString = candidate.contains("://") ? candidate : "http://\(candidate)"
+        guard let components = URLComponents(string: normalizedURLString),
+              let host = components.host, !host.isEmpty,
+              let portInt = components.port,
+              let portNum = UInt16(exactly: portInt),
               let port = NWEndpoint.Port(rawValue: portNum) else {
             store.proxyConfigurations = []
             return
         }
-        let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(parts[0]), port: port)
-        let config = isSocks
+
+        let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: port)
+        var config = isSocks
             ? ProxyConfiguration(socksv5Proxy: endpoint)
             : ProxyConfiguration(httpCONNECTProxy: endpoint)
+        if let user = components.user, !user.isEmpty {
+            config.applyCredential(username: user, password: components.password ?? "")
+        }
         store.proxyConfigurations = [config]
     }
 
