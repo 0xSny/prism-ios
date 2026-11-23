@@ -6,6 +6,12 @@ extension Notification.Name {
     static let prismSyncSessionChanged = Notification.Name("PrismSyncSessionChanged")
 }
 
+struct SyncTombstone: Codable, Equatable {
+    var scope: String
+    var itemId: String
+    var updatedAt: Double
+}
+
 @MainActor
 final class SyncEngine: ObservableObject {
     static let defaultServerUrl = "https://prism.zzaoo.com"
@@ -34,6 +40,9 @@ final class SyncEngine: ObservableObject {
     private var encKey: Data?
     private var lastPulledAt: Double = 0
     private var dirtyScopes = Set<String>()
+    private var dirtyBookmarkIds = Set<String>()
+    private var dirtyPasswordIds = Set<String>()
+    private var pendingTombstones: [SyncTombstone] = []
     private var debounceTask: Task<Void, Never>?
     private var autoSyncTask: Task<Void, Never>?
 
@@ -165,7 +174,7 @@ final class SyncEngine: ObservableObject {
                 "authKey": derived.authKey,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.0.9",
+                "appVersion": "1.1.0",
             ])
 
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -230,7 +239,7 @@ final class SyncEngine: ObservableObject {
                 "authKey": derived.authKey,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.0.9",
+                "appVersion": "1.1.0",
             ])
 
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -367,7 +376,7 @@ final class SyncEngine: ObservableObject {
                 "wipeOldCiphertext": true,
                 "deviceName": UIDevice.current.name,
                 "platform": "ios",
-                "appVersion": "1.0.9",
+                "appVersion": "1.1.0",
             ]
 
             let cleanRec = recoveryKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -534,6 +543,12 @@ final class SyncEngine: ObservableObject {
                 let (_, pushResp) = try await URLSession.shared.data(for: pushReq)
                 if let pHttp = pushResp as? HTTPURLResponse, pHttp.statusCode == 200 {
                     dirtyScopes.removeAll()
+                    dirtyBookmarkIds.removeAll()
+                    dirtyPasswordIds.removeAll()
+                    let pushedDeletedKeys = Set(pushItems.filter { $0.deleted }.map { "\($0.scope)|\($0.itemId)" })
+                    if !pushedDeletedKeys.isEmpty {
+                        pendingTombstones.removeAll { pushedDeletedKeys.contains("\($0.scope)|\($0.itemId)") }
+                    }
                 }
             }
 
@@ -562,7 +577,16 @@ final class SyncEngine: ObservableObject {
         var profMap = Dictionary(uniqueKeysWithValues: profiles.map { ($0.id, $0) })
         var profChanged = false
 
+        // Tombstones take precedence: ignore resurrected items older than pending local deletion
+        let tombstoneMap = Dictionary(
+            pendingTombstones.map { ("\($0.scope)|\($0.itemId)", $0.updatedAt) },
+            uniquingKeysWith: { max($0, $1) }
+        )
+
         for item in items {
+            if let deletedAt = tombstoneMap["\(item.scope)|\(item.itemId)"], item.updatedAt <= deletedAt {
+                continue
+            }
             switch item.scope {
             case "bookmarks" where scopes.bookmarks:
                 if item.deleted {
@@ -659,17 +683,45 @@ final class SyncEngine: ObservableObject {
             }
         }
         if dirtyScopes.contains("bookmarks") && scopes.bookmarks {
-            for bm in bookmarks.suffix(40) {
+            let targets: [BookmarkItem] = dirtyBookmarkIds.isEmpty
+                ? bookmarks
+                : bookmarks.filter { dirtyBookmarkIds.contains($0.id) || dirtyBookmarkIds.contains(bookmarkSyncId($0)) }
+            for bm in targets {
                 if let env = try? CryptoVault.encryptJSON(bm, encKey: encKey) {
                     out.append(SyncItemPayload(scope: "bookmarks", itemId: bookmarkSyncId(bm), iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: bm.updatedAt ?? nowMs))
                 }
             }
         }
         if dirtyScopes.contains("passwords") && scopes.passwords {
-            for pw in passwords.prefix(40) {
+            let targets: [PasswordEntry] = dirtyPasswordIds.isEmpty
+                ? passwords
+                : passwords.filter { dirtyPasswordIds.contains($0.id) }
+            for pw in targets {
                 if let env = try? CryptoVault.encryptJSON(pw, encKey: encKey) {
                     out.append(SyncItemPayload(scope: "passwords", itemId: "password:\(pw.id)", iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: pw.updatedAt))
                 }
+            }
+        }
+        if !pendingTombstones.isEmpty {
+            struct TombstonePayload: Encodable {
+                let deleted: Bool
+                let deletedAt: Double
+            }
+            for tomb in pendingTombstones {
+                let allowed: Bool = {
+                    switch tomb.scope {
+                    case "bookmarks": return scopes.bookmarks
+                    case "passwords": return scopes.passwords
+                    case "profiles": return scopes.profiles
+                    case "history": return scopes.history
+                    default: return true
+                    }
+                }()
+                guard allowed,
+                      let env = try? CryptoVault.encryptJSON(TombstonePayload(deleted: true, deletedAt: tomb.updatedAt), encKey: encKey) else {
+                    continue
+                }
+                out.append(SyncItemPayload(scope: tomb.scope, itemId: tomb.itemId, iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: true, updatedAt: tomb.updatedAt))
             }
         }
         if dirtyScopes.contains("profiles") && scopes.profiles {
@@ -704,6 +756,42 @@ final class SyncEngine: ObservableObject {
         return out
     }
 
+    func markBookmarkChanged(_ bm: BookmarkItem) {
+        dirtyBookmarkIds.insert(bm.id)
+        pendingTombstones.removeAll { $0.scope == "bookmarks" && $0.itemId == bookmarkSyncId(bm) }
+        saveLocalCache()
+        notifyScopeDirty("bookmarks")
+    }
+
+    func recordDeletedBookmark(_ bm: BookmarkItem) {
+        let syncId = bookmarkSyncId(bm)
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        bookmarks.removeAll { $0.id == bm.id || bookmarkSyncId($0) == syncId }
+        dirtyBookmarkIds.remove(bm.id)
+        pendingTombstones.removeAll { $0.scope == "bookmarks" && $0.itemId == syncId }
+        pendingTombstones.append(SyncTombstone(scope: "bookmarks", itemId: syncId, updatedAt: nowMs))
+        saveLocalCache()
+        notifyScopeDirty("bookmarks")
+    }
+
+    func markPasswordChanged(_ pw: PasswordEntry) {
+        dirtyPasswordIds.insert(pw.id)
+        pendingTombstones.removeAll { $0.scope == "passwords" && $0.itemId == "password:\(pw.id)" }
+        saveLocalCache()
+        notifyScopeDirty("passwords")
+    }
+
+    func recordDeletedPassword(_ pw: PasswordEntry) {
+        let syncId = "password:\(pw.id)"
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        passwords.removeAll { $0.id == pw.id }
+        dirtyPasswordIds.remove(pw.id)
+        pendingTombstones.removeAll { $0.scope == "passwords" && $0.itemId == syncId }
+        pendingTombstones.append(SyncTombstone(scope: "passwords", itemId: syncId, updatedAt: nowMs))
+        saveLocalCache()
+        notifyScopeDirty("passwords")
+    }
+
     private func bookmarkSyncId(_ bm: BookmarkItem) -> String {
         if bm.type == "folder" {
             return "bookmark:folder:\(bm.id)"
@@ -719,6 +807,7 @@ final class SyncEngine: ObservableObject {
         var history: [HistoryItem]
         var homeConfig: HomeConfig
         var profiles: [BrowserProfile]
+        var pendingTombstones: [SyncTombstone]?
     }
 
     func saveLocalCache() {
@@ -727,7 +816,8 @@ final class SyncEngine: ObservableObject {
             passwords: passwords,
             history: Array(history.prefix(500)),
             homeConfig: homeConfig,
-            profiles: profiles
+            profiles: profiles,
+            pendingTombstones: pendingTombstones
         )
         let url = cacheDir.appendingPathComponent("vault-state.json")
         if let data = try? JSONEncoder().encode(snap) {
@@ -746,5 +836,6 @@ final class SyncEngine: ObservableObject {
         if !snap.profiles.isEmpty {
             self.profiles = snap.profiles
         }
+        self.pendingTombstones = snap.pendingTombstones ?? []
     }
 }

@@ -13,8 +13,8 @@ jobs:
   build-ios:
     runs-on: macos-15
     env:
-      APP_VERSION: "1.0.9"
-      BUILD_NUMBER: "1009"
+      APP_VERSION: "1.1.0"
+      BUILD_NUMBER: "1100"
       BUNDLE_ID: "com.zzaoo.prism.mobile"
     steps:
       - name: Checkout repository
@@ -75,7 +75,7 @@ jobs:
                 "bundleIdentifier": "${BUNDLE_ID}",
                 "developerName": "Prism Team",
                 "subtitle": "零知识云同步与指纹容器隔离浏览器",
-                "localizedDescription": "Prism v${APP_VERSION} 原生 SwiftUI 移动客户端：四层防强跳 App 引擎与剪贴板投毒免疫、Safari 分组卡片智能搜索（拼音/快捷搜索/实时换算与色彩）、120Hz 滚动底栏沉浸、标签页会话持久化与懒加载。",
+                "localizedDescription": "Prism v${APP_VERSION} 原生 SwiftUI 移动客户端：液态玻璃底部倒序悬浮 Omnibox、0ms 防闪白网页深色自愈引擎、四层防强跳 App 护盾、动态底栏避让与锁定屏媒体控制、书签历史云同步与 Tombstone 删除墓碑。",
                 "iconURL": "https://prism.zzaoo.com/ios/icon.png",
                 "tintColor": "#4285F4",
                 "versions": [
@@ -86,7 +86,7 @@ jobs:
                     "size": ${IPA_SIZE},
                     "minOSVersion": "17.0",
                     "downloadURL": "https://prism.zzaoo.com/releases/Prism-${APP_VERSION}.ipa",
-                    "localizedDescription": "v${APP_VERSION}：四层防强跳其他 App 护盾（掐断 Universal Links / 中转网关剥离 / 剪贴板口令拦截 / 免 App 展开）、Safari 级五维智能 Omnibox 搜索与即时答案、底栏 120Hz 滚动沉浸与长按历史、标签页会话持久化与后台懒加载。"
+                    "localizedDescription": "v${APP_VERSION}：液态玻璃倒序悬浮 Omnibox、0ms 网页深色预染色自愈、精准视频接力定位、底栏安全内边距、锁屏媒体控制、书签/历史/密码库 CRUD 与 Tombstone 同步。"
                   }
                 ]
               }
@@ -112,7 +112,9 @@ jobs:
           name: Prism v${{ env.APP_VERSION }} (Unsigned IPA)
           body: |
             Prism v${{ env.APP_VERSION }} 无签名原生 `.ipa` 与 AltStore / ESign / OmniSign / Feather 软件源。
-            - 修复滑回桌面再打开偶发触发网页深色模式的问题，精简底部视频栏仅留桌面续播（画中画与倍速移入更多菜单），并全面加入丝滑弹簧交互动效。
+            - 模块一：液态玻璃底部倒序悬浮 Omnibox（实景渐晕背景、SERP 去重、Safari 反向加粗联想、零点击剪贴板隐私检测）。
+            - 模块二~四：0ms 防闪白网页深色自愈引擎、动态底栏 `contentInset.bottom` 避让、视频接力精确秒数定位、按需音频会话与锁屏控制、分片 POST 并发翻译、原生弹窗与离线错误页、桌面视图切换。
+            - 模块五~六：书签与历史管理面板、密码库 CRUD（滑动删除/新增/复制）、零知识加密 Tombstone 墓碑同步与弹窗切换时序修复。
             - 无受限权限（No restricted entitlements），完整实心 AppIcon，个人证书 / 自签工具直接安装。
             - 官方自签源 URL：`https://prism.zzaoo.com/ios/repo.json`
           files: |

@@ -25,7 +25,6 @@ private final class OmniboxRemoteSuggester: ObservableObject {
         if key == lastKey { return }
         lastKey = key
 
-        // 0ms instant hit on backspacing or repeated queries
         if let cached = lruMap[key] {
             fetchTask?.cancel()
             if suggestions != cached { suggestions = cached }
@@ -111,6 +110,72 @@ private final class OmniboxRemoteSuggester: ObservableObject {
     }
 }
 
+// MARK: - iOS Liquid Glass Optical Modifier & Tactile ButtonStyle
+
+private struct LiquidGlassBubbleModifier: ViewModifier {
+    var isProminent: Bool = false
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
+        let isDark = (colorScheme == .dark)
+        let shape = RoundedRectangle(cornerRadius: 24, style: .continuous)
+        let strokeColors: [Color] = isProminent
+            ? [
+                Color(hex: "#60A5FA")?.opacity(isDark ? 0.65 : 0.72) ?? Color.blue.opacity(0.6),
+                Color.white.opacity(isDark ? 0.48 : 0.90),
+                Color(hex: "#A855F7")?.opacity(isDark ? 0.45 : 0.42) ?? Color.purple.opacity(0.4),
+                Color.white.opacity(0.09)
+            ]
+            : [
+                Color.white.opacity(isDark ? 0.42 : 0.85),
+                Color.white.opacity(isDark ? 0.14 : 0.30),
+                Color.white.opacity(0.08)
+            ]
+
+        content
+            .background(
+                ZStack {
+                    shape.fill(.ultraThinMaterial)
+                    shape.fill(Color.white.opacity(isDark ? (isProminent ? 0.08 : 0.04) : (isProminent ? 0.26 : 0.14)))
+                }
+            )
+            .clipShape(shape)
+            .overlay(
+                shape.stroke(
+                    LinearGradient(
+                        colors: strokeColors,
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 1.0
+                )
+            )
+            .shadow(
+                color: Color.black.opacity(isDark ? (isProminent ? 0.34 : 0.24) : (isProminent ? 0.16 : 0.10)),
+                radius: isProminent ? 14 : 9,
+                x: 0,
+                y: isProminent ? 6 : 4
+            )
+    }
+}
+
+private extension View {
+    func liquidGlassBubble(isProminent: Bool = false) -> some View {
+        modifier(LiquidGlassBubbleModifier(isProminent: isProminent))
+    }
+}
+
+private struct LiquidGlassPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.96 : 1.0)
+            .opacity(configuration.isPressed ? 0.90 : 1.0)
+            .animation(.spring(response: 0.22, dampingFraction: 0.72), value: configuration.isPressed)
+    }
+}
+
+// MARK: - Bottom-Up Floating Liquid Glass Omnibox Overlay
+
 struct OmniboxInlineOverlay: View {
     @Binding var text: String
     let bookmarks: [BookmarkItem]
@@ -136,6 +201,13 @@ struct OmniboxInlineOverlay: View {
     @State private var isDismissing: Bool = false
     @State private var copiedCurrentURLFeedback = false
     @State private var copiedAnswerFeedback = false
+
+    private enum PrimaryBubbleKind {
+        case instantAnswer(InstantAnswerResult)
+        case quickSite(QuickWebsiteSearchMatch)
+        case topHit(OmniboxCandidateEntry)
+        case searchPrimary(String)
+    }
 
     var body: some View {
         buildBody()
@@ -182,45 +254,71 @@ struct OmniboxInlineOverlay: View {
         let preferGoKey = isExplicitURL || enterOpensTopHit || quickSite != nil
 
         return ZStack(alignment: .bottom) {
-            Rectangle()
-                .fill(.regularMaterial)
-                .ignoresSafeArea()
-                .opacity(isDismissing ? 0 : 1)
-                .onTapGesture { triggerSmoothClose { onDismiss() } }
+            // Progressive Scrim: keeps live webpage beneath cleanly visible & translucent
+            LinearGradient(
+                colors: [
+                    Color.black.opacity(0.08),
+                    Color.black.opacity(0.20),
+                    Color.black.opacity(0.36)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea()
+            .opacity(isDismissing ? 0 : 1)
+            .onTapGesture { triggerSmoothClose { onDismiss() } }
 
             VStack(spacing: 0) {
-                ScrollView(.vertical, showsIndicators: true) {
-                    LazyVStack(alignment: .leading, spacing: 14) {
-                        if q.isEmpty {
-                            zeroInputStartContent(matchedTabs: matchedTabs, libraryItems: libraryItems)
-                        } else {
-                            activeQueryContent(
-                                trimmed: trimmed,
-                                q: q,
-                                isExplicitURL: isExplicitURL,
-                                quickSite: quickSite,
-                                instantAnswer: instantAnswer,
-                                topHit: topHit,
-                                enterOpensTopHit: enterOpensTopHit,
-                                matchedTabs: matchedTabs,
-                                remoteList: remoteList,
-                                libraryItems: libraryItems
-                            )
-                        }
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.top, 12)
-                    .padding(.bottom, 14)
-                }
-                .scrollDismissesKeyboard(.interactively)
-                .opacity(isDismissing ? 0 : 1)
-                .offset(y: isDismissing ? 16 : 0)
+                GeometryReader { scrollGeo in
+                    ScrollView(.vertical, showsIndicators: false) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Spacer(minLength: 20)
 
-                // Docked Bottom Search Capsule + Circular [×] Cancel Button directly under Candidates
+                            if q.isEmpty {
+                                zeroInputBottomUpStack(matchedTabs: matchedTabs)
+                            } else {
+                                activeQueryBottomUpStack(
+                                    trimmed: trimmed,
+                                    q: q,
+                                    isExplicitURL: isExplicitURL,
+                                    quickSite: quickSite,
+                                    instantAnswer: instantAnswer,
+                                    topHit: topHit,
+                                    enterOpensTopHit: enterOpensTopHit,
+                                    matchedTabs: matchedTabs,
+                                    remoteList: remoteList,
+                                    libraryItems: libraryItems
+                                )
+                            }
+                        }
+                        .frame(maxWidth: .infinity, minHeight: scrollGeo.size.height, alignment: .bottom)
+                        .padding(.horizontal, 14)
+                        .padding(.top, 16)
+                        .padding(.bottom, 10)
+                        .animation(.spring(response: 0.30, dampingFraction: 0.82), value: q)
+                    }
+                    .defaultScrollAnchor(.bottom)
+                    .scrollDismissesKeyboard(.interactively)
+                    .mask(
+                        LinearGradient(
+                            stops: [
+                                .init(color: .clear, location: 0.0),
+                                .init(color: .black, location: 0.055),
+                                .init(color: .black, location: 1.0)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                }
+                .opacity(isDismissing ? 0 : 1)
+                .offset(y: isDismissing ? 18 : 0)
+
+                // Docked Liquid Glass Input Capsule + Circular [×] Dismiss Bubble
                 HStack(spacing: 10) {
                     HStack(spacing: 8) {
                         Image(systemName: "magnifyingglass")
-                            .font(.system(size: 14, weight: .medium))
+                            .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(.secondary)
                         SelectableAddressBar(
                             text: $text,
@@ -261,15 +359,8 @@ struct OmniboxInlineOverlay: View {
                         }
                     }
                     .padding(.horizontal, 14)
-                    .frame(height: 44)
-                    .background(
-                        Capsule()
-                            .fill(Color(.secondarySystemGroupedBackground))
-                            .shadow(color: Color.black.opacity(0.12), radius: 8, y: 2)
-                    )
-                    .overlay(
-                        Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
-                    )
+                    .frame(height: 46)
+                    .liquidGlassBubble(isProminent: false)
 
                     Button {
                         triggerSmoothClose { onDismiss() }
@@ -277,20 +368,24 @@ struct OmniboxInlineOverlay: View {
                         Image(systemName: "xmark")
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundStyle(.primary)
-                            .frame(width: 44, height: 44)
-                            .background(
-                                Circle()
-                                    .fill(Color(.secondarySystemGroupedBackground))
-                                    .shadow(color: Color.black.opacity(0.12), radius: 8, y: 2)
-                            )
+                            .frame(width: 46, height: 46)
+                            .background(.ultraThinMaterial, in: Circle())
                             .overlay(
-                                Circle().stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+                                Circle().stroke(
+                                    LinearGradient(
+                                        colors: [Color.white.opacity(0.6), Color.white.opacity(0.1)],
+                                        startPoint: .topLeading,
+                                        endPoint: .bottomTrailing
+                                    ),
+                                    lineWidth: 1.0
+                                )
                             )
+                            .shadow(color: Color.black.opacity(0.16), radius: 10, y: 4)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(LiquidGlassPressStyle())
                 }
                 .padding(.horizontal, 14)
-                .padding(.top, 6)
+                .padding(.top, 4)
                 .padding(.bottom, isDismissing ? 10 : max(10, keyboardHeight + 6))
             }
         }
@@ -320,171 +415,54 @@ struct OmniboxInlineOverlay: View {
         }
     }
 
-    // MARK: - Zero-Input Intelligent Start State
+    // MARK: - Zero-Input Bottom-Up Bubbles (Weakest Top -> #1 Strongest Bottom Above Input)
 
     @ViewBuilder
-    private func zeroInputStartContent(
-        matchedTabs: [OmniboxCandidateEntry],
-        libraryItems: [OmniboxCandidateEntry]
-    ) -> some View {
-        // 1. Current Webpage Quick Card (Copy, Share, Edit URL)
-        if let cur = activeTab, !cur.isNewTab, !cur.urlString.isEmpty {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 11) {
-                    FaviconView(urlString: cur.urlString, title: cur.title, size: 30, cornerRadius: 8)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(cur.title.isEmpty ? SmartOmniboxEngine.hostOnly(cur.urlString) : cur.title)
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                        Text(cur.urlString)
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer(minLength: 0)
-                }
-
-                HStack(spacing: 8) {
-                    Button {
-                        UIPasteboard.general.string = cur.urlString
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        copiedCurrentURLFeedback = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
-                            copiedCurrentURLFeedback = false
-                        }
-                    } label: {
-                        Label(
-                            copiedCurrentURLFeedback ? L10n.t("已复制", "Copied") : L10n.t("复制", "Copy"),
-                            systemImage: copiedCurrentURLFeedback ? "checkmark" : "doc.on.doc"
-                        )
-                        .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(copiedCurrentURLFeedback ? .green : .primary)
-                        .padding(.horizontal, 11)
-                        .padding(.vertical, 6)
-                        .background(Color(.tertiarySystemFill), in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-
-                    if let shareURL = URL(string: cur.urlString) {
-                        Button {
-                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                            BrowserRootView.presentSystemShareSheet(items: [shareURL])
-                        } label: {
-                            Label(L10n.t("分享", "Share"), systemImage: "square.and.arrow.up")
-                                .font(.system(size: 12.5, weight: .medium))
-                                .foregroundStyle(.primary)
-                                .padding(.horizontal, 11)
-                                .padding(.vertical, 6)
-                                .background(Color(.tertiarySystemFill), in: Capsule())
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    Button {
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        text = cur.urlString
-                    } label: {
-                        Label(L10n.t("编辑网址", "Edit URL"), systemImage: "pencil")
-                            .font(.system(size: 12.5, weight: .medium))
-                            .foregroundStyle(.blue)
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 6)
-                            .background(Color.blue.opacity(0.12), in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-
-                    Spacer(minLength: 0)
-                }
-            }
-            .padding(12)
-            .background(cardBackground)
-        }
-
-        // 2. Privacy-Safe Clipboard URL Quick-Go Bar
-        if hasClipboardWebURL {
+    private func zeroInputBottomUpStack(matchedTabs: [OmniboxCandidateEntry]) -> some View {
+        // Upper bubble: Open Tabs
+        ForEach(Array(matchedTabs.prefix(2).reversed())) { item in
             Button {
-                if let raw = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
-                    triggerSmoothClose { onSubmit(raw) }
+                if let tid = item.tabId {
+                    triggerSmoothClose { onSelectTab(tid) }
+                } else {
+                    triggerSmoothClose { onSubmit(item.url) }
                 }
             } label: {
-                HStack(spacing: 12) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(Color.blue.opacity(0.14))
-                            .frame(width: 28, height: 28)
-                        Image(systemName: "doc.on.clipboard")
-                            .font(.system(size: 13.5, weight: .semibold))
-                            .foregroundStyle(.blue)
-                    }
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(L10n.t("粘贴并打开剪贴板链接", "Paste & Open Clipboard Link"))
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(.primary)
-                        Text(L10n.t("检测到剪贴板包含网页地址，轻点直接前往", "Web URL detected in clipboard"))
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer(minLength: 0)
-                    Image(systemName: "arrow.up.right")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.blue)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .background(cardBackground)
+                siteBubbleLabel(item: item, isProminent: false, showEnter: false)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(LiquidGlassPressStyle())
         }
 
-        // 3. Favorite Shortcuts Icon Strip
-        let sortedShortcuts = Array(shortcuts.sorted { $0.order < $1.order }.prefix(10))
+        // Upper bubble: Favorites Shortcut Strip
+        let sortedShortcuts = Array(shortcuts.sorted { $0.order < $1.order }.prefix(8))
         if !sortedShortcuts.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                sectionHeader(L10n.t("常用快捷方式", "Favorites"))
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 16) {
-                        ForEach(sortedShortcuts) { sc in
-                            Button {
-                                triggerSmoothClose { onSubmit(sc.url) }
-                            } label: {
-                                VStack(spacing: 6) {
-                                    FaviconView(urlString: sc.url, title: sc.title, size: 38, cornerRadius: 10, accentHex: sc.color)
-                                    Text(sc.title)
-                                        .font(.system(size: 11.5, weight: .medium))
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(1)
-                                        .frame(width: 54)
-                                }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 14) {
+                    ForEach(sortedShortcuts) { sc in
+                        Button {
+                            triggerSmoothClose { onSubmit(sc.url) }
+                        } label: {
+                            VStack(spacing: 5) {
+                                FaviconView(urlString: sc.url, title: sc.title, size: 32, cornerRadius: 9, accentHex: sc.color)
+                                Text(sc.title)
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                    .frame(width: 48)
                             }
-                            .buttonStyle(.plain)
                         }
+                        .buttonStyle(LiquidGlassPressStyle())
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
                 }
-                .background(cardBackground)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
             }
+            .liquidGlassBubble(isProminent: false)
         }
 
-        // 4. Recent Searches Capsules (max 8)
+        // Mid bubble: Recent Searches horizontal pills + Clear button
         if !smartEngine.recentSearches.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    sectionHeader(L10n.t("最近搜索", "Recent Searches"))
-                    Spacer()
-                    Button {
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        smartEngine.clearRecentSearches()
-                    } label: {
-                        Text(L10n.t("清空", "Clear"))
-                            .font(.system(size: 12.5, weight: .medium))
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.trailing, 4)
-                }
-
+            HStack(spacing: 8) {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         ForEach(smartEngine.recentSearches, id: \.self) { term in
@@ -497,60 +475,139 @@ struct OmniboxInlineOverlay: View {
                                         .font(.system(size: 11, weight: .medium))
                                         .foregroundStyle(.secondary)
                                     Text(term)
-                                        .font(.system(size: 13.5, weight: .medium))
+                                        .font(.system(size: 13, weight: .medium))
                                         .foregroundStyle(.primary)
                                         .lineLimit(1)
                                 }
                                 .padding(.horizontal, 12)
-                                .padding(.vertical, 7)
-                                .background(cardBackground)
+                                .padding(.vertical, 8)
+                                .liquidGlassBubble(isProminent: false)
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(LiquidGlassPressStyle())
                         }
                     }
                 }
+
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    smartEngine.clearRecentSearches()
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 34, height: 34)
+                        .liquidGlassBubble(isProminent: false)
+                }
+                .buttonStyle(LiquidGlassPressStyle())
             }
         }
 
-        // 5. Open Tabs Preview
-        if !matchedTabs.isEmpty {
-            VStack(alignment: .leading, spacing: 6) {
-                sectionHeader(L10n.t("打开的标签页", "Open Tabs"))
-                insetGroupedCard(items: matchedTabs) { item in
+        // Lower bubble (#2 or #1): Current Webpage Action Bubble (Copy / Share / Edit URL)
+        if let cur = activeTab, !cur.isNewTab, !cur.urlString.isEmpty {
+            HStack(spacing: 10) {
+                FaviconView(urlString: cur.urlString, title: cur.title, size: 28, cornerRadius: 8)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(cur.title.isEmpty ? SmartOmniboxEngine.hostOnly(cur.urlString) : cur.title)
+                        .font(.system(size: 14.5, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Text(cur.urlString)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 4)
+
+                HStack(spacing: 6) {
                     Button {
-                        if let tid = item.tabId {
-                            triggerSmoothClose { onSelectTab(tid) }
-                        } else {
-                            triggerSmoothClose { onSubmit(item.url) }
+                        UIPasteboard.general.string = cur.urlString
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        copiedCurrentURLFeedback = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                            copiedCurrentURLFeedback = false
                         }
                     } label: {
-                        candidateRowContent(item: item, showBadge: nil, highlight: false)
+                        Image(systemName: copiedCurrentURLFeedback ? "checkmark" : "doc.on.doc")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(copiedCurrentURLFeedback ? .green : .primary)
+                            .frame(width: 32, height: 32)
+                            .background(Color.primary.opacity(0.08), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+
+                    if let shareURL = URL(string: cur.urlString) {
+                        Button {
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            BrowserRootView.presentSystemShareSheet(items: [shareURL])
+                        } label: {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .frame(width: 32, height: 32)
+                                .background(Color.primary.opacity(0.08), in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        text = cur.urlString
+                    } label: {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(.blue)
+                            .frame(width: 32, height: 32)
+                            .background(Color.blue.opacity(0.14), in: Circle())
                     }
                     .buttonStyle(.plain)
                 }
             }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .liquidGlassBubble(isProminent: !hasClipboardWebURL)
         }
 
-        // 6. Recent History / Bookmarks
-        if !libraryItems.isEmpty {
-            VStack(alignment: .leading, spacing: 6) {
-                sectionHeader(L10n.t("历史与书签", "History & Bookmarks"))
-                insetGroupedCard(items: libraryItems) { item in
-                    Button {
-                        triggerSmoothClose { onSubmit(item.url) }
-                    } label: {
-                        candidateRowContent(item: item, showBadge: nil, highlight: false)
-                    }
-                    .buttonStyle(.plain)
+        // Bottommost #1 (Right above input bar when clipboard has URL): Clipboard Quick-Go Bubble
+        if hasClipboardWebURL {
+            Button {
+                if let raw = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+                    triggerSmoothClose { onSubmit(raw) }
                 }
+            } label: {
+                HStack(spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.blue.opacity(0.16))
+                            .frame(width: 32, height: 32)
+                        Image(systemName: "doc.on.clipboard")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.blue)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(L10n.t("粘贴并打开剪贴板链接", "Paste & Open Clipboard Link"))
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.primary)
+                        Text(L10n.t("检测到网页链接 · 轻点直达", "Web URL detected · Tap to go"))
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                    enterBadge
+                }
+                .padding(.horizontal, 14)
+                .frame(minHeight: 54)
+                .liquidGlassBubble(isProminent: true)
             }
+            .buttonStyle(LiquidGlassPressStyle())
         }
     }
 
-    // MARK: - Active Typing Content (Safari Inset-Grouped)
+    // MARK: - Active Typing Bottom-Up Inverted Liquid Glass Stack
+    // Visual Order (top to bottom -> weakest top, strongest #1 prominent bubble directly above thumb):
+    //   On This Page Bubble -> Secondary Sites & Search Suggestions (decreasing downward rank) -> #1 Primary Action Bubble (height >= 54pt)
 
     @ViewBuilder
-    private func activeQueryContent(
+    private func activeQueryBottomUpStack(
         trimmed: String,
         q: String,
         isExplicitURL: Bool,
@@ -562,39 +619,76 @@ struct OmniboxInlineOverlay: View {
         remoteList: [String],
         libraryItems: [OmniboxCandidateEntry]
     ) -> some View {
-        // A. Quick Website Search Card
-        if let quickSite {
+        // Choose #1 Bottommost Primary Bubble: Instant Answer > Quick Site Search > Clean Top Hit > Engine Search Primary
+        let primaryKind: PrimaryBubbleKind = {
+            if let instantAnswer { return .instantAnswer(instantAnswer) }
+            if let quickSite { return .quickSite(quickSite) }
+            if let topHit { return .topHit(topHit) }
+            return .searchPrimary(remoteList.first ?? trimmed)
+        }()
+
+        // Optional On-This-Page Find Bubble (topmost utility bubble)
+        if canFindInPage && !trimmed.isEmpty {
+            let countLabel = pageMatchCount.map { L10n.t("此页（\($0)个匹配）", "On Page (\($0) matches)") } ?? L10n.t("此页查找", "Find on Page")
             Button {
-                smartEngine.recordSearchIfNeeded(quickSite.query)
-                triggerSmoothClose { onSubmit(quickSite.urlString) }
+                triggerSmoothClose { onFindInPage(trimmed) }
             } label: {
-                HStack(spacing: 12) {
-                    FaviconView(urlString: quickSite.urlString, title: quickSite.siteName, size: 28, cornerRadius: 7, accentHex: quickSite.accentHex)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(L10n.t("在 \(quickSite.siteName) 中搜索 “\(quickSite.query)”", "Search \(quickSite.siteName) for “\(quickSite.query)”"))
-                            .font(.system(size: 15.5, weight: .semibold))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                        Text(quickSite.host)
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                    }
+                HStack(spacing: 11) {
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                    Text("\(countLabel) “\(trimmed)”")
+                        .font(.system(size: 14.5, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
                     Spacer(minLength: 0)
-                    enterBadge
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 11)
-                .background(cardBackground)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(Color.blue.opacity(0.35), lineWidth: 1)
-                )
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .liquidGlassBubble(isProminent: false)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(LiquidGlassPressStyle())
         }
 
-        // B. Spotlight Instant Answer Card (Math / Units / Color Swatch / Timestamp)
-        if let answer = instantAnswer {
+        // Open Tabs & Secondary Bookmarks/History (ordered weak top -> stronger downward)
+        let secondarySites: [OmniboxCandidateEntry] = Array((matchedTabs + libraryItems).prefix(3)).reversed()
+        ForEach(secondarySites) { item in
+            Button {
+                if let tid = item.tabId {
+                    triggerSmoothClose { onSelectTab(tid) }
+                } else {
+                    triggerSmoothClose { onSubmit(item.url) }
+                }
+            } label: {
+                siteBubbleLabel(item: item, isProminent: false, showEnter: false)
+            }
+            .buttonStyle(LiquidGlassPressStyle())
+        }
+
+        // Reverse-Bold Search Suggestions (ordered weak top -> strongest nearest thumb)
+        let secondarySearchTerms: [String] = {
+            if case .searchPrimary = primaryKind {
+                return Array(remoteList.dropFirst().prefix(4)).reversed()
+            } else {
+                return Array(remoteList.prefix(3)).reversed()
+            }
+        }()
+        ForEach(Array(secondarySearchTerms.enumerated()), id: \.element) { _, term in
+            let isDefaultReturn = (term == (remoteList.first ?? trimmed)) && quickSite == nil && !enterOpensTopHit
+            searchSuggestionBubble(term: term, trimmed: trimmed, q: q, isDefaultReturn: isDefaultReturn, isProminent: false)
+        }
+
+        // If #1 is Instant Answer or Quick Site Search, still keep Top Hit close at #2 if present!
+        if case .instantAnswer = primaryKind, let hit = topHit {
+            topHitBubble(hit: hit, isExplicitURL: isExplicitURL, enterOpensTopHit: enterOpensTopHit, isProminent: false)
+        } else if case .quickSite = primaryKind, let hit = topHit {
+            topHitBubble(hit: hit, isExplicitURL: isExplicitURL, enterOpensTopHit: false, isProminent: false)
+        }
+
+        // #1 Bottommost Gold-Thumb Primary Bubble (54pt+, directly above input capsule)
+        switch primaryKind {
+        case .instantAnswer(let answer):
             Button {
                 UIPasteboard.general.string = answer.copyValue
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -607,7 +701,7 @@ struct OmniboxInlineOverlay: View {
                     instantAnswerIcon(answer.kind)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(answer.primaryText)
-                            .font(.system(size: 16.5, weight: .bold).monospacedDigit())
+                            .font(.system(size: 17, weight: .bold).monospacedDigit())
                             .foregroundStyle(.primary)
                             .lineLimit(1)
                         Text(answer.secondaryText)
@@ -621,239 +715,155 @@ struct OmniboxInlineOverlay: View {
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(.green)
                             .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(Color.green.opacity(0.14), in: Capsule())
+                            .padding(.vertical, 4)
+                            .background(Color.green.opacity(0.16), in: Capsule())
+                    } else {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.secondary)
                     }
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .background(cardBackground)
+                .padding(.horizontal, 14)
+                .frame(minHeight: 54)
+                .liquidGlassBubble(isProminent: true)
+            }
+            .buttonStyle(LiquidGlassPressStyle())
+
+        case .quickSite(let qs):
+            Button {
+                smartEngine.recordSearchIfNeeded(qs.query)
+                triggerSmoothClose { onSubmit(qs.urlString) }
+            } label: {
+                HStack(spacing: 12) {
+                    FaviconView(urlString: qs.urlString, title: qs.siteName, size: 28, cornerRadius: 8, accentHex: qs.accentHex)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(L10n.t("在 \(qs.siteName) 中搜索 “\(qs.query)”", "Search \(qs.siteName) for “\(qs.query)”"))
+                            .font(.system(size: 15.5, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        Text(qs.host)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                    enterBadge
+                }
+                .padding(.horizontal, 14)
+                .frame(minHeight: 54)
+                .liquidGlassBubble(isProminent: true)
+            }
+            .buttonStyle(LiquidGlassPressStyle())
+
+        case .topHit(let hit):
+            topHitBubble(hit: hit, isExplicitURL: isExplicitURL, enterOpensTopHit: enterOpensTopHit, isProminent: true)
+
+        case .searchPrimary(let term):
+            searchSuggestionBubble(term: term, trimmed: trimmed, q: q, isDefaultReturn: true, isProminent: true)
+        }
+    }
+
+    // MARK: - Individual Liquid Glass Bubble Components
+
+    private func topHitBubble(hit: OmniboxCandidateEntry, isExplicitURL: Bool, enterOpensTopHit: Bool, isProminent: Bool) -> some View {
+        HStack(spacing: 10) {
+            Button {
+                if let tid = hit.tabId {
+                    triggerSmoothClose { onSelectTab(tid) }
+                } else {
+                    triggerSmoothClose { onSubmit(hit.url) }
+                }
+            } label: {
+                HStack(spacing: 12) {
+                    FaviconView(urlString: hit.url, title: hit.title, size: isProminent ? 30 : 24, cornerRadius: 8, accentHex: hit.accentHex)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(hit.title)
+                            .font(.system(size: isProminent ? 16 : 15, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        Text(hit.subtitle)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-        }
 
-        // C. Top Hit + Open Matching Tabs
-        if topHit != nil || !matchedTabs.isEmpty {
-            VStack(alignment: .leading, spacing: 6) {
-                if topHit != nil {
-                    HStack {
-                        sectionHeader(L10n.t("最佳匹配", "Top Hit"))
-                        Spacer()
-                        if !isExplicitURL && quickSite == nil {
-                            Button {
-                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                enterTopHitEnabled.toggle()
-                            } label: {
-                                HStack(spacing: 4) {
-                                    Image(systemName: enterTopHitEnabled ? "return" : "magnifyingglass")
-                                        .font(.system(size: 10, weight: .semibold))
-                                    Text(enterTopHitEnabled
-                                         ? L10n.t("回车直达：开", "Enter → Site: On")
-                                         : L10n.t("回车直达：关", "Enter → Search"))
-                                        .font(.system(size: 11, weight: .medium))
-                                }
-                                .foregroundStyle(enterTopHitEnabled ? Color.blue : Color.secondary)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 3)
-                                .background(
-                                    Capsule()
-                                        .fill(enterTopHitEnabled ? Color.blue.opacity(0.12) : Color(.tertiarySystemFill))
-                                )
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                }
-
-                VStack(spacing: 0) {
-                    if let hit = topHit {
-                        Button {
-                            if let tid = hit.tabId {
-                                triggerSmoothClose { onSelectTab(tid) }
-                            } else {
-                                triggerSmoothClose { onSubmit(hit.url) }
-                            }
-                        } label: {
-                            candidateRowContent(item: hit, showBadge: enterOpensTopHit ? "↵" : nil, highlight: enterOpensTopHit)
-                        }
-                        .buttonStyle(.plain)
-
-                        if !matchedTabs.isEmpty {
-                            Divider().padding(.leading, 48)
-                        }
-                    }
-
-                    ForEach(Array(matchedTabs.enumerated()), id: \.element.id) { idx, item in
-                        Button {
-                            if let tid = item.tabId {
-                                triggerSmoothClose { onSelectTab(tid) }
-                            } else {
-                                triggerSmoothClose { onSubmit(item.url) }
-                            }
-                        } label: {
-                            candidateRowContent(item: item, showBadge: nil, highlight: false)
-                        }
-                        .buttonStyle(.plain)
-
-                        if idx < matchedTabs.count - 1 {
-                            Divider().padding(.leading, 48)
-                        }
-                    }
-                }
-                .background(cardBackground)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(enterOpensTopHit ? Color.blue.opacity(0.32) : Color.clear, lineWidth: 1)
-                )
-            }
-        }
-
-        // D. Search Engine Suggestions (Safari Reverse-Bold)
-        if !remoteList.isEmpty {
-            VStack(alignment: .leading, spacing: 6) {
-                sectionHeader("\(searchEngine.title)\(L10n.t("搜索建议", " Suggestions"))")
-
-                VStack(spacing: 0) {
-                    ForEach(Array(remoteList.enumerated()), id: \.element) { idx, term in
-                        let isDefaultSearchRow = (idx == 0 && !enterOpensTopHit && quickSite == nil)
-                        HStack(spacing: 10) {
-                            Button {
-                                smartEngine.recordSearchIfNeeded(term)
-                                triggerSmoothClose { onSubmit(term) }
-                            } label: {
-                                HStack(spacing: 12) {
-                                    Image(systemName: "magnifyingglass")
-                                        .font(.system(size: 14, weight: isDefaultSearchRow ? .semibold : .regular))
-                                        .foregroundStyle(isDefaultSearchRow ? Color.blue : Color.secondary)
-                                        .frame(width: 24, height: 24)
-                                    reverseBoldSuggestionText(term: term, query: trimmed)
-                                        .font(.system(size: 16))
-                                        .lineLimit(1)
-                                    Spacer(minLength: 0)
-                                    if isDefaultSearchRow {
-                                        enterBadge
-                                    }
-                                }
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-
-                            if term.lowercased() != q {
-                                Button {
-                                    text = term
-                                } label: {
-                                    Image(systemName: "arrow.up.left")
-                                        .font(.system(size: 12.5, weight: .medium))
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 28, height: 28)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-
-                        if idx < remoteList.count - 1 {
-                            Divider().padding(.leading, 48)
-                        }
-                    }
-                }
-                .background(cardBackground)
-            }
-        }
-
-        // E. Bookmarks, History & Popular Matches
-        if !libraryItems.isEmpty {
-            VStack(alignment: .leading, spacing: 6) {
-                sectionHeader(L10n.t("书签与历史记录", "Bookmarks & History"))
-                insetGroupedCard(items: libraryItems) { item in
-                    Button {
-                        triggerSmoothClose { onSubmit(item.url) }
-                    } label: {
-                        candidateRowContent(item: item, showBadge: nil, highlight: false)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-
-        // F. On This Page
-        if canFindInPage && !trimmed.isEmpty {
-            VStack(alignment: .leading, spacing: 6) {
-                let countLabel: String = {
-                    if let c = pageMatchCount {
-                        return L10n.t("此页（\(c)个匹配项）", "On This Page (\(c) matches)")
-                    }
-                    return L10n.t("此页", "On This Page")
-                }()
-                sectionHeader(countLabel)
-
+            if !isExplicitURL {
                 Button {
-                    triggerSmoothClose { onFindInPage(trimmed) }
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    enterTopHitEnabled.toggle()
                 } label: {
-                    HStack(spacing: 12) {
-                        Image(systemName: "doc.text.magnifyingglass")
-                            .font(.system(size: 15))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 24, height: 24)
-                        Text(L10n.t("在当前页查找“\(trimmed)”", "Find “\(trimmed)” on Page"))
-                            .font(.system(size: 15.5))
-                            .foregroundStyle(.primary)
-                        Spacer(minLength: 0)
+                    Text(enterTopHitEnabled ? L10n.t("回车直达", "Enter → Go") : L10n.t("回车搜索", "Enter → Find"))
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(enterTopHitEnabled ? .blue : .secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            (enterTopHitEnabled ? Color.blue.opacity(0.14) : Color.primary.opacity(0.08)),
+                            in: Capsule()
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+
+            if enterOpensTopHit {
+                enterBadge
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: isProminent ? 54 : 48)
+        .liquidGlassBubble(isProminent: isProminent)
+    }
+
+    private func searchSuggestionBubble(term: String, trimmed: String, q: String, isDefaultReturn: Bool, isProminent: Bool) -> some View {
+        HStack(spacing: 10) {
+            Button {
+                smartEngine.recordSearchIfNeeded(term)
+                triggerSmoothClose { onSubmit(term) }
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 14, weight: isDefaultReturn ? .semibold : .regular))
+                        .foregroundStyle(isDefaultReturn ? .blue : .secondary)
+                        .frame(width: 24, height: 24)
+                    reverseBoldSuggestionText(term: term, query: trimmed)
+                        .font(.system(size: isProminent ? 16 : 15))
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    if isDefaultReturn {
+                        enterBadge
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 11)
-                    .background(cardBackground)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if term.lowercased() != q {
+                Button {
+                    text = term
+                } label: {
+                    Image(systemName: "arrow.up.left")
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 28)
                 }
                 .buttonStyle(.plain)
             }
         }
+        .padding(.horizontal, 14)
+        .frame(minHeight: isProminent ? 54 : 46)
+        .liquidGlassBubble(isProminent: isProminent)
     }
 
-    // MARK: - Safari Shared UI Helpers
-
-    private var cardBackground: some View {
-        RoundedRectangle(cornerRadius: 16, style: .continuous)
-            .fill(Color(.secondarySystemGroupedBackground).opacity(0.94))
-    }
-
-    private func sectionHeader(_ title: String) -> some View {
-        Text(title)
-            .font(.system(size: 12.5, weight: .semibold))
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 4)
-    }
-
-    private var enterBadge: some View {
-        Text("↵")
-            .font(.system(size: 12, weight: .bold))
-            .foregroundStyle(.blue)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(Color.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-    }
-
-    private func insetGroupedCard<Row: View>(
-        items: [OmniboxCandidateEntry],
-        @ViewBuilder rowBuilder: @escaping (OmniboxCandidateEntry) -> Row
-    ) -> some View {
-        VStack(spacing: 0) {
-            ForEach(Array(items.enumerated()), id: \.element.id) { idx, item in
-                rowBuilder(item)
-                if idx < items.count - 1 {
-                    Divider().padding(.leading, 48)
-                }
-            }
-        }
-        .background(cardBackground)
-    }
-
-    private func candidateRowContent(item: OmniboxCandidateEntry, showBadge: String?, highlight: Bool) -> some View {
+    private func siteBubbleLabel(item: OmniboxCandidateEntry, isProminent: Bool, showEnter: Bool) -> some View {
         HStack(spacing: 12) {
             if item.tabId != nil {
                 Image(systemName: "macwindow")
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(highlight ? Color.blue : Color.secondary)
+                    .font(.system(size: 14.5, weight: .medium))
+                    .foregroundStyle(.secondary)
                     .frame(width: 24, height: 24)
             } else {
                 FaviconView(
@@ -864,10 +874,9 @@ struct OmniboxInlineOverlay: View {
                     accentHex: item.accentHex
                 )
             }
-
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.title)
-                    .font(.system(size: 15.5, weight: highlight ? .semibold : .medium))
+                    .font(.system(size: 15, weight: .medium))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
                 Text(item.subtitle)
@@ -876,22 +885,26 @@ struct OmniboxInlineOverlay: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
-            if let badge = showBadge {
-                Text(badge)
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(.blue)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(Color.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            if showEnter {
+                enterBadge
             } else if item.tabId != nil {
                 Image(systemName: "arrow.right.circle")
                     .font(.system(size: 14))
                     .foregroundStyle(.tertiary)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .contentShape(Rectangle())
+        .padding(.horizontal, 14)
+        .frame(minHeight: isProminent ? 54 : 48)
+        .liquidGlassBubble(isProminent: isProminent)
+    }
+
+    private var enterBadge: some View {
+        Text("↵")
+            .font(.system(size: 12, weight: .bold))
+            .foregroundStyle(.blue)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(Color.blue.opacity(0.15), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
     }
 
     @ViewBuilder
@@ -901,41 +914,25 @@ struct OmniboxInlineOverlay: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(Color(red: Double(r) / 255.0, green: Double(g) / 255.0, blue: Double(b) / 255.0))
                 .frame(width: 28, height: 28)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(Color.primary.opacity(0.18), lineWidth: 1)
-                )
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.white.opacity(0.5), lineWidth: 1))
         case .calculator:
             ZStack {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.green.opacity(0.16))
-                    .frame(width: 28, height: 28)
-                Image(systemName: "equal")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(.green)
+                Circle().fill(Color.green.opacity(0.18)).frame(width: 28, height: 28)
+                Image(systemName: "equal").font(.system(size: 14, weight: .bold)).foregroundStyle(.green)
             }
         case .converter:
             ZStack {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.orange.opacity(0.16))
-                    .frame(width: 28, height: 28)
-                Image(systemName: "arrow.left.arrow.right")
-                    .font(.system(size: 12.5, weight: .bold))
-                    .foregroundStyle(.orange)
+                Circle().fill(Color.orange.opacity(0.18)).frame(width: 28, height: 28)
+                Image(systemName: "arrow.left.arrow.right").font(.system(size: 12.5, weight: .bold)).foregroundStyle(.orange)
             }
         case .timestamp:
             ZStack {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.purple.opacity(0.16))
-                    .frame(width: 28, height: 28)
-                Image(systemName: "clock.fill")
-                    .font(.system(size: 13.5, weight: .semibold))
-                    .foregroundStyle(.purple)
+                Circle().fill(Color.purple.opacity(0.18)).frame(width: 28, height: 28)
+                Image(systemName: "clock.fill").font(.system(size: 13.5, weight: .semibold)).foregroundStyle(.purple)
             }
         }
     }
 
-    // Safari-style Reverse-Bold: typed query stays .secondary regular, predicted continuation becomes .primary bold
     private func reverseBoldSuggestionText(term: String, query: String) -> Text {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty, let range = term.range(of: q, options: .caseInsensitive) else {

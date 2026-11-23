@@ -52,6 +52,7 @@ final class BrowserTab: ObservableObject, Identifiable {
 
     var webView: WKWebView?
     var topBackdropColor: UIColor?
+    var pendingSeekSeconds: Double? = nil
     var lastUserInteractionAt: TimeInterval = 0
     var themeColorObservation: NSKeyValueObservation?
     var progressObservation: NSKeyValueObservation?
@@ -110,7 +111,7 @@ final class BrowserTab: ObservableObject, Identifiable {
 
 @MainActor
 final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, WKDownloadDelegate {
-    static let standardDarkBackdropColor = UIColor(red: 0x20 / 255.0, green: 0x21 / 255.0, blue: 0x24 / 255.0, alpha: 1.0)
+    static let standardDarkBackdropColor = UIColor(red: 0x19 / 255.0, green: 0x1A / 255.0, blue: 0x1C / 255.0, alpha: 1.0)
     static let standardLightBackdropColor = UIColor.white
     static let dynamicSystemBackdropColor = UIColor { trait in
         trait.userInterfaceStyle == .dark ? standardDarkBackdropColor : standardLightBackdropColor
@@ -245,7 +246,26 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
                 .filter { !$0.isEmpty }
             self.webDarkModeWhitelistHosts = Set(cleaned)
         }
-        BackgroundMediaController.shared.configureAudioSession()
+        BackgroundMediaController.shared.onRemoteCommand = { [weak self] action, positionSeconds in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard let targetTab = self.tabs.first(where: { $0.hasVideo && !$0.videoPaused }) ?? self.activeTab,
+                      let webView = targetTab.webView else { return }
+                switch action {
+                case "play":
+                    webView.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('play');", completionHandler: nil)
+                case "pause":
+                    webView.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('pause');", completionHandler: nil)
+                case "toggle":
+                    webView.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('togglePlay');", completionHandler: nil)
+                case "seek":
+                    let sec = max(0, positionSeconds ?? 0)
+                    webView.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('seekTo', \(sec));", completionHandler: nil)
+                default:
+                    break
+                }
+            }
+        }
         restoreSessionOrCreateDefault()
     }
 
@@ -621,16 +641,13 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         tab.isNewTab = false
         tab.urlString = url.absoluteString
         tab.isTranslated = false
+        tab.topBackdropColor = nil
         tab.matchedPasswords = []
         tab.showAutofillBar = false
         tab.blockedAppJumpURL = nil
+        tab.pendingSeekSeconds = (seekSeconds ?? 0) > 0 ? seekSeconds : nil
+        applyWebDarkAppearance(to: webView, url: url)
         webView.load(URLRequest(url: url))
-
-        if let seekSeconds, seekSeconds > 0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                webView.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('seekTo', \(seekSeconds));", completionHandler: nil)
-            }
-        }
     }
 
     func ensureWebView(for tab: BrowserTab) -> WKWebView {
@@ -653,6 +670,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         AdBlockManager.shared.apply(to: ucc, enabled: adblockEnabled && profile.fingerprint.blockTrackers)
 
         let webView = WKWebView(frame: .zero, configuration: config)
+        webView.isOpaque = false
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
@@ -954,19 +972,45 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             }
             return
         }
-        webView.evaluateJavaScript(TranslatorService.collectNodesJS) { result, _ in
-            guard let dict = result as? [String: Any] else { return }
+        showToast(L10n.t("正在翻译网页...", "Translating page..."))
+        webView.evaluateJavaScript(TranslatorService.collectNodesJS) { [weak self, weak tab, weak webView] result, _ in
+            guard let self, let tab, let webView else { return }
+            guard let dict = result as? [String: Any] else {
+                Task { @MainActor in
+                    self.showToast(L10n.t("未检测到可翻译正文", "No translatable text found"))
+                }
+                return
+            }
             if (dict["toggleOn"] as? Bool) == true {
                 Task { @MainActor in tab.isTranslated = true }
                 return
             }
-            guard let texts = dict["texts"] as? [String], !texts.isEmpty else { return }
+            guard let texts = dict["texts"] as? [String], !texts.isEmpty else {
+                Task { @MainActor in
+                    self.showToast(L10n.t("未检测到可翻译正文", "No translatable text found"))
+                }
+                return
+            }
             Task {
-                let translated = await TranslatorService.translateBatch(texts)
+                let (translated, ok) = await TranslatorService.translateBatch(texts)
+                guard ok else {
+                    await MainActor.run {
+                        tab.isTranslated = false
+                        self.showToast(L10n.t("翻译请求失败，请检查网络后重试", "Translation failed, please try again"))
+                    }
+                    return
+                }
                 let applyJS = TranslatorService.applyTranslationsJS(translated)
                 await MainActor.run {
-                    webView.evaluateJavaScript(applyJS) { _, _ in
-                        tab.isTranslated = true
+                    webView.evaluateJavaScript(applyJS) { _, err in
+                        Task { @MainActor in
+                            if err == nil {
+                                tab.isTranslated = true
+                            } else {
+                                tab.isTranslated = false
+                                self.showToast(L10n.t("应用译文失败", "Failed to apply translations"))
+                            }
+                        }
                     }
                 }
             }
@@ -976,7 +1020,8 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     func toggleBookmarkCurrentPage() {
         guard let tab = activeTab, !tab.isNewTab, !tab.urlString.isEmpty, let syncEngine else { return }
         if let idx = syncEngine.bookmarks.firstIndex(where: { $0.url == tab.urlString }) {
-            syncEngine.bookmarks.remove(at: idx)
+            let existing = syncEngine.bookmarks[idx]
+            syncEngine.recordDeletedBookmark(existing)
             showToast(L10n.t("已移除书签", "Bookmark removed"))
         } else {
             let item = BookmarkItem(
@@ -991,7 +1036,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
                 createdAt: Date().timeIntervalSince1970 * 1000,
                 updatedAt: Date().timeIntervalSince1970 * 1000
             )
-            syncEngine.bookmarks.append(item)
+            syncEngine.markBookmarkChanged(item)
             showToast(L10n.t("已收藏并同步到云端", "Bookmarked & syncing"))
         }
         syncEngine.notifyScopeDirty("bookmarks")
@@ -1230,21 +1275,124 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
 
     // MARK: - WKNavigationDelegate & WKUIDelegate
 
-    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+    private func topMostPresenter() -> UIViewController? {
+        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first,
+              let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController ?? scene.windows.first?.rootViewController else {
+            return nil
+        }
+        var current = root
+        while let presented = current.presentedViewController {
+            current = presented
+        }
+        return current
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        preferences: WKWebpagePreferences,
+        decisionHandler: @escaping (WKNavigationActionPolicy, WKWebpagePreferences) -> Void
+    ) {
+        preferences.preferredContentMode = desktopMode ? .desktop : .mobile
         guard let url = navigationAction.request.url else {
-            decisionHandler(.allow)
+            decisionHandler(.allow, preferences)
             return
         }
         let isMain = navigationAction.targetFrame?.isMainFrame ?? true
         let policy = evaluateAppJumpShieldPolicy(for: url, in: webView, isMainFrame: isMain, isNewWindow: false)
         if policy == .cancel {
-            decisionHandler(.cancel)
+            decisionHandler(.cancel, preferences)
             return
         }
         if isMain {
             applyWebDarkAppearance(to: webView, url: url)
         }
-        decisionHandler(policy)
+        decisionHandler(policy, preferences)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptAlertPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping () -> Void
+    ) {
+        var didFinish = false
+        let finish = {
+            guard !didFinish else { return }
+            didFinish = true
+            completionHandler()
+        }
+        guard let presenter = topMostPresenter() else {
+            finish()
+            return
+        }
+        let host = frame.securityOrigin.host
+        let title = host.isEmpty ? L10n.t("网页提示", "Page Alert") : host
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: L10n.t("好", "OK"), style: .default) { _ in
+            finish()
+        })
+        presenter.present(alert, animated: true)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptConfirmPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping (Bool) -> Void
+    ) {
+        var didFinish = false
+        let finish: (Bool) -> Void = { confirmed in
+            guard !didFinish else { return }
+            didFinish = true
+            completionHandler(confirmed)
+        }
+        guard let presenter = topMostPresenter() else {
+            finish(false)
+            return
+        }
+        let host = frame.securityOrigin.host
+        let title = host.isEmpty ? L10n.t("确认操作", "Confirm") : host
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: L10n.t("取消", "Cancel"), style: .cancel) { _ in
+            finish(false)
+        })
+        alert.addAction(UIAlertAction(title: L10n.t("确定", "OK"), style: .default) { _ in
+            finish(true)
+        })
+        presenter.present(alert, animated: true)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptTextInputPanelWithPrompt prompt: String,
+        defaultText: String?,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping (String?) -> Void
+    ) {
+        var didFinish = false
+        let finish: (String?) -> Void = { value in
+            guard !didFinish else { return }
+            didFinish = true
+            completionHandler(value)
+        }
+        guard let presenter = topMostPresenter() else {
+            finish(nil)
+            return
+        }
+        let host = frame.securityOrigin.host
+        let title = host.isEmpty ? L10n.t("网页输入", "Prompt") : host
+        let alert = UIAlertController(title: title, message: prompt, preferredStyle: .alert)
+        alert.addTextField { field in
+            field.text = defaultText
+        }
+        alert.addAction(UIAlertAction(title: L10n.t("取消", "Cancel"), style: .cancel) { _ in
+            finish(nil)
+        })
+        alert.addAction(UIAlertAction(title: L10n.t("确定", "OK"), style: .default) { [weak alert] _ in
+            finish(alert?.textFields?.first?.text)
+        })
+        presenter.present(alert, animated: true)
     }
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
@@ -1357,6 +1505,9 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        if let tab = tabs.first(where: { $0.webView === webView }) {
+            tab.topBackdropColor = nil
+        }
         applyWebDarkAppearance(to: webView, url: webView.url)
         syncWebViewState(webView)
     }
@@ -1379,10 +1530,13 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         webView.scrollView.refreshControl?.endRefreshing()
         applyWebDarkAppearance(to: webView, url: webView.url)
         let enabled = effectiveWebDarkEnabled(for: webView.url)
-        webView.evaluateJavaScript(
-            "window.__prismSetWebDark && window.__prismSetWebDark(\(enabled ? "true" : "false")); window.__prismSampleTopColor && window.__prismSampleTopColor(true);",
-            completionHandler: nil
-        )
+        var postLoadJS = "window.__prismSetWebDark && window.__prismSetWebDark(\(enabled ? "true" : "false")); window.__prismSampleTopColor && window.__prismSampleTopColor(true);"
+        if let tab = tabs.first(where: { $0.webView === webView }),
+           let pendingSeek = tab.pendingSeekSeconds,
+           pendingSeek > 0 {
+            postLoadJS += " window.__prismScheduleSeek && window.__prismScheduleSeek(\(pendingSeek));"
+        }
+        webView.evaluateJavaScript(postLoadJS, completionHandler: nil)
         syncWebViewState(webView)
         scheduleSessionSave()
         guard let tab = tabs.first(where: { $0.webView === webView }),
@@ -1413,6 +1567,76 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         webView.scrollView.refreshControl?.endRefreshing()
         syncWebViewState(webView)
+        let nsErr = error as NSError
+        if (nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled)
+            || (nsErr.domain == "WebKitErrorDomain" && nsErr.code == 102) {
+            return
+        }
+        let failingURL = (nsErr.userInfo[NSURLErrorFailingURLErrorKey] as? URL) ?? webView.url
+        if failingURL?.scheme?.lowercased() == "about" {
+            return
+        }
+        let tab = tabs.first(where: { $0.webView === webView })
+        let fallbackURLString = failingURL?.absoluteString ?? tab?.urlString ?? ""
+        let escapedURL = htmlEscaped(fallbackURLString)
+        let escapedReason = htmlEscaped(error.localizedDescription)
+        let jsTargetJSON: String = {
+            if let data = try? JSONEncoder().encode(fallbackURLString),
+               let s = String(data: data, encoding: .utf8) {
+                return s
+            }
+            return "\"\""
+        }()
+        let isDark = isEffectiveAppDark
+        let bgHex = isDark ? "#191A1C" : "#F5F6F8"
+        let cardHex = isDark ? "#232529" : "#FFFFFF"
+        let fgHex = isDark ? "#EAECEE" : "#1D1F23"
+        let mutedHex = isDark ? "#9CA3AF" : "#6B7280"
+        let accentHex = "#4B7BFF"
+        let titleText = htmlEscaped(L10n.t("无法打开此网页", "Cannot Open Page"))
+        let reloadText = htmlEscaped(L10n.t("重新加载", "Reload"))
+        let html = """
+        <!doctype html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+        <title>\(titleText)</title>
+        <style>
+          :root { color-scheme: \(isDark ? "dark" : "light"); }
+          html, body { margin: 0; padding: 0; background: \(bgHex); color: \(fgHex); font-family: -apple-system, BlinkMacSystemFont, sans-serif; height: 100%; }
+          .wrap { min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box; }
+          .card { width: 100%; max-width: 420px; background: \(cardHex); border-radius: 22px; padding: 26px 22px; box-shadow: 0 14px 36px rgba(0,0,0,\(isDark ? "0.35" : "0.08")); text-align: center; }
+          .icon { width: 48px; height: 48px; margin: 0 auto 14px; border-radius: 14px; background: rgba(75,123,255,0.14); color: \(accentHex); display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: 700; }
+          h1 { font-size: 19px; margin: 0 0 8px; font-weight: 650; }
+          .url { font-size: 12px; color: \(mutedHex); word-break: break-all; margin: 0 0 10px; }
+          .reason { font-size: 13px; color: \(mutedHex); line-height: 1.5; margin: 0 0 20px; }
+          button { width: 100%; border: 0; border-radius: 14px; padding: 13px 18px; font-size: 15px; font-weight: 600; background: \(accentHex); color: #fff; cursor: pointer; }
+        </style>
+        </head>
+        <body>
+          <div class="wrap">
+            <div class="card">
+              <div class="icon">!</div>
+              <h1>\(titleText)</h1>
+              <p class="url">\(escapedURL)</p>
+              <p class="reason">\(escapedReason)</p>
+              <button type="button" onclick="var u=\(jsTargetJSON); if(u){location.href=u;}else{location.reload();}">\(reloadText)</button>
+            </div>
+          </div>
+        </body>
+        </html>
+        """
+        webView.loadHTMLString(html, baseURL: failingURL)
+    }
+
+    private func htmlEscaped(_ raw: String) -> String {
+        raw
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&#39;")
     }
 
     func syncWebViewState(_ webView: WKWebView) {
@@ -1485,6 +1709,13 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             if tab.videoPaused != nextPaused { tab.videoPaused = nextPaused }
             if tab.playbackRate != nextRate { tab.playbackRate = nextRate }
             if nextHasVideo {
+                if !nextPaused {
+                    BackgroundMediaController.shared.activateAudioSessionIfNeeded()
+                }
+                if let pendingSeek = tab.pendingSeekSeconds, pendingSeek > 0 {
+                    tab.pendingSeekSeconds = nil
+                    webView?.evaluateJavaScript("window.__prismScheduleSeek && window.__prismScheduleSeek(\(pendingSeek));", completionHandler: nil)
+                }
                 let host = URL(string: tab.urlString)?.host ?? "Prism"
                 BackgroundMediaController.shared.updateNowPlaying(
                     title: tab.title,
@@ -1673,18 +1904,13 @@ private enum WebDarkModeScripts {
           if (window.__prismWebDarkEnabled && document.documentElement) {
             ensureColorSchemeMeta(true);
             ensureDarkStyle();
-            if (!document.getElementById('prism-dark-prep')) {
-              const prep = document.createElement('style');
-              prep.id = 'prism-dark-prep';
-              prep.textContent = 'html:not([data-prism-dark]) { background-color: #202124 !important; }';
-              document.documentElement.appendChild(prep);
-            }
+            // Lock Pre-Paint dark mode immediately at documentStart BEFORE first body paint (0ms no white flash)
+            document.documentElement.setAttribute('data-prism-dark', '1');
           }
 
           window.__prismWebDarkEnsure = {
             ensureColorSchemeMeta,
-            ensureDarkStyle,
-            removePrepStyle
+            ensureDarkStyle
           };
         })();
         """
@@ -1698,9 +1924,11 @@ private enum WebDarkModeScripts {
 
           const helper = window.__prismWebDarkEnsure || {
             ensureColorSchemeMeta: function() {},
-            ensureDarkStyle: function() {},
-            removePrepStyle: function() {}
+            ensureDarkStyle: function() {}
           };
+
+          let isApplyingInternal = false;
+          const observedPendingLinks = new WeakSet();
 
           function parseCssRgb(raw) {
             if (!raw || typeof raw !== 'string') return null;
@@ -1757,13 +1985,38 @@ private enum WebDarkModeScripts {
             return Boolean(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
           }
 
+          function hasPendingStylesheets() {
+            let pending = false;
+            const links = document.querySelectorAll('link[rel~="stylesheet"]');
+            for (let i = 0; i < links.length; i += 1) {
+              const ln = links[i];
+              if (!ln.disabled && !ln.sheet) {
+                pending = true;
+                if (!observedPendingLinks.has(ln)) {
+                  observedPendingLinks.add(ln);
+                  ln.addEventListener('load', () => evaluateAndApply(true), { once: true });
+                  ln.addEventListener('error', () => evaluateAndApply(false), { once: true });
+                }
+              }
+            }
+            return pending;
+          }
+
           function isAlreadyDarkPage() {
             const root = document.documentElement;
             if (!root) return false;
 
+            isApplyingInternal = true;
             const prevAttr = root.getAttribute('data-prism-dark');
             if (prevAttr === '1') {
               root.removeAttribute('data-prism-dark');
+            }
+            // Temporarily detach Prism's own injected meta[data-prism-cs="1"] so we never spoof our own colorScheme detection!
+            const ownMeta = document.querySelector('meta[data-prism-cs="1"]');
+            const ownMetaParent = ownMeta ? ownMeta.parentNode : null;
+            const ownMetaNext = ownMeta ? ownMeta.nextSibling : null;
+            if (ownMeta && ownMetaParent) {
+              ownMeta.remove();
             }
 
             let foundDarkBg = false;
@@ -1799,14 +2052,21 @@ private enum WebDarkModeScripts {
               if (foundDarkBg) return true;
               if (foundLightBg) return false;
 
+              // Transparent background while external CSS is still downloading -> keep dark invert locked!
+              if (hasPendingStylesheets()) return false;
+
               const nativeMeta = document.querySelector('meta[name="color-scheme"]:not([data-prism-cs])');
               const metaCS = nativeMeta ? (nativeMeta.getAttribute('content') || '').toLowerCase() : '';
               const rootCS = (getComputedStyle(root).colorScheme || '').toLowerCase();
               return metaCS.includes('dark') || rootCS.includes('dark');
             } finally {
+              if (ownMeta && ownMetaParent && !document.querySelector('meta[data-prism-cs="1"]')) {
+                ownMetaParent.insertBefore(ownMeta, ownMetaNext);
+              }
               if (prevAttr === '1' && window.__prismWebDarkEnabled) {
                 root.setAttribute('data-prism-dark', '1');
               }
+              isApplyingInternal = false;
             }
           }
 
@@ -1860,9 +2120,9 @@ private enum WebDarkModeScripts {
 
               if (!sampled) {
                 if (filterActive) {
-                  sampled = { r: 25, g: 25, b: 25 };
+                  sampled = { r: 25, g: 26, b: 28 };
                 } else if (isDarkSchemeActive()) {
-                  sampled = { r: 32, g: 33, b: 36 };
+                  sampled = { r: 25, g: 26, b: 28 };
                 } else {
                   sampled = { r: 255, g: 255, b: 255 };
                 }
@@ -1887,23 +2147,27 @@ private enum WebDarkModeScripts {
           function evaluateAndApply(forceTopColor) {
             const root = document.documentElement;
             if (!root) return;
-            helper.removePrepStyle();
 
-            if (!window.__prismWebDarkEnabled) {
-              helper.ensureColorSchemeMeta(false);
-              root.removeAttribute('data-prism-dark');
+            isApplyingInternal = true;
+            try {
+              if (!window.__prismWebDarkEnabled) {
+                helper.ensureColorSchemeMeta(false);
+                root.removeAttribute('data-prism-dark');
+                sampleAndPostTopColor(Boolean(forceTopColor));
+                return;
+              }
+
+              helper.ensureColorSchemeMeta(true);
+              helper.ensureDarkStyle();
+              if (isAlreadyDarkPage()) {
+                root.setAttribute('data-prism-dark', '0');
+              } else {
+                root.setAttribute('data-prism-dark', '1');
+              }
               sampleAndPostTopColor(Boolean(forceTopColor));
-              return;
+            } finally {
+              isApplyingInternal = false;
             }
-
-            helper.ensureColorSchemeMeta(true);
-            helper.ensureDarkStyle();
-            if (isAlreadyDarkPage()) {
-              root.setAttribute('data-prism-dark', '0');
-            } else {
-              root.setAttribute('data-prism-dark', '1');
-            }
-            sampleAndPostTopColor(Boolean(forceTopColor));
           }
 
           window.__prismSyncConfig = function(themeMode, followDark, whitelistArr) {
@@ -1923,23 +2187,31 @@ private enum WebDarkModeScripts {
             }
             evaluateAndApply(true);
             if (typeof requestAnimationFrame === 'function') {
-              requestAnimationFrame(() => {
-                evaluateAndApply(true);
-              });
+              requestAnimationFrame(() => evaluateAndApply(true));
             }
           };
 
+          // Full lifecycle healing: DOMContentLoaded + window.load + pageshow (BFCache back/forward)
           evaluateAndApply(true);
           if (typeof requestAnimationFrame === 'function') {
             requestAnimationFrame(() => evaluateAndApply(true));
           }
           setTimeout(() => evaluateAndApply(false), 350);
 
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => evaluateAndApply(true), { once: true });
+          }
+          window.addEventListener('load', () => evaluateAndApply(true));
+          window.addEventListener('pageshow', () => {
+            if (typeof window.__prismComputeWebDarkEnabled === 'function') {
+              window.__prismWebDarkEnabled = window.__prismComputeWebDarkEnabled();
+            }
+            evaluateAndApply(true);
+          });
+
           if (window.matchMedia) {
             const darkMQ = window.matchMedia('(prefers-color-scheme: dark)');
-            const onMediaChange = () => {
-              window.__prismOnTraitChanged();
-            };
+            const onMediaChange = () => window.__prismOnTraitChanged();
             if (typeof darkMQ.addEventListener === 'function') {
               darkMQ.addEventListener('change', onMediaChange);
             } else if (typeof darkMQ.addListener === 'function') {
@@ -1947,20 +2219,49 @@ private enum WebDarkModeScripts {
             }
           }
 
-          let debounceTimer = null;
-          const scheduleHeadReeval = () => {
-            if (debounceTimer) clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(() => sampleAndPostTopColor(false), 180);
+          let rafScheduled = false;
+          const scheduleHealingPass = () => {
+            if (isApplyingInternal || rafScheduled) return;
+            rafScheduled = true;
+            const runPass = () => {
+              rafScheduled = false;
+              evaluateAndApply(false);
+            };
+            if (typeof requestAnimationFrame === 'function') {
+              requestAnimationFrame(runPass);
+            } else {
+              setTimeout(runPass, 16);
+            }
           };
 
-          if (typeof MutationObserver === 'function' && document.head) {
-            const mo = new MutationObserver(() => scheduleHeadReeval());
-            mo.observe(document.head, {
-              childList: true,
-              subtree: true,
-              attributes: true,
-              attributeFilter: ['content', 'media']
+          // Self-healing MutationObserver guarding head + documentElement (catches SPA hydration stripping styles/attributes)
+          if (typeof MutationObserver === 'function') {
+            const mo = new MutationObserver(() => {
+              if (isApplyingInternal) return;
+              if (window.__prismWebDarkEnabled) {
+                const root = document.documentElement;
+                if (!document.getElementById('prism-dark-style') || (root && !root.hasAttribute('data-prism-dark'))) {
+                  scheduleHealingPass();
+                  return;
+                }
+              }
+              scheduleHealingPass();
             });
+            if (document.head) {
+              mo.observe(document.head, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['content', 'media', 'rel', 'disabled']
+              });
+            }
+            if (document.documentElement) {
+              mo.observe(document.documentElement, {
+                childList: true,
+                attributes: true,
+                attributeFilter: ['class', 'style', 'data-prism-dark']
+              });
+            }
           }
         })();
         """

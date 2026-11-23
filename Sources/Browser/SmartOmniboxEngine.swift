@@ -368,11 +368,12 @@ final class SmartOmniboxEngine: ObservableObject {
             }
         }
 
-        // 4. History (Frecency)
+        // 4. History (Frecency) — skip polluting Top Hit candidates with search-engine SERP URLs
         for (_, stat) in visitStats {
             let h = stat.latest
+            let isSerp = Self.isSearchResultURL(h.url)
             let s = scoreMatch(queryLower: q, tokens: tokens, title: h.title, url: h.url)
-            if s > 0 {
+            if s > 0 && !isSerp {
                 let host = Self.hostOnly(h.url)
                 let ageDays = max(0.0, (nowMs - h.visitedAt) / 86_400_000.0)
                 let frecency = min(55.0, Double(stat.count) * 8.0 * exp(-ageDays * 0.08))
@@ -421,11 +422,9 @@ final class SmartOmniboxEngine: ObservableObject {
             return $0.visitedAt > $1.visitedAt
         }
 
-        // 6. Safari Root-Domain Synthesis:
-        // If best candidate is a deep subpage (e.g. github.com/0xSny/prism-ios) and query matches host prefix cleanly,
-        // synthesize clean root domain https://github.com for Top Hit while preserving subpage in Library below!
+        // 6. Safari Root-Domain Synthesis (strictly excludes search-engine SERP URLs):
         var topHit: OmniboxCandidateEntry? = nil
-        if let best = scoredSites.first, best.score >= 85 {
+        if let best = scoredSites.first(where: { $0.score >= 85 && !Self.isSearchResultURL($0.url) }) {
             let host = Self.hostOnly(best.url)
             if !Self.isRootURL(best.url),
                q.count >= 2,
@@ -522,6 +521,22 @@ final class SmartOmniboxEngine: ObservableObject {
             score += 45
         }
         return score
+    }
+
+    static func isSearchResultURL(_ raw: String) -> Bool {
+        guard let comps = URLComponents(string: raw),
+              let host = comps.host?.lowercased() else { return false }
+        let path = comps.path.lowercased()
+        let qNames = Set((comps.queryItems ?? []).map { $0.name.lowercased() })
+        if host.contains("google.") && path.hasPrefix("/search") { return true }
+        if host.hasSuffix("baidu.com") && (path == "/s" || qNames.contains("wd") || qNames.contains("word")) { return true }
+        if host.hasSuffix("bing.com") && path.hasPrefix("/search") { return true }
+        if host.hasSuffix("duckduckgo.com") && qNames.contains("q") { return true }
+        if host.hasSuffix("sogou.com") && (path.hasPrefix("/web") || path.hasPrefix("/sogou")) { return true }
+        if host.hasSuffix("so.com") && path == "/s" { return true }
+        if host.contains("yandex.") && path.hasPrefix("/search") { return true }
+        if host.hasSuffix("yahoo.com") && path.hasPrefix("/search") { return true }
+        return false
     }
 
     // MARK: - String URL Helpers

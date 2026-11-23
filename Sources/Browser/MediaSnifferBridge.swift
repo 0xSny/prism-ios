@@ -140,8 +140,20 @@ enum MediaSnifferScripts {
 
       // Video Controls API exposed to Swift
       window.__prismVideoControl = function(cmd, val) {
-        const v = document.querySelector('video');
+        const vids = document.getElementsByTagName('video');
+        let v = vids[0];
+        for (let i = 0; i < vids.length; i += 1) {
+          if (vids[i].readyState > 0 || !vids[i].paused) { v = vids[i]; break; }
+        }
         if (!v) return false;
+        if (cmd === 'play') {
+          v.play().catch(() => {});
+          return true;
+        }
+        if (cmd === 'pause') {
+          v.pause();
+          return true;
+        }
         if (cmd === 'rate') {
           v.playbackRate = Number(val) || 1.0;
           return true;
@@ -171,6 +183,34 @@ enum MediaSnifferScripts {
           return true;
         }
         return false;
+      };
+
+      window.__prismScheduleSeek = function(targetSeconds) {
+        const sec = Math.max(0, Number(targetSeconds) || 0);
+        if (sec <= 0) return;
+        let done = false;
+        const deadline = Date.now() + 8000;
+        const attempt = () => {
+          if (done || Date.now() > deadline) return;
+          const vids = document.getElementsByTagName('video');
+          let v = vids[0];
+          for (let i = 0; i < vids.length; i += 1) {
+            if (vids[i].readyState >= 1 || vids[i].duration > 0) { v = vids[i]; break; }
+          }
+          if (!v) {
+            setTimeout(attempt, 250);
+            return;
+          }
+          if (v.readyState >= 1) {
+            done = true;
+            try { v.currentTime = sec; } catch (e) {}
+            return;
+          }
+          v.addEventListener('loadedmetadata', attempt, { once: true });
+          v.addEventListener('canplay', attempt, { once: true });
+          setTimeout(attempt, 350);
+        };
+        attempt();
       };
 
       // Bulletproof Password field focus, input tracking & capture (eye-toggle & multi-step friendly)
@@ -335,12 +375,55 @@ enum MediaSnifferScripts {
 final class BackgroundMediaController {
     static let shared = BackgroundMediaController()
 
-    func configureAudioSession() {
+    private var audioSessionActivated = false
+    private var commandsRegistered = false
+    var onRemoteCommand: ((String, Double?) -> Void)?
+
+    // Activate .playback ONLY on demand when webpage media genuinely starts playing (never steal Apple Music/NetEase on launch!)
+    func activateAudioSessionIfNeeded() {
+        registerRemoteCommandsIfNeeded()
+        guard !audioSessionActivated else { return }
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: [.allowAirPlay])
             try AVAudioSession.sharedInstance().setActive(true)
+            audioSessionActivated = true
         } catch {
-            // Audio session failure is non-fatal
+            // Non-fatal
+        }
+    }
+
+    private func registerRemoteCommandsIfNeeded() {
+        guard !commandsRegistered else { return }
+        commandsRegistered = true
+        let cc = MPRemoteCommandCenter.shared()
+        cc.playCommand.isEnabled = true
+        cc.playCommand.addTarget { _ in
+            Task { @MainActor in
+                BackgroundMediaController.shared.onRemoteCommand?("play", nil)
+            }
+            return .success
+        }
+        cc.pauseCommand.isEnabled = true
+        cc.pauseCommand.addTarget { _ in
+            Task { @MainActor in
+                BackgroundMediaController.shared.onRemoteCommand?("pause", nil)
+            }
+            return .success
+        }
+        cc.togglePlayPauseCommand.isEnabled = true
+        cc.togglePlayPauseCommand.addTarget { _ in
+            Task { @MainActor in
+                BackgroundMediaController.shared.onRemoteCommand?("togglePlay", nil)
+            }
+            return .success
+        }
+        cc.changePlaybackPositionCommand.isEnabled = true
+        cc.changePlaybackPositionCommand.addTarget { event in
+            let pos = (event as? MPChangePlaybackPositionCommandEvent)?.positionTime ?? 0
+            Task { @MainActor in
+                BackgroundMediaController.shared.onRemoteCommand?("seekTo", pos)
+            }
+            return .success
         }
     }
 

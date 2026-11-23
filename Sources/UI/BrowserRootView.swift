@@ -22,7 +22,7 @@ struct BrowserRootView: View {
     @State private var topToastDismissTask: Task<Void, Never>?
 
     enum ActiveSheet: Identifiable {
-        case menu, account, profiles, vault, sniffer, devtools, reader, downloads
+        case menu, account, profiles, vault, sniffer, devtools, reader, downloads, bookmarksHistory
         var id: Self { self }
     }
 
@@ -45,6 +45,7 @@ struct BrowserRootView: View {
                             tabId: tab.id,
                             tab: tab,
                             tabManager: tabManager,
+                            bottomChromeInset: isChromeCollapsed ? 36 : 96,
                             onScrollCollapsedChange: { collapsed in
                                 guard isChromeCollapsed != collapsed else { return }
                                 withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
@@ -309,7 +310,10 @@ struct BrowserRootView: View {
             switch sheet {
             case .menu:
                 MenuSheetView(syncEngine: syncEngine, tabManager: tabManager, handoffService: handoffService) { target in
-                    activeSheet = target
+                    activeSheet = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) {
+                        activeSheet = target
+                    }
                 }
             case .account:
                 AccountSheetView(syncEngine: syncEngine)
@@ -325,6 +329,8 @@ struct BrowserRootView: View {
                 ReaderModeSheetView(tabManager: tabManager)
             case .downloads:
                 DownloadsSheetView(tabManager: tabManager)
+            case .bookmarksHistory:
+                BookmarksHistorySheetView(syncEngine: syncEngine, tabManager: tabManager)
             }
         }
         .preferredColorScheme(
@@ -510,7 +516,9 @@ private struct DockBackButton: View {
         let canBack = tab.canGoBack
         let canForward = tab.canGoForward
         Button {
-            tab.webView?.goBack()
+            if tab.canGoBack {
+                tab.webView?.goBack()
+            }
         } label: {
             Image(systemName: "chevron.left")
                 .font(.system(size: 15, weight: .semibold))
@@ -823,14 +831,16 @@ final class PrismWebViewController: UIViewController {
     private var lastOffsetY: CGFloat = 0
     private var scrollDeltaAccumulator: CGFloat = 0
     private var isCurrentlyCollapsed: Bool = false
+    private var currentBottomChromeInset: CGFloat = 96
 
     override func loadView() {
         view = containerView
     }
 
-    func attach(tab: BrowserTab, tabManager: TabManager) {
+    func attach(tab: BrowserTab, tabManager: TabManager, bottomChromeInset: CGFloat) {
         let target = tabManager.ensureWebView(for: tab)
         if attachedTabId == tab.id, containerView.hostedWebView === target {
+            updateBottomChromeInset(bottomChromeInset, on: target)
             return
         }
         attachedTabId = tab.id
@@ -840,6 +850,22 @@ final class PrismWebViewController: UIViewController {
         containerView.attachWebView(target, tabManager: tabManager, targetURL: target.url ?? URL(string: tab.urlString))
         attachRefreshControl(to: target)
         observeScroll(on: target)
+        updateBottomChromeInset(bottomChromeInset, on: target, force: true)
+    }
+
+    func updateBottomChromeInset(_ insetBottom: CGFloat, on webView: WKWebView? = nil, force: Bool = false) {
+        let targetWebView = webView ?? containerView.hostedWebView
+        guard let targetWebView else { return }
+        if !force && abs(currentBottomChromeInset - insetBottom) <= 0.5 && abs(targetWebView.scrollView.contentInset.bottom - insetBottom) <= 0.5 {
+            return
+        }
+        currentBottomChromeInset = insetBottom
+        var contentInset = targetWebView.scrollView.contentInset
+        contentInset.bottom = insetBottom
+        targetWebView.scrollView.contentInset = contentInset
+        var indicatorInset = targetWebView.scrollView.verticalScrollIndicatorInsets
+        indicatorInset.bottom = insetBottom
+        targetWebView.scrollView.verticalScrollIndicatorInsets = indicatorInset
     }
 
     private func observeScroll(on webView: WKWebView) {
@@ -921,18 +947,19 @@ struct WebViewControllerRepresentable: UIViewControllerRepresentable {
     let tabId: UUID
     let tab: BrowserTab
     let tabManager: TabManager
+    let bottomChromeInset: CGFloat
     var onScrollCollapsedChange: ((Bool) -> Void)? = nil
 
     func makeUIViewController(context: Context) -> PrismWebViewController {
         let vc = PrismWebViewController()
         vc.onScrollCollapsedChange = onScrollCollapsedChange
-        vc.attach(tab: tab, tabManager: tabManager)
+        vc.attach(tab: tab, tabManager: tabManager, bottomChromeInset: bottomChromeInset)
         return vc
     }
 
     func updateUIViewController(_ uiViewController: PrismWebViewController, context: Context) {
         uiViewController.onScrollCollapsedChange = onScrollCollapsedChange
-        uiViewController.attach(tab: tab, tabManager: tabManager)
+        uiViewController.attach(tab: tab, tabManager: tabManager, bottomChromeInset: bottomChromeInset)
     }
 }
 

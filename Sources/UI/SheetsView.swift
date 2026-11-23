@@ -47,24 +47,19 @@ struct MenuSheetView: View {
                             dismiss()
                         }
                         if let tab = tabManager.activeTab, !tab.isNewTab, let shareURL = URL(string: tab.urlString) {
-                            ShareLink(item: shareURL) {
-                                VStack(spacing: 6) {
-                                    Image(systemName: "square.and.arrow.up")
-                                        .font(.system(size: 18, weight: .semibold))
-                                        .foregroundStyle(.teal)
-                                        .frame(width: 44, height: 44)
-                                        .background(Color.teal.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                                    Text(L10n.t("分享", "Share"))
-                                        .font(.caption2.weight(.medium))
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(1)
+                            QuickMenuTile(
+                                title: L10n.t("分享本页", "Share"),
+                                icon: "square.and.arrow.up",
+                                color: .teal
+                            ) {
+                                dismiss()
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) {
+                                    BrowserRootView.presentSystemShareSheet(items: [shareURL])
                                 }
-                                .frame(maxWidth: .infinity)
                             }
-                            .buttonStyle(.plain)
                         } else {
                             QuickMenuTile(
-                                title: L10n.t("分享", "Share"),
+                                title: L10n.t("分享本页", "Share"),
                                 icon: "square.and.arrow.up",
                                 color: .teal
                             ) {
@@ -146,7 +141,15 @@ struct MenuSheetView: View {
 
                 Section(L10n.t("核心工具", "Tools")) {
                     Button {
-                        dismiss()
+                        onOpenSubSheet(.bookmarksHistory)
+                    } label: {
+                        Label(
+                            L10n.t("书签与历史记录 (\(syncEngine.bookmarks.count)/\(syncEngine.history.count))", "Bookmarks & History (\(syncEngine.bookmarks.count)/\(syncEngine.history.count))"),
+                            systemImage: "books.vertical"
+                        )
+                    }
+
+                    Button {
                         onOpenSubSheet(.account)
                     } label: {
                         Label(
@@ -158,21 +161,18 @@ struct MenuSheetView: View {
                     }
 
                     Button {
-                        dismiss()
                         onOpenSubSheet(.profiles)
                     } label: {
                         Label(L10n.t("隔离身份与网络代理", "Profiles & Network Proxy"), systemImage: "person.2.badge.key")
                     }
 
                     Button {
-                        dismiss()
                         onOpenSubSheet(.vault)
                     } label: {
                         Label(L10n.t("面容 ID 密码管家 (\(syncEngine.passwords.count))", "Password Vault (\(syncEngine.passwords.count))"), systemImage: "key.viewfinder")
                     }
 
                     Button {
-                        dismiss()
                         onOpenSubSheet(.sniffer)
                     } label: {
                         Label(
@@ -182,7 +182,6 @@ struct MenuSheetView: View {
                     }
 
                     Button {
-                        dismiss()
                         onOpenSubSheet(.reader)
                     } label: {
                         Label(L10n.t("沉浸式阅读模式", "Reader Mode"), systemImage: "doc.plaintext")
@@ -190,7 +189,6 @@ struct MenuSheetView: View {
                     .disabled(tabManager.activeTab?.isNewTab != false)
 
                     Button {
-                        dismiss()
                         onOpenSubSheet(.downloads)
                     } label: {
                         Label(
@@ -200,7 +198,6 @@ struct MenuSheetView: View {
                     }
 
                     Button {
-                        dismiss()
                         onOpenSubSheet(.devtools)
                     } label: {
                         Label(L10n.t("移动端 DevTools 调试器", "Mobile DevTools"), systemImage: "wrench.and.screwdriver")
@@ -286,7 +283,7 @@ struct MenuSheetView: View {
                     }
                 }
             }
-            .navigationTitle("Prism v1.0.9")
+            .navigationTitle("Prism v1.1.0")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -643,24 +640,81 @@ struct VaultSheetView: View {
     @ObservedObject var syncEngine: SyncEngine
     @State private var search = ""
     @State private var unlockedIds = Set<String>()
+    @State private var copiedFeedbackId: String?
+    @State private var showAddEntrySheet = false
+    @State private var newOrigin = ""
+    @State private var newUsername = ""
+    @State private var newPassword = ""
+    @State private var newNote = ""
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             List {
-                ForEach(filtered) { item in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text(item.origin).font(.subheadline.weight(.semibold))
-                            Spacer()
-                            Button(unlockedIds.contains(item.id) ? L10n.t("复制密码", "Copy") : L10n.t("解锁查看", "Reveal")) {
-                                authenticateAndReveal(item)
+                if filtered.isEmpty {
+                    ContentUnavailableView(
+                        L10n.t("暂无保存的密码", "No Saved Passwords"),
+                        systemImage: "key.viewfinder",
+                        description: Text(L10n.t("点击右上角 + 可手动添加账号密码，或登录网站自动保存", "Tap + above to add manually or save automatically on sign-in"))
+                    )
+                } else {
+                    ForEach(filtered) { item in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                FaviconView(urlString: item.origin, title: item.origin, size: 22, cornerRadius: 5)
+                                Text(item.origin).font(.subheadline.weight(.semibold))
+                                    .lineLimit(1)
+                                Spacer()
+                                if copiedFeedbackId == item.id {
+                                    Text(L10n.t("已复制", "Copied"))
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(.green)
+                                }
+                                Button(unlockedIds.contains(item.id) ? L10n.t("复制密码", "Copy") : L10n.t("解锁查看", "Reveal")) {
+                                    authenticateAndReveal(item)
+                                }
+                                .font(.caption.weight(.bold))
+                                .buttonStyle(.borderless)
                             }
-                            .font(.caption.weight(.bold))
+
+                            HStack {
+                                Text(item.username.isEmpty ? L10n.t("无用户名", "No username") : item.username)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Spacer()
+                                if !item.username.isEmpty {
+                                    Button {
+                                        UIPasteboard.general.string = item.username
+                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                        copiedFeedbackId = item.id
+                                    } label: {
+                                        Label(L10n.t("复制账号", "Copy User"), systemImage: "person.crop.square")
+                                            .font(.caption2.weight(.medium))
+                                    }
+                                    .buttonStyle(.borderless)
+                                }
+                            }
+
+                            if unlockedIds.contains(item.id) {
+                                Text(item.password)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.blue)
+                                    .textSelection(.enabled)
+                            }
+                            if let note = item.note, !note.isEmpty {
+                                Text(note)
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
                         }
-                        Text(item.username).font(.caption).foregroundStyle(.secondary)
-                        if unlockedIds.contains(item.id) {
-                            Text(item.password).font(.caption.monospaced()).foregroundStyle(.blue)
+                        .padding(.vertical, 2)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button(role: .destructive) {
+                                deletePasswordItem(item)
+                            } label: {
+                                Label(L10n.t("删除", "Delete"), systemImage: "trash")
+                            }
                         }
                     }
                 }
@@ -673,8 +727,49 @@ struct VaultSheetView: View {
             .navigationTitle(L10n.t("加密密码库", "Password Vault"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        newOrigin = ""
+                        newUsername = ""
+                        newPassword = ""
+                        newNote = ""
+                        showAddEntrySheet = true
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(L10n.t("完成", "Done")) { dismiss() }
+                }
+            }
+            .sheet(isPresented: $showAddEntrySheet) {
+                NavigationStack {
+                    Form {
+                        Section(L10n.t("网站与账号", "Site & Credentials")) {
+                            TextField(L10n.t("网站域名或网址（如 github.com）", "Website or domain (e.g. github.com)"), text: $newOrigin)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled(true)
+                                .keyboardType(.URL)
+                            TextField(L10n.t("用户名 / 邮箱", "Username / Email"), text: $newUsername)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled(true)
+                            SecureField(L10n.t("密码", "Password"), text: $newPassword)
+                            TextField(L10n.t("备注（可选）", "Note (optional)"), text: $newNote)
+                        }
+                    }
+                    .navigationTitle(L10n.t("新增密码条目", "Add Password"))
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button(L10n.t("取消", "Cancel")) { showAddEntrySheet = false }
+                        }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button(L10n.t("保存", "Save")) {
+                                saveNewPasswordEntry()
+                            }
+                            .disabled(newOrigin.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || newPassword.isEmpty)
+                        }
+                    }
                 }
             }
         }
@@ -686,9 +781,37 @@ struct VaultSheetView: View {
         return syncEngine.passwords.filter { $0.origin.lowercased().contains(q) || $0.username.lowercased().contains(q) }
     }
 
+    private func deletePasswordItem(_ item: PasswordEntry) {
+        syncEngine.recordDeletedPassword(item)
+        syncEngine.notifyScopeDirty("passwords")
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    }
+
+    private func saveNewPasswordEntry() {
+        var normalizedOrigin = newOrigin.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalizedOrigin.contains("://") {
+            normalizedOrigin = "https://\(normalizedOrigin)"
+        }
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        let entry = PasswordEntry(
+            id: UUID().uuidString,
+            origin: normalizedOrigin,
+            username: newUsername.trimmingCharacters(in: .whitespacesAndNewlines),
+            password: newPassword,
+            note: newNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : newNote.trimmingCharacters(in: .whitespacesAndNewlines),
+            createdAt: nowMs,
+            updatedAt: nowMs
+        )
+        syncEngine.markPasswordChanged(entry)
+        syncEngine.notifyScopeDirty("passwords")
+        showAddEntrySheet = false
+    }
+
     private func authenticateAndReveal(_ item: PasswordEntry) {
         if unlockedIds.contains(item.id) {
             UIPasteboard.general.string = item.password
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            copiedFeedbackId = item.id
             return
         }
         let ctx = LAContext()
@@ -699,8 +822,13 @@ struct VaultSheetView: View {
                 Task { @MainActor in
                     unlockedIds.insert(item.id)
                     UIPasteboard.general.string = item.password
+                    copiedFeedbackId = item.id
                 }
             }
+        } else {
+            unlockedIds.insert(item.id)
+            UIPasteboard.general.string = item.password
+            copiedFeedbackId = item.id
         }
     }
 }
@@ -1105,5 +1233,183 @@ struct DownloadsSheetView: View {
         case .completed: return L10n.t("已保存 · 点击右侧可分享至“文件”", "Saved · Share to Files")
         case .failed: return item.errorMessage ?? L10n.t("下载失败", "Download failed")
         }
+    }
+}
+
+// MARK: - Bookmarks & History Sheet
+
+struct BookmarksHistorySheetView: View {
+    @ObservedObject var syncEngine: SyncEngine
+    @ObservedObject var tabManager: TabManager
+
+    @State private var segment: Int = 0
+    @State private var search: String = ""
+    @State private var showClearConfirm = false
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                Picker("", selection: $segment) {
+                    Text(L10n.t("书签 (\(urlBookmarks.count))", "Bookmarks (\(urlBookmarks.count))")).tag(0)
+                    Text(L10n.t("历史记录 (\(syncEngine.history.count))", "History (\(syncEngine.history.count))")).tag(1)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+
+                List {
+                    if segment == 0 {
+                        if filteredBookmarks.isEmpty {
+                            ContentUnavailableView(
+                                L10n.t("暂无书签", "No Bookmarks"),
+                                systemImage: "star",
+                                description: Text(L10n.t("在菜单点击“收藏”即可跨设备云同步书签", "Bookmark any page from Menu to sync across devices"))
+                            )
+                        } else {
+                            ForEach(filteredBookmarks) { bm in
+                                Button {
+                                    if let url = URL(string: bm.url) {
+                                        tabManager.createTab(url: url, activate: true)
+                                        dismiss()
+                                    }
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        FaviconView(urlString: bm.url, title: bm.title, size: 28, cornerRadius: 7)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(bm.title.isEmpty ? bm.url : bm.title)
+                                                .font(.subheadline.weight(.medium))
+                                                .foregroundStyle(.primary)
+                                                .lineLimit(1)
+                                            Text(SmartOmniboxEngine.hostOnly(bm.url).isEmpty ? bm.url : SmartOmniboxEngine.hostOnly(bm.url))
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(1)
+                                        }
+                                        Spacer()
+                                        Image(systemName: "arrow.up.forward")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                    Button(role: .destructive) {
+                                        syncEngine.recordDeletedBookmark(bm)
+                                        syncEngine.notifyScopeDirty("bookmarks")
+                                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                    } label: {
+                                        Label(L10n.t("删除", "Delete"), systemImage: "trash")
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        if filteredHistory.isEmpty {
+                            ContentUnavailableView(
+                                L10n.t("暂无浏览历史", "No History"),
+                                systemImage: "clock",
+                                description: Text(L10n.t("你访问过的网页会加密同步到此列表", "Visited pages appear here and sync encrypted"))
+                            )
+                        } else {
+                            ForEach(filteredHistory) { item in
+                                Button {
+                                    if let url = URL(string: item.url) {
+                                        tabManager.createTab(url: url, activate: true)
+                                        dismiss()
+                                    }
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        FaviconView(urlString: item.url, title: item.title, size: 28, cornerRadius: 7)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(item.title.isEmpty ? item.url : item.title)
+                                                .font(.subheadline.weight(.medium))
+                                                .foregroundStyle(.primary)
+                                                .lineLimit(1)
+                                            HStack(spacing: 6) {
+                                                Text(SmartOmniboxEngine.hostOnly(item.url).isEmpty ? item.url : SmartOmniboxEngine.hostOnly(item.url))
+                                                    .lineLimit(1)
+                                                Text("·")
+                                                Text(relativeVisitTime(item.visitedAt))
+                                            }
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                    Button(role: .destructive) {
+                                        syncEngine.history.removeAll(where: { $0.id == item.id })
+                                        syncEngine.notifyScopeDirty("history")
+                                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                    } label: {
+                                        Label(L10n.t("删除", "Delete"), systemImage: "trash")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                .listStyle(.insetGrouped)
+            }
+            .searchable(text: $search, prompt: Text(L10n.t("搜索标题或网址", "Search title or URL")))
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled(true)
+            .navigationTitle(L10n.t("书签与历史记录", "Bookmarks & History"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if segment == 1 && !syncEngine.history.isEmpty {
+                        Button(role: .destructive) {
+                            showClearConfirm = true
+                        } label: {
+                            Text(L10n.t("清空历史", "Clear"))
+                        }
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(L10n.t("完成", "Done")) { dismiss() }
+                }
+            }
+            .confirmationDialog(
+                L10n.t("清空全部浏览历史记录？", "Clear all browsing history?"),
+                isPresented: $showClearConfirm,
+                titleVisibility: .visible
+            ) {
+                Button(L10n.t("清空历史记录", "Clear All History"), role: .destructive) {
+                    syncEngine.history.removeAll()
+                    syncEngine.notifyScopeDirty("history")
+                }
+                Button(L10n.t("取消", "Cancel"), role: .cancel) {}
+            }
+        }
+    }
+
+    private var urlBookmarks: [BookmarkItem] {
+        syncEngine.bookmarks.filter { ($0.type ?? "url") != "folder" && !$0.url.isEmpty }
+    }
+
+    private var filteredBookmarks: [BookmarkItem] {
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let list = urlBookmarks
+        guard !q.isEmpty else { return list }
+        return list.filter { $0.title.lowercased().contains(q) || $0.url.lowercased().contains(q) }
+    }
+
+    private var filteredHistory: [HistoryItem] {
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return syncEngine.history }
+        return syncEngine.history.filter { $0.title.lowercased().contains(q) || $0.url.lowercased().contains(q) }
+    }
+
+    private func relativeVisitTime(_ ms: Double) -> String {
+        let dt = Date(timeIntervalSince1970: ms / 1000.0)
+        let fmt = RelativeDateTimeFormatter()
+        fmt.unitsStyle = .short
+        return fmt.localizedString(for: dt, relativeTo: Date())
     }
 }
