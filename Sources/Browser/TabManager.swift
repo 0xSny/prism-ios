@@ -1167,10 +1167,11 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     }
 
     func refreshClipboardWebURLPatternSilently() {
-        Task { @MainActor [weak self] in
-            let patterns = try? await UIPasteboard.general.detectPatterns(for: [.probableWebURL])
-            let isWebURL = patterns?.contains(.probableWebURL) ?? false
-            self?.hasClipboardWebURL = isWebURL
+        UIPasteboard.general.detectPatterns(for: [.probableWebURL]) { [weak self] result in
+            let isWebURL = (try? result.get().contains(.probableWebURL)) ?? false
+            Task { @MainActor [weak self] in
+                self?.hasClipboardWebURL = isWebURL
+            }
         }
     }
 
@@ -1178,29 +1179,30 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         let board = UIPasteboard.general
         guard board.changeCount != lastClipboardChangeCount else { return }
         lastClipboardChangeCount = board.changeCount
-        // Use async detectPatterns first so copying ordinary text NEVER triggers iOS system paste banners
-        Task { @MainActor [weak self] in
-            let patterns = try? await UIPasteboard.general.detectPatterns(for: [.probableWebURL])
-            let isWebURL = patterns?.contains(.probableWebURL) ?? false
-            guard let self else { return }
-            self.hasClipboardWebURL = isWebURL
-            guard isWebURL else { return }
-            guard let text = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !text.isEmpty,
-                  text != self.lastPromptedClipboard,
-                  text != self.activeTab?.urlString,
-                  let url = self.extractHTTPURL(from: text) else { return }
-            self.lastPromptedClipboard = text
-            self.activeToast = ToastNotice(
-                message: L10n.t("检测到剪贴板链接：", "Clipboard URL detected: ") + (url.host ?? url.absoluteString),
-                actionTitle: L10n.t("立即打开", "Open"),
-                urlToOpen: url.absoluteString,
-                handoff: nil
-            )
-            let toastId = self.activeToast?.id
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-                if self?.activeToast?.id == toastId {
-                    self?.activeToast = nil
+        // Use privacy-safe detectPatterns first so copying ordinary text NEVER triggers iOS system paste banners
+        board.detectPatterns(for: [.probableWebURL]) { [weak self] result in
+            let isWebURL = (try? result.get().contains(.probableWebURL)) ?? false
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.hasClipboardWebURL = isWebURL
+                guard isWebURL else { return }
+                guard let text = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !text.isEmpty,
+                      text != self.lastPromptedClipboard,
+                      text != self.activeTab?.urlString,
+                      let url = self.extractHTTPURL(from: text) else { return }
+                self.lastPromptedClipboard = text
+                self.activeToast = ToastNotice(
+                    message: L10n.t("检测到剪贴板链接：", "Clipboard URL detected: ") + (url.host ?? url.absoluteString),
+                    actionTitle: L10n.t("立即打开", "Open"),
+                    urlToOpen: url.absoluteString,
+                    handoff: nil
+                )
+                let toastId = self.activeToast?.id
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                    if self?.activeToast?.id == toastId {
+                        self?.activeToast = nil
+                    }
                 }
             }
         }
