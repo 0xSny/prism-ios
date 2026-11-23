@@ -573,7 +573,8 @@ private struct DockAddressPill: View {
                 }
                 .padding(.leading, 12)
                 .padding(.trailing, tab.isNewTab ? 12 : 4)
-                .frame(maxWidth: .infinity, height: 36)
+                .frame(height: 36)
+                .frame(maxWidth: .infinity)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)

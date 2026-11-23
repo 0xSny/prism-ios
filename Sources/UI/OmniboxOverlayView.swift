@@ -987,10 +987,9 @@ struct OmniboxInlineOverlay: View {
               return count;
             })()
             """
-            wv.evaluateJavaScript(js) { val, _ in
-                if !Task.isCancelled {
-                    pageMatchCount = val as? Int
-                }
+            let val = try? await wv.evaluateJavaScript(js)
+            if !Task.isCancelled {
+                pageMatchCount = val as? Int
             }
         }
     }
