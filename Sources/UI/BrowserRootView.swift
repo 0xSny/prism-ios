@@ -1,7 +1,15 @@
 import Combine
+import Photos
+import PhotosUI
 import SwiftUI
 import UIKit
 import WebKit
+
+private struct ImagePreviewBox: Identifiable {
+    let id = UUID()
+    let image: UIImage
+    let title: String?
+}
 
 struct BrowserRootView: View {
     @ObservedObject var syncEngine: SyncEngine
@@ -12,6 +20,9 @@ struct BrowserRootView: View {
     @State private var omniboxInput = ""
     @State private var showTabSwitcher = false
     @State private var activeSheet: ActiveSheet?
+    @State private var showPhotoPickerSheet = false
+    @State private var selectedPhotoItem: PhotosPickerItem? = nil
+    @State private var fullscreenImageBox: ImagePreviewBox? = nil
 
     @State private var isSpeed2x = false
     @State private var prevPlaybackRateBefore2x: Double = 1.0
@@ -119,19 +130,43 @@ struct BrowserRootView: View {
             // Floating Overlays Above Bottom Thumb Bar
             VStack(spacing: 8) {
                 if let handoff = handoffService.latestIncoming {
-                    HandoffBannerView(payload: handoff) {
-                        if let raw = handoff.url, let url = URL(string: raw) {
-                            let seek = (handoff.videoSeconds ?? 0) > 0 ? handoff.videoSeconds : nil
-                            tabManager.createTab(url: url, activate: true, seekSeconds: seek)
-                        } else if let text = handoff.text {
-                            UIPasteboard.general.string = text
-                            tabManager.syncClipboardChangeCount()
-                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                            showTopCapsuleToast(L10n.t("📋 已同步来自电脑的剪贴板", "📋 Synced clipboard from desktop"))
+                    if handoff.kind == "image" {
+                        IncomingImageHandoffCard(
+                            payload: handoff,
+                            onSaveToAlbum: { img in
+                                saveIncomingImageToAlbum(img)
+                                handoffService.latestIncoming = nil
+                            },
+                            onCopyImage: { img in
+                                UIPasteboard.general.image = img
+                                tabManager.syncClipboardChangeCount()
+                                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                                showTopCapsuleToast(L10n.t("已复制图片到剪贴板", "Image copied to clipboard"))
+                                handoffService.latestIncoming = nil
+                            },
+                            onPreviewFullscreen: { img in
+                                fullscreenImageBox = ImagePreviewBox(image: img, title: handoff.filename ?? handoff.title)
+                            },
+                            onDismiss: {
+                                handoffService.latestIncoming = nil
+                            }
+                        )
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    } else {
+                        HandoffBannerView(payload: handoff) {
+                            if let raw = handoff.url, let url = URL(string: raw) {
+                                let seek = (handoff.videoSeconds ?? 0) > 0 ? handoff.videoSeconds : nil
+                                tabManager.createTab(url: url, activate: true, seekSeconds: seek)
+                            } else if let text = handoff.text {
+                                UIPasteboard.general.string = text
+                                tabManager.syncClipboardChangeCount()
+                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                showTopCapsuleToast(L10n.t("📋 已同步来自电脑的剪贴板", "📋 Synced clipboard from desktop"))
+                            }
+                            handoffService.latestIncoming = nil
+                        } onDismiss: {
+                            handoffService.latestIncoming = nil
                         }
-                        handoffService.latestIncoming = nil
-                    } onDismiss: {
-                        handoffService.latestIncoming = nil
                     }
                 }
 
@@ -158,6 +193,7 @@ struct BrowserRootView: View {
                         syncEngine: syncEngine,
                         tabManager: tabManager,
                         onRequireAccount: { activeSheet = .account },
+                        onSendPhotoToDesktop: { showPhotoPickerSheet = true },
                         onVideoScrub: { deltaX, ended in
                             if !ended {
                                 withAnimation(.spring(response: 0.22, dampingFraction: 0.85)) {
@@ -183,11 +219,12 @@ struct BrowserRootView: View {
                         tabManager: tabManager,
                         handoffService: handoffService,
                         onTapOmnibox: {
-                            omniboxInput = ""
+                            omniboxInput = (currentTab?.isNewTab == true) ? "" : (currentTab?.urlString ?? "")
                             withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
                                 showOmniboxEditor = true
                             }
                         },
+                        onSendPhotoToDesktop: { showPhotoPickerSheet = true },
                         onOpenTabs: {
                             tabManager.captureActiveSnapshot()
                             showTabSwitcher = true
@@ -309,12 +346,20 @@ struct BrowserRootView: View {
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
             case .menu:
-                MenuSheetView(syncEngine: syncEngine, tabManager: tabManager, handoffService: handoffService) { target in
-                    activeSheet = nil
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) {
-                        activeSheet = target
+                MenuSheetView(
+                    syncEngine: syncEngine,
+                    tabManager: tabManager,
+                    handoffService: handoffService,
+                    onOpenSubSheet: { target in
+                        activeSheet = nil
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) {
+                            activeSheet = target
+                        }
+                    },
+                    onSendPhotoToDesktop: {
+                        showPhotoPickerSheet = true
                     }
-                }
+                )
             case .account:
                 AccountSheetView(syncEngine: syncEngine)
             case .profiles:
@@ -336,6 +381,72 @@ struct BrowserRootView: View {
         .preferredColorScheme(
             tabManager.appTheme == .dark ? .dark : (tabManager.appTheme == .light ? .light : nil)
         )
+        .photosPicker(isPresented: $showPhotoPickerSheet, selection: $selectedPhotoItem, matching: .images)
+        .onChange(of: selectedPhotoItem) { _, item in
+            guard let item else { return }
+            selectedPhotoItem = nil
+            handlePickedPhotoItem(item)
+        }
+        .fullScreenCover(item: $fullscreenImageBox) { box in
+            FullscreenImagePreviewView(image: box.image, title: box.title) {
+                fullscreenImageBox = nil
+            } onSave: {
+                saveIncomingImageToAlbum(box.image)
+            } onCopy: {
+                UIPasteboard.general.image = box.image
+                tabManager.syncClipboardChangeCount()
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                showTopCapsuleToast(L10n.t("已复制图片到剪贴板", "Image copied to clipboard"))
+            }
+        }
+    }
+
+    private func handlePickedPhotoItem(_ item: PhotosPickerItem) {
+        guard syncEngine.loggedIn else {
+            tabManager.showToast(L10n.t("请先登录 Prism Account 再发送图片", "Sign in to Prism Account first"))
+            activeSheet = .account
+            return
+        }
+        tabManager.showToast(L10n.t("正在压缩并加密发送图片...", "Compressing & sending image..."))
+        Task {
+            let data = try? await item.loadTransferable(type: Data.self)
+            let ok: Bool = if let data, !data.isEmpty {
+                await handoffService.pushImage(rawData: data, title: L10n.t("相册图片", "Album Photo"), syncEngine: syncEngine)
+            } else {
+                false
+            }
+            if ok {
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                showTopCapsuleToast(L10n.t("🖼 已加密发送图片至电脑", "🖼 Encrypted photo sent to desktop"))
+            } else {
+                tabManager.showToast(L10n.t("图片发送失败，请重试", "Failed to send image"))
+            }
+        }
+    }
+
+    private func saveIncomingImageToAlbum(_ image: UIImage) {
+        Task {
+            let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+            if status == .authorized || status == .limited {
+                do {
+                    try await PHPhotoLibrary.shared().performChanges {
+                        PHAssetChangeRequest.creationRequestForAsset(from: image)
+                    }
+                    await MainActor.run {
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                        showTopCapsuleToast(L10n.t("已保存到系统相册", "Saved to Photos"))
+                    }
+                } catch {
+                    await MainActor.run {
+                        BrowserRootView.presentSystemShareSheet(items: [image])
+                    }
+                }
+            } else {
+                await MainActor.run {
+                    BrowserRootView.presentSystemShareSheet(items: [image])
+                }
+            }
+        }
     }
 
     private func showTopCapsuleToast(_ message: String, actionTitle: String? = nil, urlToOpen: String? = nil) {
@@ -358,6 +469,11 @@ struct BrowserRootView: View {
     private func handleIncomingHandoff(_ payload: HandoffPayload?) {
         guard let payload else { return }
         let kind = payload.kind.lowercased()
+        if kind == "image" {
+            // Keep latestIncoming intact so user explicitly chooses Save or Copy on the preview card
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            return
+        }
         if kind == "clipboard" {
             let text = payload.text ?? ""
             if !text.isEmpty {
@@ -435,6 +551,7 @@ private struct BottomThumbDock: View {
     @ObservedObject var tabManager: TabManager
     @ObservedObject var handoffService: HandoffService
     let onTapOmnibox: () -> Void
+    var onSendPhotoToDesktop: (() -> Void)? = nil
     let onOpenTabs: () -> Void
     let onOpenProfiles: () -> Void
     let onOpenMenu: () -> Void
@@ -473,6 +590,7 @@ private struct BottomThumbDock: View {
                     syncEngine: syncEngine,
                     handoffService: handoffService,
                     onTapOmnibox: onTapOmnibox,
+                    onSendPhotoToDesktop: onSendPhotoToDesktop,
                     onRequireAccount: onRequireAccount,
                     onSwitchTabOffset: onSwitchTabOffset,
                     onPullUpTabs: onPullUpTabs
@@ -558,6 +676,7 @@ private struct DockAddressPill: View {
     @ObservedObject var syncEngine: SyncEngine
     @ObservedObject var handoffService: HandoffService
     let onTapOmnibox: () -> Void
+    var onSendPhotoToDesktop: (() -> Void)? = nil
     let onRequireAccount: () -> Void
     let onSwitchTabOffset: (Int) -> Void
     let onPullUpTabs: () -> Void
@@ -652,6 +771,26 @@ private struct DockAddressPill: View {
                 } label: {
                     Label(L10n.t("发送至电脑", "Send to Desktop"), systemImage: "laptopcomputer")
                 }
+            }
+
+            Button {
+                guard syncEngine.loggedIn else {
+                    onRequireAccount()
+                    return
+                }
+                onSendPhotoToDesktop?()
+            } label: {
+                Label(L10n.t("🖼 发送相册图片至电脑", "🖼 Send Photo to Desktop"), systemImage: "photo.on.rectangle.angled")
+            }
+
+            Button {
+                guard syncEngine.loggedIn else {
+                    onRequireAccount()
+                    return
+                }
+                tabManager.pushSmartClipboardToDesktop()
+            } label: {
+                Label(L10n.t("📋 发送剪贴板至电脑", "📋 Send Clipboard to Desktop"), systemImage: "doc.on.clipboard")
             }
         }
         .simultaneousGesture(
@@ -1001,6 +1140,7 @@ private struct VideoMiniStrip: View {
     @ObservedObject var syncEngine: SyncEngine
     @ObservedObject var tabManager: TabManager
     let onRequireAccount: () -> Void
+    var onSendPhotoToDesktop: (() -> Void)? = nil
     var onVideoScrub: ((CGFloat, Bool) -> Void)? = nil
 
     @State private var sendState: SendState = .idle
@@ -1077,6 +1217,27 @@ private struct VideoMiniStrip: View {
             .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
         }
         .buttonStyle(PrismTactileButtonStyle())
+        .contextMenu {
+            Button {
+                guard syncEngine.loggedIn else {
+                    onRequireAccount()
+                    return
+                }
+                onSendPhotoToDesktop?()
+            } label: {
+                Label(L10n.t("🖼 发送相册图片至电脑", "🖼 Send Photo to Desktop"), systemImage: "photo.on.rectangle.angled")
+            }
+
+            Button {
+                guard syncEngine.loggedIn else {
+                    onRequireAccount()
+                    return
+                }
+                tabManager.pushSmartClipboardToDesktop()
+            } label: {
+                Label(L10n.t("📋 发送剪贴板至电脑", "📋 Send Clipboard to Desktop"), systemImage: "doc.on.clipboard")
+            }
+        }
         .simultaneousGesture(
             DragGesture(minimumDistance: 16)
                 .onChanged { val in
@@ -1204,6 +1365,163 @@ private struct BlockedAppJumpBanner: View {
             Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.12), radius: 8, y: 2)
+    }
+}
+
+private struct IncomingImageHandoffCard: View {
+    let payload: HandoffPayload
+    let onSaveToAlbum: (UIImage) -> Void
+    let onCopyImage: (UIImage) -> Void
+    let onPreviewFullscreen: (UIImage) -> Void
+    let onDismiss: () -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        let isDark = (colorScheme == .dark)
+        let decoded = payload.imageDataUrl.flatMap { HandoffService.decodeImage(fromDataUrl: $0) }
+        let shape = RoundedRectangle(cornerRadius: 22, style: .continuous)
+
+        HStack(spacing: 12) {
+            if let img = decoded {
+                Button {
+                    onPreviewFullscreen(img)
+                } label: {
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 68, height: 68)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .stroke(Color.white.opacity(isDark ? 0.25 : 0.9), lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+            } else {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color.blue.opacity(0.14))
+                    .frame(width: 68, height: 68)
+                    .overlay(Image(systemName: "photo").foregroundStyle(.blue))
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Text(L10n.t("💻 收到来自电脑的图片", "💻 Image from Desktop"))
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Button(action: onDismiss) {
+                        Image(systemName: "xmark")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 24, height: 24)
+                            .background(Color.primary.opacity(0.08), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                HStack(spacing: 8) {
+                    if let img = decoded {
+                        Button {
+                            onSaveToAlbum(img)
+                        } label: {
+                            Label(L10n.t("保存到相册", "Save"), systemImage: "square.and.arrow.down")
+                                .font(.caption.weight(.semibold))
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 7)
+                                .background(Color.blue, in: Capsule())
+                                .foregroundStyle(.white)
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            onCopyImage(img)
+                        } label: {
+                            Label(L10n.t("复制图片", "Copy"), systemImage: "doc.on.doc")
+                                .font(.caption.weight(.semibold))
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 7)
+                                .background(Color.primary.opacity(isDark ? 0.14 : 0.08), in: Capsule())
+                                .foregroundStyle(.primary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(
+            ZStack {
+                shape.fill(.ultraThinMaterial)
+                shape.fill(Color.white.opacity(isDark ? 0.06 : 0.84))
+            }
+        )
+        .clipShape(shape)
+        .overlay(
+            shape.stroke(Color.white.opacity(isDark ? 0.22 : 0.95), lineWidth: 1.1)
+        )
+        .shadow(color: Color.black.opacity(isDark ? 0.34 : 0.14), radius: 14, y: 5)
+    }
+}
+
+private struct FullscreenImagePreviewView: View {
+    let image: UIImage
+    let title: String?
+    let onClose: () -> Void
+    let onSave: () -> Void
+    let onCopy: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFit()
+                .ignoresSafeArea()
+                .onTapGesture(perform: onClose)
+
+            VStack {
+                HStack {
+                    if let title, !title.isEmpty {
+                        Text(title)
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.9))
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 34, height: 34)
+                            .background(Color.white.opacity(0.18), in: Circle())
+                    }
+                }
+                .padding()
+                Spacer()
+                HStack(spacing: 14) {
+                    Button(action: onSave) {
+                        Label(L10n.t("保存到相册", "Save to Photos"), systemImage: "square.and.arrow.down")
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 11)
+                            .background(Color.blue, in: Capsule())
+                            .foregroundStyle(.white)
+                    }
+                    Button(action: onCopy) {
+                        Label(L10n.t("复制图片", "Copy Image"), systemImage: "doc.on.doc")
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 11)
+                            .background(Color.white.opacity(0.20), in: Capsule())
+                            .foregroundStyle(.white)
+                    }
+                }
+                .padding(.bottom, 28)
+            }
+        }
     }
 }
 

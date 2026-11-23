@@ -114,29 +114,71 @@ private final class OmniboxRemoteSuggester: ObservableObject {
 
 private struct LiquidGlassBubbleModifier: ViewModifier {
     var isProminent: Bool = false
+    var cornerRadius: CGFloat = 24
     @Environment(\.colorScheme) private var colorScheme
 
     func body(content: Content) -> some View {
         let isDark = (colorScheme == .dark)
-        let shape = RoundedRectangle(cornerRadius: 24, style: .continuous)
-        let strokeColors: [Color] = isProminent
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        let fillColors: [Color] = isDark
             ? [
-                Color(hex: "#60A5FA")?.opacity(isDark ? 0.65 : 0.72) ?? Color.blue.opacity(0.6),
-                Color.white.opacity(isDark ? 0.48 : 0.90),
-                Color(hex: "#A855F7")?.opacity(isDark ? 0.45 : 0.42) ?? Color.purple.opacity(0.4),
-                Color.white.opacity(0.09)
+                Color.white.opacity(isProminent ? 0.13 : 0.08),
+                Color.white.opacity(isProminent ? 0.05 : 0.03)
             ]
             : [
-                Color.white.opacity(isDark ? 0.42 : 0.85),
-                Color.white.opacity(isDark ? 0.14 : 0.30),
-                Color.white.opacity(0.08)
+                Color.white.opacity(isProminent ? 0.90 : 0.88),
+                Color.white.opacity(isProminent ? 0.76 : 0.70)
             ]
+        let strokeColors: [Color] = isProminent
+            ? (isDark
+                ? [
+                    Color(hex: "#60A5FA")?.opacity(0.70) ?? Color.blue.opacity(0.65),
+                    Color.white.opacity(0.45),
+                    Color(hex: "#A855F7")?.opacity(0.42) ?? Color.purple.opacity(0.4),
+                    Color.white.opacity(0.12)
+                ]
+                : [
+                    Color(hex: "#93C5FD")?.opacity(0.95) ?? Color.blue.opacity(0.6),
+                    Color.white,
+                    Color(hex: "#BAE6FD")?.opacity(0.85) ?? Color.cyan.opacity(0.5),
+                    Color.white.opacity(0.80)
+                ])
+            : (isDark
+                ? [
+                    Color.white.opacity(0.38),
+                    Color.white.opacity(0.14),
+                    Color.white.opacity(0.08)
+                ]
+                : [
+                    Color.white,
+                    Color.white.opacity(0.75),
+                    Color.white.opacity(0.55)
+                ])
 
         content
             .background(
                 ZStack {
                     shape.fill(.ultraThinMaterial)
-                    shape.fill(Color.white.opacity(isDark ? (isProminent ? 0.08 : 0.04) : (isProminent ? 0.26 : 0.14)))
+                    shape.fill(
+                        LinearGradient(
+                            colors: fillColors,
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    // Top inner specular highlight rim
+                    shape.strokeBorder(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(isDark ? 0.28 : 0.96),
+                                Color.white.opacity(isDark ? 0.04 : 0.25),
+                                .clear
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        lineWidth: 1.0
+                    )
                 }
             )
             .clipShape(shape)
@@ -147,12 +189,14 @@ private struct LiquidGlassBubbleModifier: ViewModifier {
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     ),
-                    lineWidth: 1.0
+                    lineWidth: isDark ? 1.0 : 1.2
                 )
             )
             .shadow(
-                color: Color.black.opacity(isDark ? (isProminent ? 0.34 : 0.24) : (isProminent ? 0.16 : 0.10)),
-                radius: isProminent ? 14 : 9,
+                color: isDark
+                    ? Color.black.opacity(isProminent ? 0.36 : 0.24)
+                    : Color(red: 0.08, green: 0.14, blue: 0.28).opacity(isProminent ? 0.13 : 0.08),
+                radius: isProminent ? 16 : 11,
                 x: 0,
                 y: isProminent ? 6 : 4
             )
@@ -160,8 +204,8 @@ private struct LiquidGlassBubbleModifier: ViewModifier {
 }
 
 private extension View {
-    func liquidGlassBubble(isProminent: Bool = false) -> some View {
-        modifier(LiquidGlassBubbleModifier(isProminent: isProminent))
+    func liquidGlassBubble(isProminent: Bool = false, cornerRadius: CGFloat = 24) -> some View {
+        modifier(LiquidGlassBubbleModifier(isProminent: isProminent, cornerRadius: cornerRadius))
     }
 }
 
@@ -193,6 +237,7 @@ struct OmniboxInlineOverlay: View {
     let onFindInPage: (String) -> Void
     let onDismiss: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var smartEngine = SmartOmniboxEngine.shared
     @StateObject private var remoteSuggester = OmniboxRemoteSuggester()
     @State private var pageMatchCount: Int?
@@ -201,6 +246,9 @@ struct OmniboxInlineOverlay: View {
     @State private var isDismissing: Bool = false
     @State private var copiedCurrentURLFeedback = false
     @State private var copiedAnswerFeedback = false
+    @State private var baselinePrefilledText: String = ""
+    @State private var userModifiedQuery: Bool = false
+    @State private var cursorMoveNonce: Int = 0
 
     private enum PrimaryBubbleKind {
         case instantAnswer(InstantAnswerResult)
@@ -233,7 +281,9 @@ struct OmniboxInlineOverlay: View {
     }
 
     private func buildBody() -> some View {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isDark = (colorScheme == .dark)
+        let rawTrimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = userModifiedQuery ? rawTrimmed : ""
         let q = trimmed.lowercased()
         let quickSite = !trimmed.isEmpty ? SmartOmniboxEngine.parseQuickSiteSearch(trimmed) : nil
         let instantAnswer = !trimmed.isEmpty ? SmartOmniboxEngine.evaluateInstantAnswer(trimmed) : nil
@@ -249,18 +299,24 @@ struct OmniboxInlineOverlay: View {
         let matchedTabs = ranked.tabs
         let libraryItems = ranked.library
         let remoteList = buildRemoteSearchList(trimmed: trimmed, rawLower: q, remote: remoteSuggester.suggestions)
-        let isExplicitURL = SmartOmniboxEngine.isLikelyExplicitURL(trimmed)
+        let isExplicitURL = SmartOmniboxEngine.isLikelyExplicitURL(rawTrimmed)
         let enterOpensTopHit = (quickSite == nil) && enterTopHitEnabled && !isExplicitURL && topHit != nil
         let preferGoKey = isExplicitURL || enterOpensTopHit || quickSite != nil
 
         return ZStack(alignment: .bottom) {
-            // Progressive Scrim: keeps live webpage beneath cleanly visible & translucent
+            // Progressive Mist Scrim: Bright frosted white mist in Light Mode, soft vignette in Dark Mode
             LinearGradient(
-                colors: [
-                    Color.black.opacity(0.08),
-                    Color.black.opacity(0.20),
-                    Color.black.opacity(0.36)
-                ],
+                colors: isDark
+                    ? [
+                        Color.black.opacity(0.10),
+                        Color.black.opacity(0.24),
+                        Color.black.opacity(0.42)
+                    ]
+                    : [
+                        Color.white.opacity(0.22),
+                        Color.white.opacity(0.46),
+                        Color.white.opacity(0.72)
+                    ],
                 startPoint: .top,
                 endPoint: .bottom
             )
@@ -324,6 +380,7 @@ struct OmniboxInlineOverlay: View {
                             text: $text,
                             placeholder: L10n.t("搜索或输入网址", "Search or enter website name"),
                             preferGoKey: preferGoKey,
+                            cursorMoveNonce: cursorMoveNonce,
                             onSubmit: { target in
                                 let t = target.trimmingCharacters(in: .whitespacesAndNewlines)
                                 guard !t.isEmpty else { return }
@@ -369,18 +426,39 @@ struct OmniboxInlineOverlay: View {
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundStyle(.primary)
                             .frame(width: 46, height: 46)
-                            .background(.ultraThinMaterial, in: Circle())
+                            .background(
+                                ZStack {
+                                    Circle().fill(.ultraThinMaterial)
+                                    Circle().fill(
+                                        LinearGradient(
+                                            colors: isDark
+                                                ? [Color.white.opacity(0.10), Color.white.opacity(0.04)]
+                                                : [Color.white.opacity(0.90), Color.white.opacity(0.72)],
+                                            startPoint: .topLeading,
+                                            endPoint: .bottomTrailing
+                                        )
+                                    )
+                                }
+                            )
                             .overlay(
                                 Circle().stroke(
                                     LinearGradient(
-                                        colors: [Color.white.opacity(0.6), Color.white.opacity(0.1)],
+                                        colors: isDark
+                                            ? [Color.white.opacity(0.45), Color.white.opacity(0.10)]
+                                            : [Color.white, Color.white.opacity(0.60)],
                                         startPoint: .topLeading,
                                         endPoint: .bottomTrailing
                                     ),
-                                    lineWidth: 1.0
+                                    lineWidth: isDark ? 1.0 : 1.2
                                 )
                             )
-                            .shadow(color: Color.black.opacity(0.16), radius: 10, y: 4)
+                            .shadow(
+                                color: isDark
+                                    ? Color.black.opacity(0.24)
+                                    : Color(red: 0.08, green: 0.14, blue: 0.28).opacity(0.09),
+                                radius: 10,
+                                y: 4
+                            )
                     }
                     .buttonStyle(LiquidGlassPressStyle())
                 }
@@ -404,14 +482,21 @@ struct OmniboxInlineOverlay: View {
             }
         }
         .onAppear {
+            baselinePrefilledText = text
+            userModifiedQuery = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             onRefreshClipboardPattern()
-            remoteSuggester.update(query: text, engine: searchEngine)
-            schedulePageMatchCount(text)
+            let initialQuery = userModifiedQuery ? text : ""
+            remoteSuggester.update(query: initialQuery, engine: searchEngine)
+            schedulePageMatchCount(initialQuery)
         }
         .onChange(of: text) { _, newValue in
             copiedAnswerFeedback = false
-            remoteSuggester.update(query: newValue, engine: searchEngine)
-            schedulePageMatchCount(newValue)
+            if !userModifiedQuery && newValue != baselinePrefilledText {
+                userModifiedQuery = true
+            }
+            let effectiveQuery = userModifiedQuery ? newValue : ""
+            remoteSuggester.update(query: effectiveQuery, engine: searchEngine)
+            schedulePageMatchCount(effectiveQuery)
         }
     }
 
@@ -460,8 +545,9 @@ struct OmniboxInlineOverlay: View {
             .liquidGlassBubble(isProminent: false)
         }
 
-        // Mid bubble: Recent Searches horizontal pills + Clear button
+        // Mid bubble: Recent Searches enclosed in a bright Liquid Glass tray
         if !smartEngine.recentSearches.isEmpty {
+            let isDark = (colorScheme == .dark)
             HStack(spacing: 8) {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
@@ -479,13 +565,20 @@ struct OmniboxInlineOverlay: View {
                                         .foregroundStyle(.primary)
                                         .lineLimit(1)
                                 }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .liquidGlassBubble(isProminent: false)
+                                .padding(.horizontal, 11)
+                                .padding(.vertical, 7)
+                                .background(
+                                    Color.white.opacity(isDark ? 0.12 : 0.88),
+                                    in: Capsule()
+                                )
+                                .overlay(
+                                    Capsule().stroke(Color.white.opacity(isDark ? 0.14 : 0.92), lineWidth: 0.8)
+                                )
                             }
                             .buttonStyle(LiquidGlassPressStyle())
                         }
                     }
+                    .padding(.vertical, 2)
                 }
 
                 Button {
@@ -495,11 +588,17 @@ struct OmniboxInlineOverlay: View {
                     Image(systemName: "trash")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
-                        .frame(width: 34, height: 34)
-                        .liquidGlassBubble(isProminent: false)
+                        .frame(width: 30, height: 30)
+                        .background(
+                            Color.white.opacity(isDark ? 0.12 : 0.84),
+                            in: Circle()
+                        )
                 }
                 .buttonStyle(LiquidGlassPressStyle())
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .liquidGlassBubble(isProminent: false, cornerRadius: 20)
         }
 
         // Lower bubble (#2 or #1): Current Webpage Action Bubble (Copy / Share / Edit URL)
@@ -551,6 +650,8 @@ struct OmniboxInlineOverlay: View {
 
                     Button {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        userModifiedQuery = true
+                        cursorMoveNonce += 1
                         text = cur.urlString
                     } label: {
                         Image(systemName: "pencil")
@@ -843,6 +944,8 @@ struct OmniboxInlineOverlay: View {
 
             if term.lowercased() != q {
                 Button {
+                    userModifiedQuery = true
+                    cursorMoveNonce += 1
                     text = term
                 } label: {
                     Image(systemName: "arrow.up.left")
@@ -935,7 +1038,13 @@ struct OmniboxInlineOverlay: View {
 
     private func reverseBoldSuggestionText(term: String, query: String) -> Text {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty, let range = term.range(of: q, options: .caseInsensitive) else {
+        guard !q.isEmpty else {
+            return Text(term).foregroundStyle(.primary)
+        }
+        if term.caseInsensitiveCompare(q) == .orderedSame {
+            return Text(term).fontWeight(.semibold).foregroundStyle(.primary)
+        }
+        guard let range = term.range(of: q, options: .caseInsensitive) else {
             return Text(term).foregroundStyle(.primary)
         }
         let before = String(term[..<range.lowerBound])

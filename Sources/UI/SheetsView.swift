@@ -7,6 +7,7 @@ struct MenuSheetView: View {
     @ObservedObject var tabManager: TabManager
     @ObservedObject var handoffService: HandoffService
     let onOpenSubSheet: (BrowserRootView.ActiveSheet) -> Void
+    var onSendPhotoToDesktop: (() -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -119,22 +120,40 @@ struct MenuSheetView: View {
                     }
                 }
 
-                if syncEngine.loggedIn, let tab = tabManager.activeTab, !tab.isNewTab {
-                    Section {
-                        Button {
-                            Task {
-                                let ok = await handoffService.push(
-                                    kind: tab.hasVideo ? "video" : "tab",
-                                    title: tab.title,
-                                    url: tab.urlString,
-                                    videoSeconds: tab.hasVideo ? tab.videoSeconds : nil,
-                                    syncEngine: syncEngine
-                                )
-                                tabManager.showToast(ok ? L10n.t("已推送到 Windows 桌面端", "Sent to Windows desktop") : L10n.t("发送失败", "Failed"))
+                if syncEngine.loggedIn {
+                    Section(L10n.t("跨端接力", "Cross-Device Handoff")) {
+                        if let tab = tabManager.activeTab, !tab.isNewTab {
+                            Button {
+                                Task {
+                                    let ok = await handoffService.push(
+                                        kind: tab.hasVideo ? "video" : "tab",
+                                        title: tab.title,
+                                        url: tab.urlString,
+                                        videoSeconds: tab.hasVideo ? tab.videoSeconds : nil,
+                                        syncEngine: syncEngine
+                                    )
+                                    tabManager.showToast(ok ? L10n.t("已推送到 Windows 桌面端", "Sent to Windows desktop") : L10n.t("发送失败", "Failed"))
+                                }
+                                dismiss()
+                            } label: {
+                                Label(L10n.t("发送当前页至 Windows 桌面端", "Send Tab to Windows Desktop"), systemImage: "laptopcomputer.and.arrow.down")
                             }
+                        }
+
+                        Button {
                             dismiss()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) {
+                                onSendPhotoToDesktop?()
+                            }
                         } label: {
-                            Label(L10n.t("发送当前页至 Windows 桌面端", "Send Tab to Windows Desktop"), systemImage: "laptopcomputer.and.arrow.down")
+                            Label(L10n.t("🖼 发送相册图片至电脑", "🖼 Send Photo to Desktop"), systemImage: "photo.on.rectangle.angled")
+                        }
+
+                        Button {
+                            dismiss()
+                            tabManager.pushSmartClipboardToDesktop()
+                        } label: {
+                            Label(L10n.t("📋 发送剪贴板至电脑", "📋 Send Clipboard to Desktop"), systemImage: "doc.on.clipboard")
                         }
                     }
                 }

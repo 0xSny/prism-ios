@@ -256,9 +256,9 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
                     webView.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('play');", completionHandler: nil)
                 case "pause":
                     webView.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('pause');", completionHandler: nil)
-                case "toggle":
+                case "toggle", "togglePlay":
                     webView.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('togglePlay');", completionHandler: nil)
-                case "seek":
+                case "seek", "seekTo":
                     let sec = max(0, positionSeconds ?? 0)
                     webView.evaluateJavaScript("window.__prismVideoControl && window.__prismVideoControl('seekTo', \(sec));", completionHandler: nil)
                 default:
@@ -572,6 +572,11 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         if let blockJumps = remote.blockRogueAppJumps, blockRogueAppJumps != blockJumps {
             isApplyingRemoteSettings = true
             blockRogueAppJumps = blockJumps
+            isApplyingRemoteSettings = false
+        }
+        if let enterTopHit = remote.omniboxEnterTopHitEnabled, omniboxEnterTopHitEnabled != enterTopHit {
+            isApplyingRemoteSettings = true
+            omniboxEnterTopHitEnabled = enterTopHit
             isApplyingRemoteSettings = false
         }
     }
@@ -1189,26 +1194,60 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             ? (usernameOverride ?? pending.username)
             : pending.username
         let now = Date().timeIntervalSince1970 * 1000
+        let entry: PasswordEntry
         if let idx = syncEngine.passwords.firstIndex(where: { $0.origin == pending.origin && $0.username == finalUser }) {
-            syncEngine.passwords[idx].password = pending.password
-            syncEngine.passwords[idx].updatedAt = now
+            var updated = syncEngine.passwords[idx]
+            updated.password = pending.password
+            updated.updatedAt = now
+            entry = updated
         } else {
-            syncEngine.passwords.insert(
-                PasswordEntry(
-                    id: UUID().uuidString,
-                    origin: pending.origin,
-                    username: finalUser,
-                    password: pending.password,
-                    note: nil,
-                    createdAt: now,
-                    updatedAt: now
-                ),
-                at: 0
+            entry = PasswordEntry(
+                id: UUID().uuidString,
+                origin: pending.origin,
+                username: finalUser,
+                password: pending.password,
+                note: nil,
+                createdAt: now,
+                updatedAt: now
             )
         }
+        syncEngine.markPasswordChanged(entry)
         tab.pendingPasswordSave = nil
-        syncEngine.notifyScopeDirty("passwords")
         showToast(L10n.t("已加密保存并同步密码", "Password saved & encrypted"))
+    }
+
+    func pushSmartClipboardToDesktop() {
+        guard let syncEngine, syncEngine.loggedIn, let handoffService else {
+            showToast(L10n.t("请先登录 Prism Account 后再发送", "Sign in to Prism Account first"))
+            return
+        }
+        let board = UIPasteboard.general
+        if board.hasImages, let img = board.image {
+            showToast(L10n.t("正在压缩并加密发送图片...", "Compressing & sending image..."))
+            Task {
+                let ok = await handoffService.pushImage(image: img, title: L10n.t("剪贴板图片", "Clipboard Image"), syncEngine: syncEngine)
+                if ok {
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    showToast(L10n.t("✅ 已加密发送剪贴板图片至电脑", "✅ Clipboard image sent to desktop"))
+                } else {
+                    showToast(L10n.t("图片发送失败，请重试", "Failed to send image"))
+                }
+            }
+            return
+        }
+        if let text = board.string?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+            Task {
+                let ok = await handoffService.push(kind: "clipboard", title: L10n.t("剪贴板文本", "Clipboard"), url: nil, text: text, syncEngine: syncEngine)
+                if ok {
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    showToast(L10n.t("✅ 已发送剪贴板至电脑端", "✅ Clipboard sent to desktop"))
+                } else {
+                    showToast(L10n.t("发送失败", "Failed"))
+                }
+            }
+            return
+        }
+        showToast(L10n.t("剪贴板为空，请先复制图片或文本", "Clipboard is empty"))
     }
 
     func refreshClipboardWebURLPatternSilently() {
@@ -1637,6 +1676,16 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
             .replacingOccurrences(of: ">", with: "&gt;")
             .replacingOccurrences(of: "\"", with: "&quot;")
             .replacingOccurrences(of: "'", with: "&#39;")
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        webView.scrollView.refreshControl?.endRefreshing()
+        guard let tab = tabs.first(where: { $0.webView === webView }), !tab.isNewTab else { return }
+        tab.isLoading = true
+        if activeTabId == tab.id {
+            showToast(L10n.t("网页渲染进程已自动恢复", "Web page process recovered"))
+        }
+        webView.reload()
     }
 
     func syncWebViewState(_ webView: WKWebView) {

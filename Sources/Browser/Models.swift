@@ -169,6 +169,7 @@ struct PortableSettings: Codable, Equatable {
     var autoSyncIntervalMinutes: Int?
     var builtInAdblockEnabled: Bool?
     var blockRogueAppJumps: Bool?
+    var omniboxEnterTopHitEnabled: Bool?
     var webDarkModeFollowTheme: Bool?
     var webDarkModeWhitelistHosts: [String]?
 }
@@ -204,18 +205,22 @@ struct AccountSessionDisk: Codable {
 
 struct HandoffPayload: Identifiable, Codable, Equatable {
     var id: String
-    var kind: String // "tab" | "video" | "clipboard"
+    var kind: String // "tab" | "video" | "clipboard" | "image"
     var type: String?
     var targetPlatform: String?
     var title: String?
     var url: String?
     var videoSeconds: Double?
     var text: String?
+    var imageDataUrl: String?
+    var imageWidth: Int?
+    var imageHeight: Int?
+    var filename: String?
     var fromDeviceName: String?
     var createdAt: Double
 
     enum CodingKeys: String, CodingKey {
-        case id, kind, type, targetPlatform, title, url, videoSeconds, text, fromDeviceName, createdAt
+        case id, kind, type, targetPlatform, title, url, videoSeconds, text, imageDataUrl, imageWidth, imageHeight, filename, fromDeviceName, createdAt
     }
 
     init(
@@ -227,6 +232,10 @@ struct HandoffPayload: Identifiable, Codable, Equatable {
         url: String? = nil,
         videoSeconds: Double? = nil,
         text: String? = nil,
+        imageDataUrl: String? = nil,
+        imageWidth: Int? = nil,
+        imageHeight: Int? = nil,
+        filename: String? = nil,
         fromDeviceName: String? = nil,
         createdAt: Double = Date().timeIntervalSince1970 * 1000
     ) {
@@ -238,6 +247,10 @@ struct HandoffPayload: Identifiable, Codable, Equatable {
         self.url = url
         self.videoSeconds = videoSeconds
         self.text = text
+        self.imageDataUrl = imageDataUrl
+        self.imageWidth = imageWidth
+        self.imageHeight = imageHeight
+        self.filename = filename
         self.fromDeviceName = fromDeviceName
         self.createdAt = createdAt
     }
@@ -254,6 +267,10 @@ struct HandoffPayload: Identifiable, Codable, Equatable {
         self.url = try container.decodeIfPresent(String.self, forKey: .url)
         self.videoSeconds = try container.decodeIfPresent(Double.self, forKey: .videoSeconds)
         self.text = try container.decodeIfPresent(String.self, forKey: .text)
+        self.imageDataUrl = try container.decodeIfPresent(String.self, forKey: .imageDataUrl)
+        self.imageWidth = try container.decodeIfPresent(Int.self, forKey: .imageWidth)
+        self.imageHeight = try container.decodeIfPresent(Int.self, forKey: .imageHeight)
+        self.filename = try container.decodeIfPresent(String.self, forKey: .filename)
         self.fromDeviceName = try container.decodeIfPresent(String.self, forKey: .fromDeviceName)
         self.createdAt = try container.decodeIfPresent(Double.self, forKey: .createdAt) ?? (Date().timeIntervalSince1970 * 1000)
     }

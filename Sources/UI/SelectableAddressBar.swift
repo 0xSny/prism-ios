@@ -21,6 +21,7 @@ struct SelectableAddressBar: UIViewRepresentable {
     @Binding var text: String
     var placeholder: String
     var preferGoKey: Bool = false
+    var cursorMoveNonce: Int = 0
     var onSubmit: (String) -> Void
     var onPasteAndGo: ((String) -> Void)?
 
@@ -31,6 +32,7 @@ struct SelectableAddressBar: UIViewRepresentable {
     func makeUIView(context: Context) -> UITextField {
         let tf = AutofocusAddressField(frame: .zero)
         tf.delegate = context.coordinator
+        tf.text = text
         tf.placeholder = placeholder
         tf.font = .systemFont(ofSize: 15, weight: .regular)
         tf.keyboardType = .default
@@ -45,6 +47,7 @@ struct SelectableAddressBar: UIViewRepresentable {
         tf.borderStyle = .none
         tf.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         tf.addTarget(context.coordinator, action: #selector(Coordinator.textChanged(_:)), for: .editingChanged)
+        context.coordinator.lastCursorMoveNonce = cursorMoveNonce
 
         // 40pt Keyboard Quick Input Accessory Bar
         let bar = UIToolbar(frame: CGRect(x: 0, y: 0, width: 320, height: 40))
@@ -81,8 +84,17 @@ struct SelectableAddressBar: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: UITextField, context: Context) {
+        let shouldMoveCursorToEnd = context.coordinator.lastCursorMoveNonce != cursorMoveNonce
+        if shouldMoveCursorToEnd {
+            context.coordinator.lastCursorMoveNonce = cursorMoveNonce
+        }
         if uiView.text != text {
             uiView.text = text
+            if shouldMoveCursorToEnd {
+                let end = uiView.endOfDocument
+                uiView.selectedTextRange = uiView.textRange(from: end, to: end)
+            }
+        } else if shouldMoveCursorToEnd {
             let end = uiView.endOfDocument
             uiView.selectedTextRange = uiView.textRange(from: end, to: end)
         }
@@ -99,6 +111,7 @@ struct SelectableAddressBar: UIViewRepresentable {
     final class Coordinator: NSObject, UITextFieldDelegate {
         var parent: SelectableAddressBar
         weak var textField: UITextField?
+        var lastCursorMoveNonce: Int = 0
 
         init(_ parent: SelectableAddressBar) {
             self.parent = parent

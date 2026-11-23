@@ -739,6 +739,9 @@ final class SyncEngine: ObservableObject {
             let storedBlockAppJumps = UserDefaults.standard.object(forKey: "prism.blockRogueAppJumps") != nil
                 ? UserDefaults.standard.bool(forKey: "prism.blockRogueAppJumps")
                 : true
+            let storedEnterTopHit = UserDefaults.standard.object(forKey: "prism.omniboxEnterTopHitEnabled") != nil
+                ? UserDefaults.standard.bool(forKey: "prism.omniboxEnterTopHitEnabled")
+                : true
             let portable = PortableSettings(
                 language: L10n.isEnglish ? .en : .zhCN,
                 theme: nil,
@@ -747,7 +750,8 @@ final class SyncEngine: ObservableObject {
                 stripTrackingParams: nil,
                 autoSyncIntervalMinutes: autoSyncIntervalMinutes,
                 builtInAdblockEnabled: nil,
-                blockRogueAppJumps: storedBlockAppJumps
+                blockRogueAppJumps: storedBlockAppJumps,
+                omniboxEnterTopHitEnabled: storedEnterTopHit
             )
             if let env = try? CryptoVault.encryptJSON(SettingsPayload(settings: portable, updatedAt: nowMs), encKey: encKey) {
                 out.append(SyncItemPayload(scope: "settings", itemId: "settings:portable", iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: nowMs))
@@ -757,8 +761,14 @@ final class SyncEngine: ObservableObject {
     }
 
     func markBookmarkChanged(_ bm: BookmarkItem) {
+        let syncId = bookmarkSyncId(bm)
+        if let idx = bookmarks.firstIndex(where: { $0.id == bm.id || bookmarkSyncId($0) == syncId }) {
+            bookmarks[idx] = bm
+        } else {
+            bookmarks.append(bm)
+        }
         dirtyBookmarkIds.insert(bm.id)
-        pendingTombstones.removeAll { $0.scope == "bookmarks" && $0.itemId == bookmarkSyncId(bm) }
+        pendingTombstones.removeAll { $0.scope == "bookmarks" && $0.itemId == syncId }
         saveLocalCache()
         notifyScopeDirty("bookmarks")
     }
@@ -775,6 +785,11 @@ final class SyncEngine: ObservableObject {
     }
 
     func markPasswordChanged(_ pw: PasswordEntry) {
+        if let idx = passwords.firstIndex(where: { $0.id == pw.id }) {
+            passwords[idx] = pw
+        } else {
+            passwords.insert(pw, at: 0)
+        }
         dirtyPasswordIds.insert(pw.id)
         pendingTombstones.removeAll { $0.scope == "passwords" && $0.itemId == "password:\(pw.id)" }
         saveLocalCache()

@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 @MainActor
 final class HandoffService: ObservableObject {
@@ -177,13 +178,138 @@ final class HandoffService: ObservableObject {
         await pollOnce(syncEngine: syncEngine)
     }
 
-    func push(kind: String, title: String?, url: String?, videoSeconds: Double? = nil, text: String? = nil, syncEngine: SyncEngine) async -> Bool {
+    struct PreparedHandoffImage: Sendable {
+        let dataUrl: String
+        let width: Int
+        let height: Int
+        let filename: String
+    }
+
+    nonisolated static func prepareImagePayload(rawData: Data?, image: UIImage?, preferredFilename: String? = nil) -> PreparedHandoffImage? {
+        let maxLosslessBytes = 550 * 1024
+        let maxCompressedBytes = 600 * 1024
+
+        let baseImage: UIImage? = image ?? rawData.flatMap { UIImage(data: $0) }
+        let pixelW = baseImage.map { Int(($0.size.width * $0.scale).rounded()) } ?? 0
+        let pixelH = baseImage.map { Int(($0.size.height * $0.scale).rounded()) } ?? 0
+
+        if let rawData, !rawData.isEmpty, rawData.count <= maxLosslessBytes {
+            if let detected = detectMimeAndExt(for: rawData) {
+                let fallbackName = "prism-image-\(Int(Date().timeIntervalSince1970)).\(detected.ext)"
+                let cleanName = (preferredFilename?.isEmpty == false ? preferredFilename! : fallbackName)
+                let b64 = rawData.base64EncodedString()
+                return PreparedHandoffImage(
+                    dataUrl: "data:\(detected.mime);base64,\(b64)",
+                    width: pixelW,
+                    height: pixelH,
+                    filename: cleanName
+                )
+            }
+        }
+
+        guard let sourceImage = baseImage else { return nil }
+
+        // Ensure orientation-normalized UIImage before encoding
+        let longEdges: [CGFloat] = [1920, 1440, 1080, 800]
+        let qualities: [CGFloat] = [0.82, 0.70, 0.56]
+
+        for maxEdge in longEdges {
+            let scaled = downscaleIfNeeded(sourceImage, maxLongEdge: maxEdge)
+            let w = Int((scaled.size.width * scaled.scale).rounded())
+            let h = Int((scaled.size.height * scaled.scale).rounded())
+            for q in qualities {
+                if let jpeg = scaled.jpegData(compressionQuality: q), jpeg.count <= maxCompressedBytes {
+                    let baseStem = ((preferredFilename as NSString?)?.deletingPathExtension).flatMap { $0.isEmpty ? nil : $0 } ?? "prism-image-\(Int(Date().timeIntervalSince1970))"
+                    let cleanName = "\(baseStem).jpg"
+                    return PreparedHandoffImage(
+                        dataUrl: "data:image/jpeg;base64,\(jpeg.base64EncodedString())",
+                        width: w,
+                        height: h,
+                        filename: cleanName
+                    )
+                }
+            }
+        }
+        return nil
+    }
+
+    nonisolated private static func detectMimeAndExt(for data: Data) -> (mime: String, ext: String)? {
+        guard data.count >= 12 else { return nil }
+        let bytes = [UInt8](data.prefix(12))
+        if bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47 {
+            return ("image/png", "png")
+        }
+        if bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+            return ("image/jpeg", "jpg")
+        }
+        if bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x46 &&
+            bytes[8] == 0x57 && bytes[9] == 0x45 && bytes[10] == 0x42 && bytes[11] == 0x50 {
+            return ("image/webp", "webp")
+        }
+        return nil
+    }
+
+    nonisolated private static func downscaleIfNeeded(_ image: UIImage, maxLongEdge: CGFloat) -> UIImage {
+        let size = image.size
+        let longEdge = max(size.width, size.height)
+        guard longEdge > 0 else { return image }
+        let targetSize: CGSize = longEdge > maxLongEdge
+            ? CGSize(width: floor(size.width * (maxLongEdge / longEdge)), height: floor(size.height * (maxLongEdge / longEdge)))
+            : size
+        let fmt = UIGraphicsImageRendererFormat()
+        fmt.scale = 1.0
+        fmt.opaque = false
+        let renderer = UIGraphicsImageRenderer(size: targetSize, format: fmt)
+        return renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+    }
+
+    nonisolated static func decodeImage(fromDataUrl dataUrl: String) -> UIImage? {
+        guard let commaIdx = dataUrl.firstIndex(of: ",") else { return nil }
+        let b64 = String(dataUrl[dataUrl.index(after: commaIdx)...])
+        guard let data = Data(base64Encoded: b64, options: .ignoreUnknownCharacters) else { return nil }
+        return UIImage(data: data)
+    }
+
+    func pushImage(rawData: Data? = nil, image: UIImage? = nil, filename: String? = nil, title: String? = nil, syncEngine: SyncEngine) async -> Bool {
+        let prepared = await Task.detached(priority: .userInitiated) {
+            Self.prepareImagePayload(rawData: rawData, image: image, preferredFilename: filename)
+        }.value
+        guard let prepared else { return false }
+        return await push(
+            kind: "image",
+            title: title ?? prepared.filename,
+            url: nil,
+            videoSeconds: nil,
+            text: nil,
+            imageDataUrl: prepared.dataUrl,
+            imageWidth: prepared.width > 0 ? prepared.width : nil,
+            imageHeight: prepared.height > 0 ? prepared.height : nil,
+            filename: prepared.filename,
+            syncEngine: syncEngine
+        )
+    }
+
+    func push(
+        kind: String,
+        title: String?,
+        url: String?,
+        videoSeconds: Double? = nil,
+        text: String? = nil,
+        imageDataUrl: String? = nil,
+        imageWidth: Int? = nil,
+        imageHeight: Int? = nil,
+        filename: String? = nil,
+        syncEngine: SyncEngine
+    ) async -> Bool {
         guard let token = syncEngine.currentToken,
               let encKey = syncEngine.currentEncKey,
               let endpoint = URL(string: "\(syncEngine.serverUrl)/api/handoff/push") else {
             return false
         }
         let payloadId = UUID().uuidString
+        let outerKind = (kind == "image") ? "clipboard" : kind
         let payload = HandoffPayload(
             id: payloadId,
             kind: kind,
@@ -193,6 +319,10 @@ final class HandoffService: ObservableObject {
             url: url,
             videoSeconds: videoSeconds,
             text: text,
+            imageDataUrl: imageDataUrl,
+            imageWidth: imageWidth,
+            imageHeight: imageHeight,
+            filename: filename,
             fromDeviceName: syncEngine.deviceName,
             createdAt: Date().timeIntervalSince1970 * 1000
         )
@@ -200,12 +330,13 @@ final class HandoffService: ObservableObject {
 
         var req = URLRequest(url: endpoint)
         req.httpMethod = "POST"
+        req.timeoutInterval = (kind == "image") ? 25.0 : 15.0
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: [
             "id": payloadId,
-            "kind": kind,
-            "type": kind,
+            "kind": outerKind,
+            "type": outerKind,
             "targetPlatform": "desktop",
             "iv": envelope.iv,
             "ciphertext": envelope.ciphertext,
@@ -261,7 +392,9 @@ final class HandoffService: ObservableObject {
                 seenIds.insert(item.id)
                 if var payload = try? CryptoVault.decryptJSON(HandoffPayload.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag) {
                     payload.id = item.id
-                    if payload.kind.isEmpty {
+                    if let imgData = payload.imageDataUrl, !imgData.isEmpty {
+                        payload.kind = "image"
+                    } else if payload.kind.isEmpty {
                         payload.kind = item.kind ?? item.type ?? "tab"
                     }
                     payload.fromDeviceName = item.fromDeviceName ?? payload.fromDeviceName
