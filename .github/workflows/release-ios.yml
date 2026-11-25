@@ -13,8 +13,8 @@ jobs:
   build-ios:
     runs-on: macos-15
     env:
-      APP_VERSION: "1.1.4"
-      BUILD_NUMBER: "1104"
+      APP_VERSION: "1.1.5"
+      BUILD_NUMBER: "1105"
       BUNDLE_ID: "com.zzaoo.prism.mobile"
     steps:
       - name: Checkout repository

@@ -1,3 +1,4 @@
+import CryptoKit
 import SwiftUI
 import UIKit
 
@@ -8,13 +9,26 @@ final class FaviconLoader {
     private let cache = NSCache<NSString, UIImage>()
     private var inFlight: Set<String> = []
     private var waiters: [String: [(UIImage?) -> Void]] = [:]
+    private let diskCacheDir: URL
+    private static let diskCacheTTL: TimeInterval = 7 * 24 * 60 * 60
 
     private init() {
         cache.countLimit = 300
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let dir = base.appendingPathComponent("Favicons", isDirectory: true)
+        self.diskCacheDir = dir
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
 
     static func normalizedHost(from urlString: String) -> String {
         SmartOmniboxEngine.hostOnly(urlString)
+    }
+
+    nonisolated private static func diskCacheFileURL(forHost host: String, in dir: URL) -> URL {
+        let digest = SHA256.hash(data: Data(host.utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return dir.appendingPathComponent("\(hex).img")
     }
 
     func cachedImage(forHost host: String) -> UIImage? {
@@ -36,20 +50,64 @@ final class FaviconLoader {
         guard !inFlight.contains(host) else { return }
         inFlight.insert(host)
 
-        guard let encoded = host.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let url = URL(string: "https://www.google.com/s2/favicons?domain=\(encoded)&sz=64") else {
-            finish(host: host, image: nil)
-            return
-        }
-
-        let request = URLRequest(url: url, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: 6.0)
+        let cacheDir = diskCacheDir
+        let ttl = Self.diskCacheTTL
         Task.detached(priority: .utility) {
-            let data: Data? = await Self.fetchIconData(request: request)
+            let fileURL = Self.diskCacheFileURL(forHost: host, in: cacheDir)
+            if let diskData = Self.readFreshDiskCache(at: fileURL, maxAge: ttl),
+               let diskImg = Self.decodeValidIcon(from: diskData) {
+                await MainActor.run {
+                    FaviconLoader.shared.finish(host: host, image: diskImg)
+                }
+                return
+            }
+
+            let fetchedData = await Self.fetchIconWithFallback(host: host)
+            let decodedImg = fetchedData.flatMap { Self.decodeValidIcon(from: $0) }
+            if let validData = fetchedData, decodedImg != nil {
+                try? validData.write(to: fileURL, options: .atomic)
+            }
             await MainActor.run {
-                let img: UIImage? = data.flatMap { UIImage(data: $0) }.flatMap { $0.size.width >= 8 ? $0 : nil }
-                FaviconLoader.shared.finish(host: host, image: img)
+                FaviconLoader.shared.finish(host: host, image: decodedImg)
             }
         }
+    }
+
+    nonisolated private static func readFreshDiskCache(at url: URL, maxAge: TimeInterval) -> Data? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let modDate = attrs[.modificationDate] as? Date else {
+            return nil
+        }
+        if Date().timeIntervalSince(modDate) > maxAge {
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+        return try? Data(contentsOf: url)
+    }
+
+    nonisolated private static func decodeValidIcon(from data: Data) -> UIImage? {
+        guard let img = UIImage(data: data), img.size.width >= 8, img.size.height >= 8 else {
+            return nil
+        }
+        return img
+    }
+
+    nonisolated private static func fetchIconWithFallback(host: String) async -> Data? {
+        if let encoded = host.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+           let s2Url = URL(string: "https://www.google.com/s2/favicons?domain=\(encoded)&sz=64") {
+            let s2Req = URLRequest(url: s2Url, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: 4.5)
+            if let data = await fetchIconData(request: s2Req), decodeValidIcon(from: data) != nil {
+                return data
+            }
+        }
+        // Fallback directly to https://<host>/favicon.ico when S2 is blocked or returns placeholder
+        if let directUrl = URL(string: "https://\(host)/favicon.ico") {
+            let directReq = URLRequest(url: directUrl, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: 4.5)
+            if let data = await fetchIconData(request: directReq), decodeValidIcon(from: data) != nil {
+                return data
+            }
+        }
+        return nil
     }
 
     nonisolated private static func fetchIconData(request: URLRequest) async -> Data? {

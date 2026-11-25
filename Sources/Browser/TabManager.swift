@@ -55,6 +55,7 @@ final class BrowserTab: ObservableObject, Identifiable {
     var topBackdropColor: UIColor?
     var pendingSeekSeconds: Double? = nil
     var lastUserInteractionAt: TimeInterval = 0
+    var lastActiveAt: TimeInterval = Date().timeIntervalSince1970
     var themeColorObservation: NSKeyValueObservation?
     var progressObservation: NSKeyValueObservation?
     var loadingObservation: NSKeyValueObservation?
@@ -83,7 +84,7 @@ final class BrowserTab: ObservableObject, Identifiable {
         }
     }
 
-    func teardown() {
+    func hibernate() {
         themeColorObservation?.invalidate()
         progressObservation?.invalidate()
         loadingObservation?.invalidate()
@@ -106,6 +107,13 @@ final class BrowserTab: ObservableObject, Identifiable {
             wv.removeFromSuperview()
         }
         webView = nil
+        isLoading = false
+        estimatedProgress = 0
+        // Intentionally preserve snapshot, title, urlString, and isNewTab for zero-jank tab switcher preview & lazy wake
+    }
+
+    func teardown() {
+        hibernate()
         snapshot = nil
     }
 }
@@ -122,8 +130,13 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     @Published var activeTabId: UUID? {
         didSet {
             guard !isRestoringSession else { return }
-            if let nextId = activeTabId, nextId != oldValue, nextId != skipAutoLazyLoadTabId {
-                loadLazyWebViewIfNeeded(for: tabs.first(where: { $0.id == nextId }))
+            if let nextId = activeTabId, nextId != oldValue {
+                let targetTab = tabs.first(where: { $0.id == nextId })
+                targetTab?.lastActiveAt = Date().timeIntervalSince1970
+                if nextId != skipAutoLazyLoadTabId {
+                    loadLazyWebViewIfNeeded(for: targetTab)
+                }
+                enforceBackgroundTabMemoryLimit()
             }
             scheduleSessionSave()
         }
@@ -287,7 +300,46 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
                 }
             }
         }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleMemoryWarningNotification),
+            name: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil
+        )
         restoreSessionOrCreateDefault()
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    @objc private func handleMemoryWarningNotification() {
+        hibernateAllBackgroundTabs()
+    }
+
+    private func hibernateAllBackgroundTabs() {
+        for tab in tabs {
+            guard tab.id != activeTabId, tab.webView != nil else { continue }
+            tab.hibernate()
+        }
+    }
+
+    private func enforceBackgroundTabMemoryLimit(maxLiveTabs: Int = 6) {
+        let liveTabs = tabs.filter { $0.webView != nil }
+        guard liveTabs.count > maxLiveTabs else { return }
+        let candidates = liveTabs
+            .filter { tab in
+                if tab.id == activeTabId { return false }
+                // Exempt tabs currently playing audio/video
+                if tab.hasVideo && !tab.videoPaused { return false }
+                return true
+            }
+            .sorted { $0.lastActiveAt < $1.lastActiveAt }
+
+        let excessCount = liveTabs.count - maxLiveTabs
+        for tab in candidates.prefix(excessCount) {
+            tab.hibernate()
+        }
     }
 
     var isEffectiveAppDark: Bool {
@@ -1713,11 +1765,15 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         webView.scrollView.refreshControl?.endRefreshing()
         guard let tab = tabs.first(where: { $0.webView === webView }), !tab.isNewTab else { return }
-        tab.isLoading = true
         if activeTabId == tab.id {
+            tab.isLoading = true
             showToast(L10n.t("网页渲染进程已自动恢复", "Web page process recovered"))
+            webView.reload()
+        } else {
+            // Never reload background tabs after Jetsam termination (prevents cascading OOM reload storm).
+            // Hibernate cleanly preserving snapshot/title/url so switching back wakes lazily.
+            tab.hibernate()
         }
-        webView.reload()
     }
 
     func syncWebViewState(_ webView: WKWebView) {
@@ -2075,8 +2131,8 @@ private enum WebDarkModeScripts {
                 pending = true;
                 if (!observedPendingLinks.has(ln)) {
                   observedPendingLinks.add(ln);
-                  ln.addEventListener('load', () => evaluateAndApply(true), { once: true });
-                  ln.addEventListener('error', () => evaluateAndApply(false), { once: true });
+                  ln.addEventListener('load', () => evaluateAndApply(true, true), { once: true });
+                  ln.addEventListener('error', () => evaluateAndApply(false, true), { once: true });
                 }
               }
             }
@@ -2225,9 +2281,18 @@ private enum WebDarkModeScripts {
             sampleAndPostTopColor(Boolean(forcePost));
           };
 
-          function evaluateAndApply(forceTopColor) {
+          let cachedNativeDark = null;
+          let lastEvaluatedUrl = '';
+
+          function evaluateAndApply(forceTopColor, forceRecheck) {
             const root = document.documentElement;
             if (!root) return;
+
+            const currentUrl = location.href;
+            if (currentUrl !== lastEvaluatedUrl) {
+              cachedNativeDark = null;
+              lastEvaluatedUrl = currentUrl;
+            }
 
             isApplyingInternal = true;
             try {
@@ -2240,11 +2305,16 @@ private enum WebDarkModeScripts {
 
               helper.ensureColorSchemeMeta(true);
               helper.ensureDarkStyle();
-              if (isAlreadyDarkPage()) {
-                root.setAttribute('data-prism-dark', '0');
+              let isDarkNative;
+              if (!forceRecheck && cachedNativeDark !== null) {
+                isDarkNative = cachedNativeDark;
               } else {
-                root.setAttribute('data-prism-dark', '1');
+                isDarkNative = isAlreadyDarkPage();
+                if (!hasPendingStylesheets()) {
+                  cachedNativeDark = isDarkNative;
+                }
               }
+              root.setAttribute('data-prism-dark', isDarkNative ? '0' : '1');
               sampleAndPostTopColor(Boolean(forceTopColor));
             } finally {
               isApplyingInternal = false;
@@ -2259,35 +2329,41 @@ private enum WebDarkModeScripts {
 
           window.__prismSetWebDark = function(enabled) {
             window.__prismWebDarkEnabled = Boolean(enabled);
-            evaluateAndApply(true);
+            cachedNativeDark = null;
+            evaluateAndApply(true, true);
           };
 
           window.__prismOnTraitChanged = function() {
             if (typeof window.__prismComputeWebDarkEnabled === 'function') {
               window.__prismWebDarkEnabled = window.__prismComputeWebDarkEnabled();
             }
-            evaluateAndApply(true);
+            cachedNativeDark = null;
+            evaluateAndApply(true, true);
             if (typeof requestAnimationFrame === 'function') {
-              requestAnimationFrame(() => evaluateAndApply(true));
+              requestAnimationFrame(() => evaluateAndApply(true, true));
             }
           };
 
           // Full lifecycle healing: DOMContentLoaded + window.load + pageshow (BFCache back/forward)
-          evaluateAndApply(true);
+          evaluateAndApply(true, true);
           if (typeof requestAnimationFrame === 'function') {
-            requestAnimationFrame(() => evaluateAndApply(true));
+            requestAnimationFrame(() => evaluateAndApply(true, false));
           }
-          setTimeout(() => evaluateAndApply(false), 350);
+          setTimeout(() => evaluateAndApply(false, cachedNativeDark === null), 350);
 
           if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', () => evaluateAndApply(true), { once: true });
+            document.addEventListener('DOMContentLoaded', () => evaluateAndApply(true, true), { once: true });
           }
-          window.addEventListener('load', () => evaluateAndApply(true));
+          window.addEventListener('load', () => {
+            cachedNativeDark = null;
+            evaluateAndApply(true, true);
+          });
           window.addEventListener('pageshow', () => {
             if (typeof window.__prismComputeWebDarkEnabled === 'function') {
               window.__prismWebDarkEnabled = window.__prismComputeWebDarkEnabled();
             }
-            evaluateAndApply(true);
+            cachedNativeDark = null;
+            evaluateAndApply(true, true);
           });
 
           if (window.matchMedia) {
@@ -2301,12 +2377,12 @@ private enum WebDarkModeScripts {
           }
 
           let rafScheduled = false;
-          const scheduleHealingPass = () => {
+          const scheduleHealingPass = (forceRecheck) => {
             if (isApplyingInternal || rafScheduled) return;
             rafScheduled = true;
             const runPass = () => {
               rafScheduled = false;
-              evaluateAndApply(false);
+              evaluateAndApply(false, Boolean(forceRecheck));
             };
             if (typeof requestAnimationFrame === 'function') {
               requestAnimationFrame(runPass);
@@ -2315,18 +2391,27 @@ private enum WebDarkModeScripts {
             }
           };
 
-          // Self-healing MutationObserver guarding head + documentElement (catches SPA hydration stripping styles/attributes)
+          // Self-healing MutationObserver guarding head + documentElement with O(1) fast-path short-circuit
           if (typeof MutationObserver === 'function') {
             const mo = new MutationObserver(() => {
               if (isApplyingInternal) return;
+              const root = document.documentElement;
+              const urlChanged = location.href !== lastEvaluatedUrl;
               if (window.__prismWebDarkEnabled) {
-                const root = document.documentElement;
-                if (!document.getElementById('prism-dark-style') || (root && !root.hasAttribute('data-prism-dark'))) {
-                  scheduleHealingPass();
+                const styleMissing = !document.getElementById('prism-dark-style');
+                const attrMissing = Boolean(root && !root.hasAttribute('data-prism-dark'));
+                if (styleMissing || attrMissing) {
+                  scheduleHealingPass(urlChanged || cachedNativeDark === null);
                   return;
                 }
+                if (!urlChanged && cachedNativeDark !== null) {
+                  // O(1) fast-path: dark style & attribute intact on same URL, skip forced reflow!
+                  return;
+                }
+              } else if (!urlChanged && root && !root.hasAttribute('data-prism-dark')) {
+                return;
               }
-              scheduleHealingPass();
+              scheduleHealingPass(urlChanged || cachedNativeDark === null);
             });
             if (document.head) {
               mo.observe(document.head, {

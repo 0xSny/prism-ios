@@ -1072,9 +1072,18 @@ final class PrismWebViewController: UIViewController {
             let y = sv.contentOffset.y
             let maxY = max(0, sv.contentSize.height - sv.bounds.height)
             let isDragging = sv.isDragging || sv.isTracking || sv.isDecelerating
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.handleScrollOffset(y: y, maxY: maxY, isInteractive: isDragging)
+            if Thread.isMainThread {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    if y > 10 && abs(y - self.lastOffsetY) < 0.8 { return }
+                    self.handleScrollOffset(y: y, maxY: maxY, isInteractive: isDragging)
+                }
+            } else {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if y > 10 && abs(y - self.lastOffsetY) < 0.8 { return }
+                    self.handleScrollOffset(y: y, maxY: maxY, isInteractive: isDragging)
+                }
             }
         }
     }

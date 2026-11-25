@@ -1,18 +1,18 @@
 import Foundation
 import SwiftUI
 
-enum AppLang: String, Codable, CaseIterable {
+enum AppLang: String, Codable, CaseIterable, Sendable {
     case zhCN = "zh-CN"
     case en = "en"
 }
 
-enum AppTheme: String, Codable, CaseIterable {
+enum AppTheme: String, Codable, CaseIterable, Sendable {
     case system
     case light
     case dark
 }
 
-enum SearchEngineOption: String, Codable, CaseIterable {
+enum SearchEngineOption: String, Codable, CaseIterable, Sendable {
     case google
     case bing
     case duckduckgo
@@ -42,13 +42,13 @@ enum SearchEngineOption: String, Codable, CaseIterable {
     }
 }
 
-enum ProxyMode: String, Codable, CaseIterable {
+enum ProxyMode: String, Codable, CaseIterable, Sendable {
     case system
     case direct
     case custom
 }
 
-struct FingerprintConfig: Codable, Equatable {
+struct FingerprintConfig: Codable, Equatable, Sendable {
     var userAgent: String?
     var platform: String?
     var language: String?
@@ -57,7 +57,7 @@ struct FingerprintConfig: Codable, Equatable {
     var blockTrackers: Bool = true
 }
 
-struct BrowserProfile: Identifiable, Codable, Equatable {
+struct BrowserProfile: Identifiable, Codable, Equatable, Sendable {
     var id: String
     var name: String
     var color: String
@@ -83,7 +83,7 @@ struct BrowserProfile: Identifiable, Codable, Equatable {
     }
 }
 
-struct HomeShortcut: Identifiable, Codable, Equatable {
+struct HomeShortcut: Identifiable, Codable, Equatable, Sendable {
     var id: String
     var title: String
     var url: String
@@ -93,7 +93,7 @@ struct HomeShortcut: Identifiable, Codable, Equatable {
     var order: Int
 }
 
-struct WeatherLocationConfig: Codable, Equatable {
+struct WeatherLocationConfig: Codable, Equatable, Sendable {
     var name: String = "北京"
     var latitude: Double = 39.9042
     var longitude: Double = 116.4074
@@ -101,7 +101,7 @@ struct WeatherLocationConfig: Codable, Equatable {
     var unit: String = "C" // "C" | "F"
 }
 
-struct HomeConfig: Codable, Equatable {
+struct HomeConfig: Codable, Equatable, Sendable {
     var showGreeting: Bool = false
     var showShortcuts: Bool = true
     var showProfileStatus: Bool = false
@@ -120,7 +120,7 @@ struct HomeConfig: Codable, Equatable {
     ]
 }
 
-struct BookmarkItem: Identifiable, Codable, Equatable {
+struct BookmarkItem: Identifiable, Codable, Equatable, Sendable {
     var id: String
     var type: String? // "url" | "folder"
     var parentId: String?
@@ -133,7 +133,7 @@ struct BookmarkItem: Identifiable, Codable, Equatable {
     var updatedAt: Double?
 }
 
-struct HistoryItem: Identifiable, Codable, Equatable {
+struct HistoryItem: Identifiable, Codable, Equatable, Sendable {
     var id: String
     var url: String
     var title: String
@@ -141,7 +141,7 @@ struct HistoryItem: Identifiable, Codable, Equatable {
     var visitedAt: Double
 }
 
-struct PasswordEntry: Identifiable, Codable, Equatable {
+struct PasswordEntry: Identifiable, Codable, Equatable, Sendable {
     var id: String
     var origin: String
     var username: String
@@ -151,7 +151,7 @@ struct PasswordEntry: Identifiable, Codable, Equatable {
     var updatedAt: Double
 }
 
-struct SyncScopeToggles: Codable, Equatable {
+struct SyncScopeToggles: Codable, Equatable, Sendable {
     var passwords: Bool = true
     var bookmarks: Bool = true
     var home_shortcuts: Bool = true
@@ -160,7 +160,7 @@ struct SyncScopeToggles: Codable, Equatable {
     var settings: Bool = true
 }
 
-struct PortableSettings: Codable, Equatable {
+struct PortableSettings: Codable, Equatable, Sendable {
     var language: AppLang?
     var theme: AppTheme?
     var searchEngine: SearchEngineOption?
@@ -174,7 +174,7 @@ struct PortableSettings: Codable, Equatable {
     var webDarkModeWhitelistHosts: [String]?
 }
 
-struct SyncItemPayload: Codable {
+struct SyncItemPayload: Codable, Sendable {
     var scope: String
     var itemId: String
     var iv: String
@@ -184,7 +184,7 @@ struct SyncItemPayload: Codable {
     var updatedAt: Double
 }
 
-struct EncryptedEnvelope: Codable {
+struct EncryptedEnvelope: Codable, Sendable {
     var iv: String
     var ciphertext: String
     var tag: String

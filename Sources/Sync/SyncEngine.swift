@@ -6,10 +6,49 @@ extension Notification.Name {
     static let prismSyncSessionChanged = Notification.Name("PrismSyncSessionChanged")
 }
 
-struct SyncTombstone: Codable, Equatable {
+struct SyncTombstone: Codable, Equatable, Sendable {
     var scope: String
     var itemId: String
     var updatedAt: Double
+}
+
+private actor LocalCacheWriter {
+    func write<T: Encodable & Sendable>(_ snapshot: T, to url: URL) {
+        if let data = try? JSONEncoder().encode(snapshot) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+}
+
+private struct SyncDiskSnapshot: Codable, Sendable {
+    var bookmarks: [BookmarkItem]
+    var passwords: [PasswordEntry]
+    var history: [HistoryItem]
+    var homeConfig: HomeConfig
+    var profiles: [BrowserProfile]
+    var pendingTombstones: [SyncTombstone]?
+    var lastPushedHashes: [String: String]?
+}
+
+private struct DecryptedPullBatch: Sendable {
+    var deletedBookmarkIds: [String] = []
+    var upsertedBookmarks: [BookmarkItem] = []
+    var deletedPasswordRawIds: [String] = []
+    var upsertedPasswords: [PasswordEntry] = []
+    var remoteHomeConfig: HomeConfig? = nil
+    var deletedProfileRawIds: [String] = []
+    var upsertedProfiles: [BrowserProfile] = []
+    var deletedHistoryItems: [(itemId: String, updatedAt: Double)] = []
+    var upsertedHistory: [HistoryItem] = []
+    var remotePortableSettings: PortableSettings? = nil
+    var syncedHashes: [String: String] = [:]
+}
+
+private struct OutboundSyncBuildResult: Sendable {
+    var items: [SyncItemPayload]
+    var encodedBody: Data?
+    var updatedHashes: [String: String]
+    var deletedKeys: Set<String>
 }
 
 @MainActor
@@ -43,10 +82,12 @@ final class SyncEngine: ObservableObject {
     private var dirtyBookmarkIds = Set<String>()
     private var dirtyPasswordIds = Set<String>()
     private var pendingTombstones: [SyncTombstone] = []
+    private var lastPushedHashes: [String: String] = [:]
     private var debounceTask: Task<Void, Never>?
     private var autoSyncTask: Task<Void, Never>?
 
     private let cacheDir: URL
+    private let cacheWriter = LocalCacheWriter()
     var onRemotePortableSettings: ((PortableSettings) -> Void)?
 
     init() {
@@ -294,6 +335,7 @@ final class SyncEngine: ObservableObject {
         token = nil
         kdfSalt = nil
         encKey = nil
+        lastPushedHashes.removeAll()
         NotificationCenter.default.post(name: .prismSyncSessionChanged, object: nil)
     }
 
@@ -514,6 +556,9 @@ final class SyncEngine: ObservableObject {
     }
 
     private func applyAuthenticatedSession(_ session: AccountSessionDisk, encKey: Data) {
+        if self.userId != session.userId {
+            self.lastPushedHashes.removeAll()
+        }
         self.token = session.token
         self.email = session.email
         self.userId = session.userId
@@ -552,37 +597,76 @@ final class SyncEngine: ObservableObject {
                 let items: [SyncItemPayload]
             }
             let decoded = try JSONDecoder().decode(PullResponse.self, from: pullData)
-            applyPulledItems(decoded.items, encKey: encKey)
+            let pullScopes = self.scopes
+            let pullTombstones = self.pendingTombstones
+            let pullItems = decoded.items
+            let pullBatch = await Task.detached(priority: .utility) {
+                Self.decryptPulledItems(
+                    pullItems,
+                    encKey: encKey,
+                    scopes: pullScopes,
+                    pendingTombstones: pullTombstones
+                )
+            }.value
+            applyDecryptedPullBatch(pullBatch)
 
             let processedDirtyScopes = dirtyScopes
             let processedDirtyBookmarkIds = dirtyBookmarkIds
             let processedDirtyPasswordIds = dirtyPasswordIds
-            let pushItems = buildOutboundItems(
-                encKey: encKey,
-                targetScopes: processedDirtyScopes,
-                targetBookmarkIds: processedDirtyBookmarkIds,
-                targetPasswordIds: processedDirtyPasswordIds
-            )
-            if pushItems.isEmpty {
+            let snapScopes = self.scopes
+            let snapBookmarks = self.bookmarks
+            let snapPasswords = self.passwords
+            let snapHistory = self.history
+            let snapProfiles = self.profiles
+            let snapHomeConfig = self.homeConfig
+            let snapTombstones = self.pendingTombstones
+            let snapHashes = self.lastPushedHashes
+            let snapPortable = buildCurrentPortableSettings()
+
+            let outbound = await Task.detached(priority: .utility) {
+                Self.buildOutboundPayload(
+                    encKey: encKey,
+                    targetScopes: processedDirtyScopes,
+                    targetBookmarkIds: processedDirtyBookmarkIds,
+                    targetPasswordIds: processedDirtyPasswordIds,
+                    scopes: snapScopes,
+                    bookmarks: snapBookmarks,
+                    passwords: snapPasswords,
+                    history: snapHistory,
+                    profiles: snapProfiles,
+                    homeConfig: snapHomeConfig,
+                    pendingTombstones: snapTombstones,
+                    portableSettings: snapPortable,
+                    lastPushedHashes: snapHashes
+                )
+            }.value
+
+            if outbound.items.isEmpty {
                 dirtyScopes.subtract(processedDirtyScopes)
                 dirtyBookmarkIds.subtract(processedDirtyBookmarkIds)
                 dirtyPasswordIds.subtract(processedDirtyPasswordIds)
-            } else if let pushUrl = URL(string: "\(serverUrl)/api/sync/push") {
+            } else if let pushUrl = URL(string: "\(serverUrl)/api/sync/push"),
+                      let body = outbound.encodedBody {
                 var pushReq = URLRequest(url: pushUrl)
                 pushReq.httpMethod = "POST"
                 pushReq.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
                 pushReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                let body = try JSONEncoder().encode(["items": pushItems])
                 pushReq.httpBody = body
                 let (_, pushResp) = try await URLSession.shared.data(for: pushReq)
                 if let pHttp = pushResp as? HTTPURLResponse, pHttp.statusCode == 200 {
                     dirtyScopes.subtract(processedDirtyScopes)
                     dirtyBookmarkIds.subtract(processedDirtyBookmarkIds)
                     dirtyPasswordIds.subtract(processedDirtyPasswordIds)
-                    let pushedDeletedKeys = Set(pushItems.filter { $0.deleted }.map { "\($0.scope)|\($0.itemId)" })
-                    if !pushedDeletedKeys.isEmpty {
-                        pendingTombstones.removeAll { pushedDeletedKeys.contains("\($0.scope)|\($0.itemId)") }
+                    for (k, v) in outbound.updatedHashes {
+                        lastPushedHashes[k] = v
                     }
+                    for delKey in outbound.deletedKeys {
+                        lastPushedHashes.removeValue(forKey: delKey)
+                    }
+                    if !outbound.deletedKeys.isEmpty {
+                        pendingTombstones.removeAll { outbound.deletedKeys.contains("\($0.scope)|\($0.itemId)") }
+                    }
+                    pruneStalePushedHashes()
                 }
             }
 
@@ -601,17 +685,72 @@ final class SyncEngine: ObservableObject {
         }
     }
 
-    private func applyPulledItems(_ items: [SyncItemPayload], encKey: Data) {
-        var bmMap = Dictionary(uniqueKeysWithValues: bookmarks.map { (bookmarkSyncId($0), $0) })
-        var bmChanged = false
-        var pwMap = Dictionary(uniqueKeysWithValues: passwords.map { ($0.id, $0) })
-        var pwChanged = false
-        var histMap = Dictionary(uniqueKeysWithValues: history.map { ($0.url, $0) })
-        var histChanged = false
-        var profMap = Dictionary(uniqueKeysWithValues: profiles.map { ($0.id, $0) })
-        var profChanged = false
+    private func buildCurrentPortableSettings() -> PortableSettings {
+        let storedBlockAppJumps = UserDefaults.standard.object(forKey: "prism.blockRogueAppJumps") != nil
+            ? UserDefaults.standard.bool(forKey: "prism.blockRogueAppJumps")
+            : true
+        let storedEnterTopHit = UserDefaults.standard.object(forKey: "prism.omniboxEnterTopHitEnabled") != nil
+            ? UserDefaults.standard.bool(forKey: "prism.omniboxEnterTopHitEnabled")
+            : false
+        let storedTheme = UserDefaults.standard.string(forKey: "prism.theme")
+            .flatMap { AppTheme(rawValue: $0) }
+        let storedEngine = UserDefaults.standard.string(forKey: "prism.searchEngine")
+            .flatMap { SearchEngineOption(rawValue: $0) }
+        return PortableSettings(
+            language: L10n.isEnglish ? .en : .zhCN,
+            theme: storedTheme,
+            searchEngine: storedEngine,
+            defaultProxyMode: nil,
+            stripTrackingParams: nil,
+            autoSyncIntervalMinutes: autoSyncIntervalMinutes,
+            builtInAdblockEnabled: nil,
+            blockRogueAppJumps: storedBlockAppJumps,
+            omniboxEnterTopHitEnabled: storedEnterTopHit
+        )
+    }
 
-        // Tombstones take precedence: ignore resurrected items older than pending local deletion
+    private func pruneStalePushedHashes() {
+        // Prevent unbounded hash dictionary growth if user visits thousands of URLs over months
+        if lastPushedHashes.count <= 2000 { return }
+        var keep = Set<String>()
+        keep.insert("home_shortcuts|home:config")
+        keep.insert("settings|settings:portable")
+        for bm in bookmarks { keep.insert("bookmarks|\(Self.bookmarkSyncIdStatic(bm))") }
+        for pw in passwords { keep.insert("passwords|password:\(pw.id)") }
+        for prof in profiles { keep.insert("profiles|profile:\(prof.id)") }
+        for h in history.prefix(500) { keep.insert("history|\(Self.historySyncIdStatic(url: h.url))") }
+        lastPushedHashes = lastPushedHashes.filter { keep.contains($0.key) }
+    }
+
+    nonisolated private static func contentHash<T: Encodable>(_ value: T) -> String? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(value),
+              let str = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return CryptoVault.sha1Hex(str)
+    }
+
+    nonisolated private static func historySyncIdStatic(url: String) -> String {
+        let clean = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "history:\(CryptoVault.sha1Hex(clean))"
+    }
+
+    nonisolated private static func bookmarkSyncIdStatic(_ bm: BookmarkItem) -> String {
+        if bm.type == "folder" {
+            return "bookmark:folder:\(bm.id)"
+        }
+        return "bookmark:\(CryptoVault.sha1Hex(bm.url))"
+    }
+
+    nonisolated private static func decryptPulledItems(
+        _ items: [SyncItemPayload],
+        encKey: Data,
+        scopes: SyncScopeToggles,
+        pendingTombstones: [SyncTombstone]
+    ) -> DecryptedPullBatch {
+        var batch = DecryptedPullBatch()
         let tombstoneMap = Dictionary(
             pendingTombstones.map { ("\($0.scope)|\($0.itemId)", $0.updatedAt) },
             uniquingKeysWith: { max($0, $1) }
@@ -624,28 +763,20 @@ final class SyncEngine: ObservableObject {
             switch item.scope {
             case "bookmarks" where scopes.bookmarks:
                 if item.deleted {
-                    if bmMap.removeValue(forKey: item.itemId) != nil { bmChanged = true }
+                    batch.deletedBookmarkIds.append(item.itemId)
                 } else if let bm = try? CryptoVault.decryptJSON(BookmarkItem.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag) {
-                    let key = bookmarkSyncId(bm)
-                    let existingTs = bmMap[key]?.updatedAt ?? bmMap[key]?.createdAt ?? 0
-                    if (bm.updatedAt ?? bm.createdAt) >= existingTs {
-                        bmMap[key] = bm
-                        bmChanged = true
+                    batch.upsertedBookmarks.append(bm)
+                    if let h = contentHash(bm) {
+                        batch.syncedHashes["bookmarks|\(bookmarkSyncIdStatic(bm))"] = h
                     }
                 }
             case "passwords" where scopes.passwords:
                 if item.deleted {
-                    let rawId = item.itemId.replacingOccurrences(of: "password:", with: "")
-                    if pwMap.removeValue(forKey: rawId) != nil { pwChanged = true }
+                    batch.deletedPasswordRawIds.append(item.itemId.replacingOccurrences(of: "password:", with: ""))
                 } else if let pw = try? CryptoVault.decryptJSON(PasswordEntry.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag) {
-                    if let old = pwMap[pw.id] {
-                        if pw.updatedAt > old.updatedAt {
-                            pwMap[pw.id] = pw
-                            pwChanged = true
-                        }
-                    } else {
-                        pwMap[pw.id] = pw
-                        pwChanged = true
+                    batch.upsertedPasswords.append(pw)
+                    if let h = contentHash(pw) {
+                        batch.syncedHashes["passwords|password:\(pw.id)"] = h
                     }
                 }
             case "home_shortcuts" where scopes.home_shortcuts && item.itemId == "home:config" && !item.deleted:
@@ -654,30 +785,30 @@ final class SyncEngine: ObservableObject {
                 }
                 if let wrapped = try? CryptoVault.decryptJSON(HomePayload.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag),
                    let remoteHome = wrapped.homeConfig {
-                    homeConfig = remoteHome
+                    batch.remoteHomeConfig = remoteHome
+                    if let h = contentHash(remoteHome) {
+                        batch.syncedHashes["home_shortcuts|home:config"] = h
+                    }
                 }
             case "profiles" where scopes.profiles:
                 if item.deleted {
                     let rawId = item.itemId.hasPrefix("profile:")
                         ? String(item.itemId.dropFirst("profile:".count))
                         : item.itemId
-                    if rawId != "default", profMap.removeValue(forKey: rawId) != nil {
-                        profChanged = true
-                    }
+                    batch.deletedProfileRawIds.append(rawId)
                 } else if let prof = try? CryptoVault.decryptJSON(BrowserProfile.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag) {
-                    profMap[prof.id] = prof
-                    profChanged = true
+                    batch.upsertedProfiles.append(prof)
+                    if let h = contentHash(prof) {
+                        batch.syncedHashes["profiles|profile:\(prof.id)"] = h
+                    }
                 }
             case "history" where scopes.history:
                 if item.deleted {
-                    for (u, h) in histMap where historySyncId(url: u) == item.itemId && item.updatedAt >= h.visitedAt {
-                        histMap.removeValue(forKey: u)
-                        histChanged = true
-                    }
+                    batch.deletedHistoryItems.append((item.itemId, item.updatedAt))
                 } else if let hist = try? CryptoVault.decryptJSON(HistoryItem.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag) {
-                    if (histMap[hist.url]?.visitedAt ?? 0) < hist.visitedAt {
-                        histMap[hist.url] = hist
-                        histChanged = true
+                    batch.upsertedHistory.append(hist)
+                    if let h = contentHash(hist) {
+                        batch.syncedHashes["history|\(historySyncIdStatic(url: hist.url))"] = h
                     }
                 }
             case "settings" where scopes.settings && item.itemId == "settings:portable" && !item.deleted:
@@ -686,19 +817,99 @@ final class SyncEngine: ObservableObject {
                 }
                 if let wrap = try? CryptoVault.decryptJSON(SettingsWrap.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag),
                    let remote = wrap.settings {
-                    if let freq = remote.autoSyncIntervalMinutes, freq != autoSyncIntervalMinutes {
-                        autoSyncIntervalMinutes = freq
-                        UserDefaults.standard.set(freq, forKey: "prism.autoSyncInterval")
-                        rescheduleAutoSync()
+                    batch.remotePortableSettings = remote
+                    if let h = contentHash(remote) {
+                        batch.syncedHashes["settings|settings:portable"] = h
                     }
-                    if let blockJumps = remote.blockRogueAppJumps {
-                        UserDefaults.standard.set(blockJumps, forKey: "prism.blockRogueAppJumps")
-                    }
-                    onRemotePortableSettings?(remote)
                 }
             default:
                 break
             }
+        }
+        return batch
+    }
+
+    private func applyDecryptedPullBatch(_ batch: DecryptedPullBatch) {
+        var bmMap = Dictionary(uniqueKeysWithValues: bookmarks.map { (bookmarkSyncId($0), $0) })
+        var bmChanged = false
+        for delId in batch.deletedBookmarkIds {
+            if bmMap.removeValue(forKey: delId) != nil { bmChanged = true }
+            lastPushedHashes.removeValue(forKey: "bookmarks|\(delId)")
+        }
+        for bm in batch.upsertedBookmarks {
+            let key = bookmarkSyncId(bm)
+            let existingTs = bmMap[key]?.updatedAt ?? bmMap[key]?.createdAt ?? 0
+            if (bm.updatedAt ?? bm.createdAt) >= existingTs {
+                bmMap[key] = bm
+                bmChanged = true
+            }
+        }
+
+        var pwMap = Dictionary(uniqueKeysWithValues: passwords.map { ($0.id, $0) })
+        var pwChanged = false
+        for rawId in batch.deletedPasswordRawIds {
+            if pwMap.removeValue(forKey: rawId) != nil { pwChanged = true }
+            lastPushedHashes.removeValue(forKey: "passwords|password:\(rawId)")
+        }
+        for pw in batch.upsertedPasswords {
+            if let old = pwMap[pw.id] {
+                if pw.updatedAt > old.updatedAt {
+                    pwMap[pw.id] = pw
+                    pwChanged = true
+                }
+            } else {
+                pwMap[pw.id] = pw
+                pwChanged = true
+            }
+        }
+
+        if let remoteHome = batch.remoteHomeConfig {
+            homeConfig = remoteHome
+        }
+
+        var profMap = Dictionary(uniqueKeysWithValues: profiles.map { ($0.id, $0) })
+        var profChanged = false
+        for rawId in batch.deletedProfileRawIds {
+            if rawId != "default", profMap.removeValue(forKey: rawId) != nil {
+                profChanged = true
+            }
+            lastPushedHashes.removeValue(forKey: "profiles|profile:\(rawId)")
+        }
+        for prof in batch.upsertedProfiles {
+            profMap[prof.id] = prof
+            profChanged = true
+        }
+
+        var histMap = Dictionary(uniqueKeysWithValues: history.map { ($0.url, $0) })
+        var histChanged = false
+        for del in batch.deletedHistoryItems {
+            for (u, h) in histMap where historySyncId(url: u) == del.itemId && del.updatedAt >= h.visitedAt {
+                histMap.removeValue(forKey: u)
+                histChanged = true
+            }
+            lastPushedHashes.removeValue(forKey: "history|\(del.itemId)")
+        }
+        for hist in batch.upsertedHistory {
+            if (histMap[hist.url]?.visitedAt ?? 0) < hist.visitedAt {
+                histMap[hist.url] = hist
+                histChanged = true
+            }
+        }
+
+        if let remote = batch.remotePortableSettings {
+            if let freq = remote.autoSyncIntervalMinutes, freq != autoSyncIntervalMinutes {
+                autoSyncIntervalMinutes = freq
+                UserDefaults.standard.set(freq, forKey: "prism.autoSyncInterval")
+                rescheduleAutoSync()
+            }
+            if let blockJumps = remote.blockRogueAppJumps {
+                UserDefaults.standard.set(blockJumps, forKey: "prism.blockRogueAppJumps")
+            }
+            onRemotePortableSettings?(remote)
+        }
+
+        for (k, v) in batch.syncedHashes {
+            lastPushedHashes[k] = v
         }
 
         if bmChanged {
@@ -715,13 +926,24 @@ final class SyncEngine: ObservableObject {
         }
     }
 
-    private func buildOutboundItems(
+    nonisolated private static func buildOutboundPayload(
         encKey: Data,
         targetScopes: Set<String>,
         targetBookmarkIds: Set<String>,
-        targetPasswordIds: Set<String>
-    ) -> [SyncItemPayload] {
+        targetPasswordIds: Set<String>,
+        scopes: SyncScopeToggles,
+        bookmarks: [BookmarkItem],
+        passwords: [PasswordEntry],
+        history: [HistoryItem],
+        profiles: [BrowserProfile],
+        homeConfig: HomeConfig,
+        pendingTombstones: [SyncTombstone],
+        portableSettings: PortableSettings,
+        lastPushedHashes: [String: String]
+    ) -> OutboundSyncBuildResult {
         var out: [SyncItemPayload] = []
+        var updatedHashes: [String: String] = [:]
+        var deletedKeys = Set<String>()
         let nowMs = Date().timeIntervalSince1970 * 1000
 
         if targetScopes.contains("home_shortcuts") && scopes.home_shortcuts {
@@ -729,17 +951,26 @@ final class SyncEngine: ObservableObject {
                 let homeConfig: HomeConfig
                 let updatedAt: Double
             }
-            if let env = try? CryptoVault.encryptJSON(HomePayload(homeConfig: homeConfig, updatedAt: nowMs), encKey: encKey) {
+            let hashKey = "home_shortcuts|home:config"
+            let h = contentHash(homeConfig)
+            if h == nil || lastPushedHashes[hashKey] != h,
+               let env = try? CryptoVault.encryptJSON(HomePayload(homeConfig: homeConfig, updatedAt: nowMs), encKey: encKey) {
                 out.append(SyncItemPayload(scope: "home_shortcuts", itemId: "home:config", iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: nowMs))
+                if let h { updatedHashes[hashKey] = h }
             }
         }
         if targetScopes.contains("bookmarks") && scopes.bookmarks {
             let targets: [BookmarkItem] = targetBookmarkIds.isEmpty
                 ? bookmarks
-                : bookmarks.filter { targetBookmarkIds.contains($0.id) || targetBookmarkIds.contains(bookmarkSyncId($0)) }
+                : bookmarks.filter { targetBookmarkIds.contains($0.id) || targetBookmarkIds.contains(bookmarkSyncIdStatic($0)) }
             for bm in targets {
+                let itemId = bookmarkSyncIdStatic(bm)
+                let hashKey = "bookmarks|\(itemId)"
+                let h = contentHash(bm)
+                if let h, lastPushedHashes[hashKey] == h { continue }
                 if let env = try? CryptoVault.encryptJSON(bm, encKey: encKey) {
-                    out.append(SyncItemPayload(scope: "bookmarks", itemId: bookmarkSyncId(bm), iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: bm.updatedAt ?? nowMs))
+                    out.append(SyncItemPayload(scope: "bookmarks", itemId: itemId, iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: bm.updatedAt ?? nowMs))
+                    if let h { updatedHashes[hashKey] = h }
                 }
             }
         }
@@ -748,8 +979,13 @@ final class SyncEngine: ObservableObject {
                 ? passwords
                 : passwords.filter { targetPasswordIds.contains($0.id) }
             for pw in targets {
+                let itemId = "password:\(pw.id)"
+                let hashKey = "passwords|\(itemId)"
+                let h = contentHash(pw)
+                if let h, lastPushedHashes[hashKey] == h { continue }
                 if let env = try? CryptoVault.encryptJSON(pw, encKey: encKey) {
-                    out.append(SyncItemPayload(scope: "passwords", itemId: "password:\(pw.id)", iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: pw.updatedAt))
+                    out.append(SyncItemPayload(scope: "passwords", itemId: itemId, iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: pw.updatedAt))
+                    if let h { updatedHashes[hashKey] = h }
                 }
             }
         }
@@ -770,9 +1006,14 @@ final class SyncEngine: ObservableObject {
                 .sorted { $0.visitedAt > $1.visitedAt }
                 .prefix(500)
             for h in recentUnique {
-                let itemId = historySyncId(url: h.url)
+                let itemId = historySyncIdStatic(url: h.url)
+                let hashKey = "history|\(itemId)"
+                let digest = contentHash(h)
+                // Incremental delta check: only encrypt & upload history items that actually changed
+                if let digest, lastPushedHashes[hashKey] == digest { continue }
                 if let env = try? CryptoVault.encryptJSON(h, encKey: encKey) {
                     out.append(SyncItemPayload(scope: "history", itemId: itemId, iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: h.visitedAt > 0 ? h.visitedAt : nowMs))
+                    if let digest { updatedHashes[hashKey] = digest }
                 }
             }
         }
@@ -796,12 +1037,18 @@ final class SyncEngine: ObservableObject {
                     continue
                 }
                 out.append(SyncItemPayload(scope: tomb.scope, itemId: tomb.itemId, iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: true, updatedAt: tomb.updatedAt))
+                deletedKeys.insert("\(tomb.scope)|\(tomb.itemId)")
             }
         }
         if targetScopes.contains("profiles") && scopes.profiles {
             for prof in profiles {
+                let itemId = "profile:\(prof.id)"
+                let hashKey = "profiles|\(itemId)"
+                let h = contentHash(prof)
+                if let h, lastPushedHashes[hashKey] == h { continue }
                 if let env = try? CryptoVault.encryptJSON(prof, encKey: encKey) {
-                    out.append(SyncItemPayload(scope: "profiles", itemId: "profile:\(prof.id)", iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: nowMs))
+                    out.append(SyncItemPayload(scope: "profiles", itemId: itemId, iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: nowMs))
+                    if let h { updatedHashes[hashKey] = h }
                 }
             }
         }
@@ -810,32 +1057,22 @@ final class SyncEngine: ObservableObject {
                 let settings: PortableSettings
                 let updatedAt: Double
             }
-            let storedBlockAppJumps = UserDefaults.standard.object(forKey: "prism.blockRogueAppJumps") != nil
-                ? UserDefaults.standard.bool(forKey: "prism.blockRogueAppJumps")
-                : true
-            let storedEnterTopHit = UserDefaults.standard.object(forKey: "prism.omniboxEnterTopHitEnabled") != nil
-                ? UserDefaults.standard.bool(forKey: "prism.omniboxEnterTopHitEnabled")
-                : false
-            let storedTheme = UserDefaults.standard.string(forKey: "prism.theme")
-                .flatMap { AppTheme(rawValue: $0) }
-            let storedEngine = UserDefaults.standard.string(forKey: "prism.searchEngine")
-                .flatMap { SearchEngineOption(rawValue: $0) }
-            let portable = PortableSettings(
-                language: L10n.isEnglish ? .en : .zhCN,
-                theme: storedTheme,
-                searchEngine: storedEngine,
-                defaultProxyMode: nil,
-                stripTrackingParams: nil,
-                autoSyncIntervalMinutes: autoSyncIntervalMinutes,
-                builtInAdblockEnabled: nil,
-                blockRogueAppJumps: storedBlockAppJumps,
-                omniboxEnterTopHitEnabled: storedEnterTopHit
-            )
-            if let env = try? CryptoVault.encryptJSON(SettingsPayload(settings: portable, updatedAt: nowMs), encKey: encKey) {
+            let hashKey = "settings|settings:portable"
+            let h = contentHash(portableSettings)
+            if h == nil || lastPushedHashes[hashKey] != h,
+               let env = try? CryptoVault.encryptJSON(SettingsPayload(settings: portableSettings, updatedAt: nowMs), encKey: encKey) {
                 out.append(SyncItemPayload(scope: "settings", itemId: "settings:portable", iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: nowMs))
+                if let h { updatedHashes[hashKey] = h }
             }
         }
-        return out
+
+        let body = out.isEmpty ? nil : (try? JSONEncoder().encode(["items": out]))
+        return OutboundSyncBuildResult(
+            items: out,
+            encodedBody: body,
+            updatedHashes: updatedHashes,
+            deletedKeys: deletedKeys
+        )
     }
 
     func markBookmarkChanged(_ bm: BookmarkItem) {
@@ -940,34 +1177,27 @@ final class SyncEngine: ObservableObject {
 
     // MARK: - Local JSON Cache
 
-    private struct DiskSnapshot: Codable {
-        var bookmarks: [BookmarkItem]
-        var passwords: [PasswordEntry]
-        var history: [HistoryItem]
-        var homeConfig: HomeConfig
-        var profiles: [BrowserProfile]
-        var pendingTombstones: [SyncTombstone]?
-    }
-
     func saveLocalCache() {
-        let snap = DiskSnapshot(
+        let snap = SyncDiskSnapshot(
             bookmarks: bookmarks,
             passwords: passwords,
             history: Array(history.prefix(500)),
             homeConfig: homeConfig,
             profiles: profiles,
-            pendingTombstones: pendingTombstones
+            pendingTombstones: pendingTombstones,
+            lastPushedHashes: lastPushedHashes
         )
         let url = cacheDir.appendingPathComponent("vault-state.json")
-        if let data = try? JSONEncoder().encode(snap) {
-            try? data.write(to: url, options: .atomic)
+        let writer = cacheWriter
+        Task.detached(priority: .utility) {
+            await writer.write(snap, to: url)
         }
     }
 
     private func loadLocalCache() {
         let url = cacheDir.appendingPathComponent("vault-state.json")
         guard let data = try? Data(contentsOf: url),
-              let snap = try? JSONDecoder().decode(DiskSnapshot.self, from: data) else { return }
+              let snap = try? JSONDecoder().decode(SyncDiskSnapshot.self, from: data) else { return }
         self.bookmarks = snap.bookmarks
         self.passwords = snap.passwords
         self.history = snap.history
@@ -976,5 +1206,6 @@ final class SyncEngine: ObservableObject {
             self.profiles = snap.profiles
         }
         self.pendingTombstones = snap.pendingTombstones ?? []
+        self.lastPushedHashes = snap.lastPushedHashes ?? [:]
     }
 }

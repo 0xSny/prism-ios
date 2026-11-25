@@ -249,6 +249,25 @@ struct OmniboxInlineOverlay: View {
     @State private var baselinePrefilledText: String = ""
     @State private var userModifiedQuery: Bool = false
     @State private var cursorMoveNonce: Int = 0
+    @State private var cachedTopHit: OmniboxCandidateEntry? = nil
+    @State private var cachedMatchedTabs: [OmniboxCandidateEntry] = []
+    @State private var cachedLibraryItems: [OmniboxCandidateEntry] = []
+
+    private func refreshCandidates(rawText: String? = nil, modified: Bool? = nil) {
+        let currentText = (rawText ?? text).trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveQuery = (modified ?? userModifiedQuery) ? currentText : ""
+        let ranked = smartEngine.buildCandidates(
+            queryRaw: effectiveQuery,
+            bookmarks: bookmarks,
+            history: history,
+            tabs: tabs,
+            activeTab: activeTab,
+            shortcuts: shortcuts
+        )
+        cachedTopHit = !effectiveQuery.isEmpty ? ranked.topHit : nil
+        cachedMatchedTabs = ranked.tabs
+        cachedLibraryItems = ranked.library
+    }
 
     private enum PrimaryBubbleKind {
         case instantAnswer(InstantAnswerResult)
@@ -287,17 +306,9 @@ struct OmniboxInlineOverlay: View {
         let q = trimmed.lowercased()
         let quickSite = !trimmed.isEmpty ? SmartOmniboxEngine.parseQuickSiteSearch(trimmed) : nil
         let instantAnswer = !trimmed.isEmpty ? SmartOmniboxEngine.evaluateInstantAnswer(trimmed) : nil
-        let ranked = smartEngine.buildCandidates(
-            queryRaw: trimmed,
-            bookmarks: bookmarks,
-            history: history,
-            tabs: tabs,
-            activeTab: activeTab,
-            shortcuts: shortcuts
-        )
-        let topHit = !q.isEmpty ? ranked.topHit : nil
-        let matchedTabs = ranked.tabs
-        let libraryItems = ranked.library
+        let topHit = !q.isEmpty ? cachedTopHit : nil
+        let matchedTabs = cachedMatchedTabs
+        let libraryItems = cachedLibraryItems
         let remoteList = buildRemoteSearchList(trimmed: trimmed, rawLower: q, remote: remoteSuggester.suggestions)
         let isExplicitURL = SmartOmniboxEngine.isLikelyExplicitURL(rawTrimmed)
         let enterOpensTopHit = (quickSite == nil) && enterTopHitEnabled && !isExplicitURL && topHit != nil
@@ -483,21 +494,30 @@ struct OmniboxInlineOverlay: View {
         }
         .onAppear {
             baselinePrefilledText = text
-            userModifiedQuery = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let initialModified = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            userModifiedQuery = initialModified
             onRefreshClipboardPattern()
-            let initialQuery = userModifiedQuery ? text : ""
+            let initialQuery = initialModified ? text : ""
+            refreshCandidates(rawText: text, modified: initialModified)
             remoteSuggester.update(query: initialQuery, engine: searchEngine)
             schedulePageMatchCount(initialQuery)
         }
         .onChange(of: text) { _, newValue in
             copiedAnswerFeedback = false
-            if !userModifiedQuery && newValue != baselinePrefilledText {
-                userModifiedQuery = true
+            let nextModified = userModifiedQuery || newValue != baselinePrefilledText
+            if nextModified != userModifiedQuery {
+                userModifiedQuery = nextModified
             }
-            let effectiveQuery = userModifiedQuery ? newValue : ""
+            let effectiveQuery = nextModified ? newValue : ""
+            refreshCandidates(rawText: newValue, modified: nextModified)
             remoteSuggester.update(query: effectiveQuery, engine: searchEngine)
             schedulePageMatchCount(effectiveQuery)
         }
+        .onChange(of: bookmarks.count) { _, _ in refreshCandidates() }
+        .onChange(of: history.count) { _, _ in refreshCandidates() }
+        .onChange(of: tabs.count) { _, _ in refreshCandidates() }
+        .onChange(of: shortcuts.count) { _, _ in refreshCandidates() }
+        .onChange(of: smartEngine.recentSearches) { _, _ in refreshCandidates() }
     }
 
     // MARK: - Zero-Input Bottom-Up Bubbles (Weakest Top -> #1 Strongest Bottom Above Input)
