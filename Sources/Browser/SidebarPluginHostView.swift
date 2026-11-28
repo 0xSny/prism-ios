@@ -171,8 +171,8 @@ final class SidebarPluginStorageStore {
         queue.async {
             let bk = self.bucketKey(profileId: profileId, pluginId: pluginId)
             var bucket = self.data[bk] ?? [:]
-            if let value, !(value is NSNull) {
-                bucket[key] = AnyCodableValue(value)
+            if let wrapped = AnyCodableValue.from(value), !(value is NSNull) {
+                bucket[key] = wrapped
             } else {
                 bucket.removeValue(forKey: key)
             }
@@ -595,7 +595,7 @@ private struct SidebarPluginWebView: UIViewRepresentable {
                 }
                 let activate = (params["active"] as? Bool) ?? true
                 Task { @MainActor in
-                    self.tabManager.openNewTab(urlString: url.absoluteString, profileId: self.profile.id, activate: activate)
+                    _ = self.tabManager.createTab(url: url, profileId: self.profile.id, activate: activate)
                     self.reply(id, ok: true, data: true)
                 }
 
