@@ -27,6 +27,7 @@ private struct SyncDiskSnapshot: Codable, Sendable {
     var homeConfig: HomeConfig
     var profiles: [BrowserProfile]
     var userscripts: [UserscriptItem]?
+    var sidebarPlugins: [SidebarPluginItem]?
     var pendingTombstones: [SyncTombstone]?
     var lastPushedHashes: [String: String]?
 }
@@ -43,6 +44,8 @@ private struct DecryptedPullBatch: Sendable {
     var upsertedHistory: [HistoryItem] = []
     var deletedUserscriptRawIds: [String] = []
     var upsertedUserscripts: [UserscriptItem] = []
+    var deletedPluginRawIds: [String] = []
+    var upsertedPlugins: [SidebarPluginItem] = []
     var remotePortableSettings: PortableSettings? = nil
     var syncedHashes: [String: String] = [:]
 }
@@ -76,6 +79,7 @@ final class SyncEngine: ObservableObject {
     @Published var homeConfig: HomeConfig = HomeConfig()
     @Published var profiles: [BrowserProfile] = [.defaultProfile]
     @Published var userscripts: [UserscriptItem] = []
+    @Published var sidebarPlugins: [SidebarPluginItem] = []
     @Published var scopes: SyncScopeToggles = SyncScopeToggles()
 
     private var token: String?
@@ -94,6 +98,7 @@ final class SyncEngine: ObservableObject {
     private let cacheWriter = LocalCacheWriter()
     var onRemotePortableSettings: ((PortableSettings) -> Void)?
     var onUserscriptsChanged: (() -> Void)?
+    var onSidebarPluginsChanged: (() -> Void)?
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -624,6 +629,7 @@ final class SyncEngine: ObservableObject {
             let snapHistory = self.history
             let snapProfiles = self.profiles
             let snapUserscripts = self.userscripts
+            let snapPlugins = self.sidebarPlugins
             let snapHomeConfig = self.homeConfig
             let snapTombstones = self.pendingTombstones
             let snapHashes = self.lastPushedHashes
@@ -641,6 +647,7 @@ final class SyncEngine: ObservableObject {
                     history: snapHistory,
                     profiles: snapProfiles,
                     userscripts: snapUserscripts,
+                    sidebarPlugins: snapPlugins,
                     homeConfig: snapHomeConfig,
                     pendingTombstones: snapTombstones,
                     portableSettings: snapPortable,
@@ -726,6 +733,7 @@ final class SyncEngine: ObservableObject {
         for pw in passwords { keep.insert("passwords|password:\(pw.id)") }
         for prof in profiles { keep.insert("profiles|profile:\(prof.id)") }
         for us in userscripts { keep.insert("userscripts|userscript:\(us.id)") }
+        for pl in sidebarPlugins { keep.insert("plugins|plugin:\(pl.id)") }
         for h in history.prefix(500) { keep.insert("history|\(Self.historySyncIdStatic(url: h.url))") }
         lastPushedHashes = lastPushedHashes.filter { keep.contains($0.key) }
     }
@@ -842,6 +850,23 @@ final class SyncEngine: ObservableObject {
                     batch.upsertedUserscripts.append(normalized)
                     if let h = contentHash(normalized) {
                         batch.syncedHashes["userscripts|userscript:\(normalized.id)"] = h
+                    }
+                }
+            case "plugins" where scopes.plugins:
+                let rawId = item.itemId.hasPrefix("plugin:")
+                    ? String(item.itemId.dropFirst("plugin:".count))
+                    : item.itemId
+                if item.deleted {
+                    batch.deletedPluginRawIds.append(rawId)
+                } else if let pl = try? CryptoVault.decryptJSON(SidebarPluginItem.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag) {
+                    var normalized = pl
+                    if let parsed = try? SidebarPluginMetaParser.parseHTML(pl.html, fallbackName: pl.id) {
+                        normalized.manifest = parsed.manifest
+                        normalized.manifest.id = pl.id
+                    }
+                    batch.upsertedPlugins.append(normalized)
+                    if let h = contentHash(normalized) {
+                        batch.syncedHashes["plugins|plugin:\(normalized.id)"] = h
                     }
                 }
             default:
@@ -967,6 +992,27 @@ final class SyncEngine: ObservableObject {
             userscripts = usMap.values.sorted { $0.updatedAt > $1.updatedAt }
             onUserscriptsChanged?()
         }
+
+        var plMap = Dictionary(uniqueKeysWithValues: sidebarPlugins.map { ($0.id, $0) })
+        var plChanged = false
+        for rawId in batch.deletedPluginRawIds {
+            if plMap.removeValue(forKey: rawId) != nil {
+                plChanged = true
+                SidebarPluginStorageStore.shared.clearPlugin(rawId)
+            }
+            lastPushedHashes.removeValue(forKey: "plugins|plugin:\(rawId)")
+        }
+        for pl in batch.upsertedPlugins {
+            let existingTs = plMap[pl.id]?.updatedAt ?? 0
+            if pl.updatedAt > existingTs {
+                plMap[pl.id] = pl
+                plChanged = true
+            }
+        }
+        if plChanged {
+            sidebarPlugins = plMap.values.sorted { $0.updatedAt > $1.updatedAt }
+            onSidebarPluginsChanged?()
+        }
     }
 
     nonisolated private static func buildOutboundPayload(
@@ -980,6 +1026,7 @@ final class SyncEngine: ObservableObject {
         history: [HistoryItem],
         profiles: [BrowserProfile],
         userscripts: [UserscriptItem],
+        sidebarPlugins: [SidebarPluginItem],
         homeConfig: HomeConfig,
         pendingTombstones: [SyncTombstone],
         portableSettings: PortableSettings,
@@ -1074,6 +1121,7 @@ final class SyncEngine: ObservableObject {
                     case "profiles": return scopes.profiles
                     case "history": return scopes.history
                     case "userscripts": return scopes.userscripts
+                    case "plugins": return scopes.plugins
                     default: return true
                     }
                 }()
@@ -1118,6 +1166,19 @@ final class SyncEngine: ObservableObject {
                 if let h, lastPushedHashes[hashKey] == h { continue }
                 if let env = try? CryptoVault.encryptJSON(us, encKey: encKey) {
                     out.append(SyncItemPayload(scope: "userscripts", itemId: itemId, iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: us.updatedAt > 0 ? us.updatedAt : nowMs))
+                    if let h { updatedHashes[hashKey] = h }
+                }
+            }
+        }
+        if targetScopes.contains("plugins") && scopes.plugins {
+            for pl in sidebarPlugins {
+                if pl.html.utf8.count > 1_500_000 { continue }
+                let itemId = "plugin:\(pl.id)"
+                let hashKey = "plugins|\(itemId)"
+                let h = contentHash(pl)
+                if let h, lastPushedHashes[hashKey] == h { continue }
+                if let env = try? CryptoVault.encryptJSON(pl, encKey: encKey) {
+                    out.append(SyncItemPayload(scope: "plugins", itemId: itemId, iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: pl.updatedAt > 0 ? pl.updatedAt : nowMs))
                     if let h { updatedHashes[hashKey] = h }
                 }
             }
@@ -1274,6 +1335,71 @@ final class SyncEngine: ObservableObject {
         notifyScopeDirty("userscripts")
     }
 
+    func saveSidebarPluginHtml(_ html: String) throws {
+        let parsed = try SidebarPluginMetaParser.parseHTML(html)
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        if let idx = sidebarPlugins.firstIndex(where: { $0.id == parsed.manifest.id || $0.manifest.id == parsed.manifest.id }) {
+            var existing = sidebarPlugins[idx]
+            existing.manifest = parsed.manifest
+            existing.manifest.id = existing.id
+            existing.html = parsed.html
+            existing.updatedAt = nowMs
+            sidebarPlugins[idx] = existing
+        } else {
+            let item = SidebarPluginItem(
+                id: parsed.manifest.id,
+                enabled: true,
+                disabledProfileIds: nil,
+                manifest: parsed.manifest,
+                html: parsed.html,
+                sourceType: "paste",
+                sourceName: nil,
+                createdAt: nowMs,
+                updatedAt: nowMs
+            )
+            sidebarPlugins.insert(item, at: 0)
+        }
+        onSidebarPluginsChanged?()
+        saveLocalCache()
+        notifyScopeDirty("plugins")
+    }
+
+    func toggleSidebarPlugin(id: String) {
+        guard let idx = sidebarPlugins.firstIndex(where: { $0.id == id }) else { return }
+        sidebarPlugins[idx].enabled.toggle()
+        sidebarPlugins[idx].updatedAt = Date().timeIntervalSince1970 * 1000
+        onSidebarPluginsChanged?()
+        saveLocalCache()
+        notifyScopeDirty("plugins")
+    }
+
+    func toggleSidebarPluginForProfile(id: String, profileId: String) {
+        guard let idx = sidebarPlugins.firstIndex(where: { $0.id == id }) else { return }
+        var set = Set(sidebarPlugins[idx].disabledProfileIds ?? [])
+        if set.contains(profileId) {
+            set.remove(profileId)
+        } else {
+            set.insert(profileId)
+        }
+        sidebarPlugins[idx].disabledProfileIds = set.isEmpty ? nil : Array(set)
+        sidebarPlugins[idx].updatedAt = Date().timeIntervalSince1970 * 1000
+        onSidebarPluginsChanged?()
+        saveLocalCache()
+        notifyScopeDirty("plugins")
+    }
+
+    func deleteSidebarPlugin(id: String) {
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        sidebarPlugins.removeAll { $0.id == id }
+        SidebarPluginStorageStore.shared.clearPlugin(id)
+        let syncId = "plugin:\(id)"
+        pendingTombstones.removeAll { $0.scope == "plugins" && $0.itemId == syncId }
+        pendingTombstones.append(SyncTombstone(scope: "plugins", itemId: syncId, updatedAt: nowMs))
+        onSidebarPluginsChanged?()
+        saveLocalCache()
+        notifyScopeDirty("plugins")
+    }
+
     func recordClearedHistory() {
         let nowMs = Date().timeIntervalSince1970 * 1000
         let previous = history
@@ -1309,6 +1435,7 @@ final class SyncEngine: ObservableObject {
             homeConfig: homeConfig,
             profiles: profiles,
             userscripts: userscripts,
+            sidebarPlugins: sidebarPlugins,
             pendingTombstones: pendingTombstones,
             lastPushedHashes: lastPushedHashes
         )
@@ -1331,6 +1458,7 @@ final class SyncEngine: ObservableObject {
             self.profiles = snap.profiles
         }
         self.userscripts = snap.userscripts ?? []
+        self.sidebarPlugins = snap.sidebarPlugins ?? []
         self.pendingTombstones = snap.pendingTombstones ?? []
         self.lastPushedHashes = snap.lastPushedHashes ?? [:]
     }

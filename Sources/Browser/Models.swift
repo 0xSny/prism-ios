@@ -159,6 +159,7 @@ struct SyncScopeToggles: Codable, Equatable, Sendable {
     var profiles: Bool = true
     var settings: Bool = true
     var userscripts: Bool = true
+    var plugins: Bool = true
 
     init(
         passwords: Bool = true,
@@ -167,7 +168,8 @@ struct SyncScopeToggles: Codable, Equatable, Sendable {
         history: Bool = true,
         profiles: Bool = true,
         settings: Bool = true,
-        userscripts: Bool = true
+        userscripts: Bool = true,
+        plugins: Bool = true
     ) {
         self.passwords = passwords
         self.bookmarks = bookmarks
@@ -176,6 +178,7 @@ struct SyncScopeToggles: Codable, Equatable, Sendable {
         self.profiles = profiles
         self.settings = settings
         self.userscripts = userscripts
+        self.plugins = plugins
     }
 
     init(from decoder: Decoder) throws {
@@ -187,6 +190,7 @@ struct SyncScopeToggles: Codable, Equatable, Sendable {
         self.profiles = try c.decodeIfPresent(Bool.self, forKey: .profiles) ?? true
         self.settings = try c.decodeIfPresent(Bool.self, forKey: .settings) ?? true
         self.userscripts = try c.decodeIfPresent(Bool.self, forKey: .userscripts) ?? true
+        self.plugins = try c.decodeIfPresent(Bool.self, forKey: .plugins) ?? true
     }
 }
 
@@ -218,6 +222,31 @@ struct UserscriptItem: Identifiable, Codable, Equatable, Sendable {
     var sourceUrl: String?
     var code: String
     var meta: UserscriptMeta
+    var createdAt: Double
+    var updatedAt: Double
+}
+
+struct SidebarPluginManifest: Codable, Equatable, Sendable {
+    var id: String
+    var name: String
+    var version: String
+    var description: String
+    var author: String?
+    var icon: String?
+    var permissions: [String]
+    var platforms: [String]?
+    var hostPermissions: [String]?
+    var contextMenus: [String]?
+}
+
+struct SidebarPluginItem: Identifiable, Codable, Equatable, Sendable {
+    var id: String
+    var enabled: Bool
+    var disabledProfileIds: [String]?
+    var manifest: SidebarPluginManifest
+    var html: String
+    var sourceType: String
+    var sourceName: String?
     var createdAt: Double
     var updatedAt: Double
 }

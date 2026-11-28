@@ -13,8 +13,8 @@ jobs:
   build-ios:
     runs-on: macos-15-intel
     env:
-      APP_VERSION: "1.1.6"
-      BUILD_NUMBER: "1106"
+      APP_VERSION: "1.1.7"
+      BUILD_NUMBER: "1107"
       BUNDLE_ID: "com.zzaoo.prism.mobile"
     steps:
       - name: Checkout repository
@@ -86,7 +86,7 @@ jobs:
                     "size": ${IPA_SIZE},
                     "minOSVersion": "17.0",
                     "downloadURL": "https://prism.zzaoo.com/releases/Prism-${APP_VERSION}.ipa",
-                    "localizedDescription": "v${APP_VERSION}：新增 PC ⇄ iOS 通用油猴/扩展脚本引擎（GM_info.prism、@prism-platform、WKContentWorld 隔离与 GM_* 桥接）、userscripts 零知识加密云同步与移动端脚本管理面板。"
+                    "localizedDescription": "v${APP_VERSION}：升级 Prism 自有插件标准 (Spec v2.1)，支持 .prism.html 原生面板、PC ⇄ iOS 加密云同步、无损传图与内置 UI Kit，并保留油猴脚本兼容。"
                   }
                 ]
               }
