@@ -104,6 +104,7 @@ final class BrowserTab: ObservableObject, Identifiable {
             wv.navigationDelegate = nil
             wv.uiDelegate = nil
             wv.configuration.userContentController.removeAllScriptMessageHandlers()
+            wv.configuration.userContentController.removeAllScriptMessageHandlers(from: .defaultClient)
             wv.removeFromSuperview()
         }
         webView = nil
@@ -641,6 +642,19 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         }
     }
 
+    func reapplyUserscriptsToAllTabs() {
+        let profiles = syncEngine?.profiles ?? [.defaultProfile]
+        for tab in tabs {
+            guard let webView = tab.webView else { continue }
+            let profile = profiles.first(where: { $0.id == tab.profileId }) ?? .defaultProfile
+            configureUserScripts(
+                on: webView.configuration.userContentController,
+                profile: profile,
+                initialURL: URL(string: tab.urlString)
+            )
+        }
+    }
+
     func applyRemotePortableSettings(_ remote: PortableSettings) {
         if let theme = remote.theme, appTheme != theme {
             isApplyingRemoteSettings = true
@@ -754,6 +768,7 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         let bridgeHandler = WeakScriptMessageHandler(self)
         ucc.add(bridgeHandler, name: "prismBridge")
         ucc.add(bridgeHandler, name: "prismTopColor")
+        ucc.add(bridgeHandler, contentWorld: .defaultClient, name: "prismGmBridge")
         configureUserScripts(on: ucc, profile: profile, initialURL: URL(string: tab.urlString))
         AdBlockManager.shared.apply(to: ucc, enabled: adblockEnabled && profile.fingerprint.blockTrackers)
 
@@ -855,6 +870,14 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         let endScript = WebDarkModeScripts.documentEndSource()
         ucc.addUserScript(WKUserScript(source: startScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         ucc.addUserScript(WKUserScript(source: endScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        let userscripts = UserscriptRuntime.shared.buildWKUserScripts(
+            scripts: syncEngine?.userscripts ?? [],
+            profileId: profile.id,
+            urlString: initialURL?.absoluteString ?? ""
+        )
+        for us in userscripts {
+            ucc.addUserScript(us)
+        }
     }
 
     func fallbackBackdropColor(for url: URL?, trait: UITraitCollection? = nil) -> UIColor {
@@ -1789,6 +1812,10 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     // MARK: - WKScriptMessageHandler
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "prismGmBridge" {
+            handleUserscriptBridgeMessage(message)
+            return
+        }
         if message.name == "prismTopColor" {
             guard let body = message.body as? [String: Any],
                   let r = body["r"] as? Double,
@@ -1887,6 +1914,103 @@ final class TabManager: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
                   !password.isEmpty else { return }
             let username = (payload["username"] as? String) ?? ""
             tab.pendingPasswordSave = (origin: trusted.origin, username: username, password: password)
+        default:
+            break
+        }
+    }
+
+    private func handleUserscriptBridgeMessage(_ message: WKScriptMessage) {
+        guard let body = message.body as? [String: Any],
+              let action = body["action"] as? String,
+              let scriptId = body["scriptId"] as? String,
+              let profileId = body["profileId"] as? String else { return }
+
+        switch action {
+        case "setValue":
+            guard let key = body["key"] as? String else { return }
+            UserscriptStorageStore.shared.setValue(profileId: profileId, scriptId: scriptId, key: key, value: body["value"])
+        case "deleteValue":
+            guard let key = body["key"] as? String else { return }
+            UserscriptStorageStore.shared.deleteValue(profileId: profileId, scriptId: scriptId, key: key)
+        case "openInTab":
+            guard let rawUrl = body["url"] as? String,
+                  let url = URL(string: rawUrl),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https" else { return }
+            let activate = (body["activate"] as? Bool) ?? true
+            createTab(url: url, profileId: profileId, activate: activate)
+        case "setClipboard":
+            if let text = body["text"] as? String {
+                UIPasteboard.general.string = text
+            }
+        case "notify":
+            let text = (body["text"] as? String) ?? ""
+            let title = (body["title"] as? String) ?? ""
+            let msg = title.isEmpty ? text : "\(title): \(text)"
+            if !msg.isEmpty { showToast(msg) }
+        case "xhr":
+            guard let reqId = body["reqId"] as? String,
+                  let rawUrl = body["url"] as? String,
+                  let url = URL(string: rawUrl),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https" else { return }
+            let method = ((body["method"] as? String) ?? "GET").uppercased()
+            let headers = (body["headers"] as? [String: String]) ?? [:]
+            let dataStr = body["data"] as? String
+            let timeoutSec = min(60.0, max(1.0, ((body["timeout"] as? Double) ?? 15000.0) / 1000.0))
+            let responseType = ((body["responseType"] as? String) ?? "text").lowercased()
+            let anonymous = (body["anonymous"] as? Bool) ?? false
+            weak var targetWebView = message.webView
+
+            var req = URLRequest(url: url, timeoutInterval: timeoutSec)
+            req.httpMethod = method
+            req.httpShouldHandleCookies = !anonymous
+            for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+            if let dataStr, method != "GET", method != "HEAD" {
+                req.httpBody = dataStr.data(using: .utf8)
+            }
+
+            Task.detached {
+                var resultPayload: [String: Any]
+                do {
+                    let (data, resp) = try await URLSession.shared.data(for: req)
+                    let http = resp as? HTTPURLResponse
+                    var rawHeaders: [String] = []
+                    http?.allHeaderFields.forEach { k, v in
+                        rawHeaders.append("\(k): \(v)")
+                    }
+                    let isBinary = (responseType == "arraybuffer" || responseType == "blob")
+                    resultPayload = [
+                        "ok": true,
+                        "status": http?.statusCode ?? 200,
+                        "statusText": HTTPURLResponse.localizedString(forStatusCode: http?.statusCode ?? 200),
+                        "finalUrl": resp.url?.absoluteString ?? rawUrl,
+                        "responseHeaders": rawHeaders.joined(separator: "\r\n"),
+                        "responseText": isBinary ? "" : (String(data: data, encoding: .utf8) ?? ""),
+                    ]
+                    if isBinary {
+                        resultPayload["base64Body"] = data.base64EncodedString()
+                    }
+                } catch {
+                    resultPayload = [
+                        "ok": false,
+                        "status": 0,
+                        "statusText": "",
+                        "finalUrl": rawUrl,
+                        "responseHeaders": "",
+                        "responseText": "",
+                        "error": error.localizedDescription,
+                    ]
+                }
+                guard let jsonData = try? JSONSerialization.data(withJSONObject: resultPayload),
+                      let jsonStr = String(data: jsonData, encoding: .utf8),
+                      let reqIdData = try? JSONSerialization.data(withJSONObject: [reqId]),
+                      let reqIdArrStr = String(data: reqIdData, encoding: .utf8) else { return }
+                let js = "window.__prismGmXhrCallback && window.__prismGmXhrCallback(\(reqIdArrStr)[0], \(jsonStr));"
+                await MainActor.run {
+                    targetWebView?.evaluateJavaScript(js, in: nil, in: .defaultClient, completionHandler: nil)
+                }
+            }
         default:
             break
         }

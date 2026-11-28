@@ -13,8 +13,8 @@ jobs:
   build-ios:
     runs-on: macos-15-intel
     env:
-      APP_VERSION: "1.1.5"
-      BUILD_NUMBER: "1105"
+      APP_VERSION: "1.1.6"
+      BUILD_NUMBER: "1106"
       BUNDLE_ID: "com.zzaoo.prism.mobile"
     steps:
       - name: Checkout repository
@@ -86,7 +86,7 @@ jobs:
                     "size": ${IPA_SIZE},
                     "minOSVersion": "17.0",
                     "downloadURL": "https://prism.zzaoo.com/releases/Prism-${APP_VERSION}.ipa",
-                    "localizedDescription": "v${APP_VERSION}：支持长按底部标签数直开空白新标签、重构地址栏/桌面续播横滑与误触隔离、移除多余分享入口、升级 Crockford Base32 恢复密钥防误清云端、完善历史墓碑与带鉴权代理支持。"
+                    "localizedDescription": "v${APP_VERSION}：新增 PC ⇄ iOS 通用油猴/扩展脚本引擎（GM_info.prism、@prism-platform、WKContentWorld 隔离与 GM_* 桥接）、userscripts 零知识加密云同步与移动端脚本管理面板。"
                   }
                 ]
               }
@@ -112,6 +112,7 @@ jobs:
           name: Prism v${{ env.APP_VERSION }} (Unsigned IPA)
           body: |
             Prism v${{ env.APP_VERSION }} 无签名原生 `.ipa` 与 AltStore / ESign / OmniSign / Feather 软件源。
+            - 新增：PC ⇄ iOS 通用油猴/扩展脚本引擎（`GM_info.prism`、`@prism-platform`、`WKContentWorld` 隔离、`GM_getValue`/`GM_setValue`/`GM_addStyle`/`GM_xmlhttpRequest` 桥接）、`userscripts` 零知识加密云同步与移动端脚本管理面板。
             - 模块一：液态玻璃底部倒序悬浮 Omnibox（实景渐晕背景、SERP 去重、Safari 反向加粗联想、零点击剪贴板隐私检测）。
             - 模块二~四：0ms 防闪白网页深色自愈引擎、动态底栏 `contentInset.bottom` 避让、视频接力精确秒数定位、按需音频会话与锁屏控制、分片 POST 并发翻译、原生弹窗与离线错误页、桌面视图切换。
             - 模块五~六：书签与历史管理面板、密码库 CRUD（滑动删除/新增/复制）、零知识加密 Tombstone 墓碑同步与弹窗切换时序修复。

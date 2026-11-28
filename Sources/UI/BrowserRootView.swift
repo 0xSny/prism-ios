@@ -34,7 +34,7 @@ struct BrowserRootView: View {
     @State private var topToastDismissTask: Task<Void, Never>?
 
     enum ActiveSheet: Identifiable {
-        case menu, account, profiles, vault, sniffer, devtools, reader, downloads, bookmarksHistory
+        case menu, account, profiles, vault, sniffer, devtools, reader, downloads, bookmarksHistory, userscripts
         var id: Self { self }
     }
 
@@ -389,6 +389,8 @@ struct BrowserRootView: View {
                 DownloadsSheetView(tabManager: tabManager)
             case .bookmarksHistory:
                 BookmarksHistorySheetView(syncEngine: syncEngine, tabManager: tabManager)
+            case .userscripts:
+                UserscriptsSheetView(syncEngine: syncEngine, tabManager: tabManager)
             }
         }
         .preferredColorScheme(

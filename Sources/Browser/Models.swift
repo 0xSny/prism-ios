@@ -158,6 +158,68 @@ struct SyncScopeToggles: Codable, Equatable, Sendable {
     var history: Bool = true
     var profiles: Bool = true
     var settings: Bool = true
+    var userscripts: Bool = true
+
+    init(
+        passwords: Bool = true,
+        bookmarks: Bool = true,
+        home_shortcuts: Bool = true,
+        history: Bool = true,
+        profiles: Bool = true,
+        settings: Bool = true,
+        userscripts: Bool = true
+    ) {
+        self.passwords = passwords
+        self.bookmarks = bookmarks
+        self.home_shortcuts = home_shortcuts
+        self.history = history
+        self.profiles = profiles
+        self.settings = settings
+        self.userscripts = userscripts
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.passwords = try c.decodeIfPresent(Bool.self, forKey: .passwords) ?? true
+        self.bookmarks = try c.decodeIfPresent(Bool.self, forKey: .bookmarks) ?? true
+        self.home_shortcuts = try c.decodeIfPresent(Bool.self, forKey: .home_shortcuts) ?? true
+        self.history = try c.decodeIfPresent(Bool.self, forKey: .history) ?? true
+        self.profiles = try c.decodeIfPresent(Bool.self, forKey: .profiles) ?? true
+        self.settings = try c.decodeIfPresent(Bool.self, forKey: .settings) ?? true
+        self.userscripts = try c.decodeIfPresent(Bool.self, forKey: .userscripts) ?? true
+    }
+}
+
+struct UserscriptMeta: Codable, Equatable, Sendable {
+    var name: String
+    var namespace: String?
+    var version: String
+    var description: String
+    var author: String?
+    var icon: String?
+    var matches: [String]
+    var includes: [String]
+    var excludes: [String]
+    var grants: [String]
+    var requires: [String]
+    var resources: [String: String]
+    var runAt: String // "document-start" | "document-body" | "document-end" | "document-idle"
+    var noFrames: Bool
+    var platforms: [String]? // ["desktop", "ios"]
+    var downloadURL: String?
+    var updateURL: String?
+    var homepageURL: String?
+}
+
+struct UserscriptItem: Identifiable, Codable, Equatable, Sendable {
+    var id: String
+    var enabled: Bool
+    var disabledProfileIds: [String]?
+    var sourceUrl: String?
+    var code: String
+    var meta: UserscriptMeta
+    var createdAt: Double
+    var updatedAt: Double
 }
 
 struct PortableSettings: Codable, Equatable, Sendable {

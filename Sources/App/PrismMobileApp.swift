@@ -64,6 +64,9 @@ final class PrismAppStateContainer {
         syncEngine.onRemotePortableSettings = { [weak tabManager] remote in
             tabManager?.applyRemotePortableSettings(remote)
         }
+        syncEngine.onUserscriptsChanged = { [weak tabManager] in
+            tabManager?.reapplyUserscriptsToAllTabs()
+        }
         Task {
             await AdBlockManager.shared.prepareRules()
             tabManager.applyAdblockToAllTabs()

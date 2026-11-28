@@ -149,6 +149,15 @@ struct MenuSheetView: View {
                     }
 
                     Button {
+                        onOpenSubSheet(.userscripts)
+                    } label: {
+                        Label(
+                            L10n.t("插件与油猴脚本 (\(syncEngine.userscripts.count))", "Plugins & Userscripts (\(syncEngine.userscripts.count))"),
+                            systemImage: "puzzlepiece.extension"
+                        )
+                    }
+
+                    Button {
                         onOpenSubSheet(.account)
                     } label: {
                         Label(
@@ -1408,5 +1417,141 @@ struct BookmarksHistorySheetView: View {
         let fmt = RelativeDateTimeFormatter()
         fmt.unitsStyle = .short
         return fmt.localizedString(for: dt, relativeTo: Date())
+    }
+}
+
+struct UserscriptsSheetView: View {
+    @ObservedObject var syncEngine: SyncEngine
+    @ObservedObject var tabManager: TabManager
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var showingEditor = false
+    @State private var draftCode = """
+// ==UserScript==
+// @name         Prism Mobile & PC Helper
+// @namespace    https://prism.zzaoo.com/scripts/custom
+// @version      1.0.0
+// @match        https://*/*
+// @grant        GM_addStyle
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
+(function () {
+  'use strict';
+})();
+"""
+
+    private var activeProfileId: String {
+        tabManager.activeTab?.profileId ?? "default"
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Label(
+                        L10n.t(
+                            "油猴脚本与桌面端 Prism 通过零知识加密双向同步，支持按隔离环境独立开关。",
+                            "Userscripts sync end-to-end encrypted with Prism Desktop and support per-profile toggles."
+                        ),
+                        systemImage: "arrow.triangle.2.circlepath.circle"
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                }
+
+                if syncEngine.userscripts.isEmpty {
+                    Section {
+                        Text(L10n.t("暂无脚本，点击右上角 + 新建或等待电脑端同步。", "No scripts yet. Tap + or sync from Desktop."))
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Section(L10n.t("已安装脚本 (\(syncEngine.userscripts.count))", "Installed (\(syncEngine.userscripts.count))")) {
+                        ForEach(syncEngine.userscripts) { item in
+                            let profileDisabled = item.disabledProfileIds?.contains(activeProfileId) == true
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(item.meta.name)
+                                            .font(.headline)
+                                        Text("v\(item.meta.version) · \(item.meta.matches.first ?? "*")")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Toggle("", isOn: Binding(
+                                        get: { item.enabled },
+                                        set: { _ in syncEngine.toggleUserscript(id: item.id) }
+                                    ))
+                                    .labelsHidden()
+                                }
+                                HStack(spacing: 12) {
+                                    Button {
+                                        syncEngine.toggleUserscriptForProfile(id: item.id, profileId: activeProfileId)
+                                    } label: {
+                                        Text(profileDisabled
+                                            ? L10n.t("当前环境已停用", "Muted in profile")
+                                            : L10n.t("当前环境启用中", "Active in profile"))
+                                            .font(.caption2)
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 3)
+                                            .background(profileDisabled ? Color.secondary.opacity(0.15) : Color.indigo.opacity(0.15))
+                                            .clipShape(Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    Spacer()
+
+                                    Button(role: .destructive) {
+                                        syncEngine.deleteUserscript(id: item.id)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                            .font(.caption)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+            }
+            .navigationTitle(L10n.t("插件与油猴脚本", "Plugins & Userscripts"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(L10n.t("完成", "Done")) { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showingEditor = true
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                }
+            }
+            .sheet(isPresented: $showingEditor) {
+                NavigationStack {
+                    TextEditor(text: $draftCode)
+                        .font(.system(.caption, design: .monospaced))
+                        .padding(12)
+                        .navigationTitle(L10n.t("新建油猴脚本", "New Userscript"))
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button(L10n.t("取消", "Cancel")) { showingEditor = false }
+                            }
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button(L10n.t("保存", "Save")) {
+                                    syncEngine.saveUserscript(code: draftCode)
+                                    showingEditor = false
+                                }
+                            }
+                        }
+                }
+            }
+        }
     }
 }

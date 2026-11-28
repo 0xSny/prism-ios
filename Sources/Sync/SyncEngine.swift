@@ -26,6 +26,7 @@ private struct SyncDiskSnapshot: Codable, Sendable {
     var history: [HistoryItem]
     var homeConfig: HomeConfig
     var profiles: [BrowserProfile]
+    var userscripts: [UserscriptItem]?
     var pendingTombstones: [SyncTombstone]?
     var lastPushedHashes: [String: String]?
 }
@@ -40,6 +41,8 @@ private struct DecryptedPullBatch: Sendable {
     var upsertedProfiles: [BrowserProfile] = []
     var deletedHistoryItems: [(itemId: String, updatedAt: Double)] = []
     var upsertedHistory: [HistoryItem] = []
+    var deletedUserscriptRawIds: [String] = []
+    var upsertedUserscripts: [UserscriptItem] = []
     var remotePortableSettings: PortableSettings? = nil
     var syncedHashes: [String: String] = [:]
 }
@@ -72,6 +75,7 @@ final class SyncEngine: ObservableObject {
     @Published var history: [HistoryItem] = []
     @Published var homeConfig: HomeConfig = HomeConfig()
     @Published var profiles: [BrowserProfile] = [.defaultProfile]
+    @Published var userscripts: [UserscriptItem] = []
     @Published var scopes: SyncScopeToggles = SyncScopeToggles()
 
     private var token: String?
@@ -89,6 +93,7 @@ final class SyncEngine: ObservableObject {
     private let cacheDir: URL
     private let cacheWriter = LocalCacheWriter()
     var onRemotePortableSettings: ((PortableSettings) -> Void)?
+    var onUserscriptsChanged: (() -> Void)?
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -618,6 +623,7 @@ final class SyncEngine: ObservableObject {
             let snapPasswords = self.passwords
             let snapHistory = self.history
             let snapProfiles = self.profiles
+            let snapUserscripts = self.userscripts
             let snapHomeConfig = self.homeConfig
             let snapTombstones = self.pendingTombstones
             let snapHashes = self.lastPushedHashes
@@ -634,6 +640,7 @@ final class SyncEngine: ObservableObject {
                     passwords: snapPasswords,
                     history: snapHistory,
                     profiles: snapProfiles,
+                    userscripts: snapUserscripts,
                     homeConfig: snapHomeConfig,
                     pendingTombstones: snapTombstones,
                     portableSettings: snapPortable,
@@ -718,6 +725,7 @@ final class SyncEngine: ObservableObject {
         for bm in bookmarks { keep.insert("bookmarks|\(Self.bookmarkSyncIdStatic(bm))") }
         for pw in passwords { keep.insert("passwords|password:\(pw.id)") }
         for prof in profiles { keep.insert("profiles|profile:\(prof.id)") }
+        for us in userscripts { keep.insert("userscripts|userscript:\(us.id)") }
         for h in history.prefix(500) { keep.insert("history|\(Self.historySyncIdStatic(url: h.url))") }
         lastPushedHashes = lastPushedHashes.filter { keep.contains($0.key) }
     }
@@ -822,6 +830,20 @@ final class SyncEngine: ObservableObject {
                         batch.syncedHashes["settings|settings:portable"] = h
                     }
                 }
+            case "userscripts" where scopes.userscripts:
+                let rawId = item.itemId.hasPrefix("userscript:")
+                    ? String(item.itemId.dropFirst("userscript:".count))
+                    : item.itemId
+                if item.deleted {
+                    batch.deletedUserscriptRawIds.append(rawId)
+                } else if let script = try? CryptoVault.decryptJSON(UserscriptItem.self, encKey: encKey, ivB64: item.iv, ciphertextB64: item.ciphertext, tagB64: item.tag) {
+                    var normalized = script
+                    normalized.meta = UserscriptMetaParser.parseHeader(script.code)
+                    batch.upsertedUserscripts.append(normalized)
+                    if let h = contentHash(normalized) {
+                        batch.syncedHashes["userscripts|userscript:\(normalized.id)"] = h
+                    }
+                }
             default:
                 break
             }
@@ -912,6 +934,23 @@ final class SyncEngine: ObservableObject {
             lastPushedHashes[k] = v
         }
 
+        var usMap = Dictionary(uniqueKeysWithValues: userscripts.map { ($0.id, $0) })
+        var usChanged = false
+        for rawId in batch.deletedUserscriptRawIds {
+            if usMap.removeValue(forKey: rawId) != nil {
+                usChanged = true
+                UserscriptStorageStore.shared.clearScript(rawId)
+            }
+            lastPushedHashes.removeValue(forKey: "userscripts|userscript:\(rawId)")
+        }
+        for us in batch.upsertedUserscripts {
+            let existingTs = usMap[us.id]?.updatedAt ?? 0
+            if us.updatedAt > existingTs {
+                usMap[us.id] = us
+                usChanged = true
+            }
+        }
+
         if bmChanged {
             bookmarks = bmMap.values.sorted { ($0.order ?? 0, $0.createdAt) < ($1.order ?? 0, $1.createdAt) }
         }
@@ -923,6 +962,10 @@ final class SyncEngine: ObservableObject {
         }
         if profChanged {
             profiles = profMap.values.sorted { $0.createdAt < $1.createdAt }
+        }
+        if usChanged {
+            userscripts = usMap.values.sorted { $0.updatedAt > $1.updatedAt }
+            onUserscriptsChanged?()
         }
     }
 
@@ -936,6 +979,7 @@ final class SyncEngine: ObservableObject {
         passwords: [PasswordEntry],
         history: [HistoryItem],
         profiles: [BrowserProfile],
+        userscripts: [UserscriptItem],
         homeConfig: HomeConfig,
         pendingTombstones: [SyncTombstone],
         portableSettings: PortableSettings,
@@ -1029,6 +1073,7 @@ final class SyncEngine: ObservableObject {
                     case "passwords": return scopes.passwords
                     case "profiles": return scopes.profiles
                     case "history": return scopes.history
+                    case "userscripts": return scopes.userscripts
                     default: return true
                     }
                 }()
@@ -1063,6 +1108,18 @@ final class SyncEngine: ObservableObject {
                let env = try? CryptoVault.encryptJSON(SettingsPayload(settings: portableSettings, updatedAt: nowMs), encKey: encKey) {
                 out.append(SyncItemPayload(scope: "settings", itemId: "settings:portable", iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: nowMs))
                 if let h { updatedHashes[hashKey] = h }
+            }
+        }
+        if targetScopes.contains("userscripts") && scopes.userscripts {
+            for us in userscripts {
+                let itemId = "userscript:\(us.id)"
+                let hashKey = "userscripts|\(itemId)"
+                let h = contentHash(us)
+                if let h, lastPushedHashes[hashKey] == h { continue }
+                if let env = try? CryptoVault.encryptJSON(us, encKey: encKey) {
+                    out.append(SyncItemPayload(scope: "userscripts", itemId: itemId, iv: env.iv, ciphertext: env.ciphertext, tag: env.tag, deleted: false, updatedAt: us.updatedAt > 0 ? us.updatedAt : nowMs))
+                    if let h { updatedHashes[hashKey] = h }
+                }
             }
         }
 
@@ -1150,6 +1207,73 @@ final class SyncEngine: ObservableObject {
         notifyScopeDirty("history")
     }
 
+    func saveUserscript(code: String, id: String? = nil, sourceUrl: String? = nil) {
+        let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let meta = UserscriptMetaParser.parseHeader(code)
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        if let idx = userscripts.firstIndex(where: { $0.id == id || ($0.meta.name == meta.name && ($0.meta.namespace ?? "") == (meta.namespace ?? "")) }) {
+            var existing = userscripts[idx]
+            existing.code = code
+            existing.meta = meta
+            if let sourceUrl, !sourceUrl.isEmpty { existing.sourceUrl = sourceUrl }
+            existing.updatedAt = nowMs
+            userscripts[idx] = existing
+        } else {
+            let newId = id ?? "us-\(String(UUID().uuidString.prefix(8)).lowercased())"
+            let item = UserscriptItem(
+                id: newId,
+                enabled: true,
+                disabledProfileIds: nil,
+                sourceUrl: sourceUrl,
+                code: code,
+                meta: meta,
+                createdAt: nowMs,
+                updatedAt: nowMs
+            )
+            userscripts.insert(item, at: 0)
+        }
+        onUserscriptsChanged?()
+        saveLocalCache()
+        notifyScopeDirty("userscripts")
+    }
+
+    func toggleUserscript(id: String) {
+        guard let idx = userscripts.firstIndex(where: { $0.id == id }) else { return }
+        userscripts[idx].enabled.toggle()
+        userscripts[idx].updatedAt = Date().timeIntervalSince1970 * 1000
+        onUserscriptsChanged?()
+        saveLocalCache()
+        notifyScopeDirty("userscripts")
+    }
+
+    func toggleUserscriptForProfile(id: String, profileId: String) {
+        guard let idx = userscripts.firstIndex(where: { $0.id == id }) else { return }
+        var disabled = Set(userscripts[idx].disabledProfileIds ?? [])
+        if disabled.contains(profileId) {
+            disabled.remove(profileId)
+        } else {
+            disabled.insert(profileId)
+        }
+        userscripts[idx].disabledProfileIds = disabled.isEmpty ? nil : Array(disabled)
+        userscripts[idx].updatedAt = Date().timeIntervalSince1970 * 1000
+        onUserscriptsChanged?()
+        saveLocalCache()
+        notifyScopeDirty("userscripts")
+    }
+
+    func deleteUserscript(id: String) {
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        userscripts.removeAll { $0.id == id }
+        UserscriptStorageStore.shared.clearScript(id)
+        let syncId = "userscript:\(id)"
+        pendingTombstones.removeAll { $0.scope == "userscripts" && $0.itemId == syncId }
+        pendingTombstones.append(SyncTombstone(scope: "userscripts", itemId: syncId, updatedAt: nowMs))
+        onUserscriptsChanged?()
+        saveLocalCache()
+        notifyScopeDirty("userscripts")
+    }
+
     func recordClearedHistory() {
         let nowMs = Date().timeIntervalSince1970 * 1000
         let previous = history
@@ -1184,6 +1308,7 @@ final class SyncEngine: ObservableObject {
             history: Array(history.prefix(500)),
             homeConfig: homeConfig,
             profiles: profiles,
+            userscripts: userscripts,
             pendingTombstones: pendingTombstones,
             lastPushedHashes: lastPushedHashes
         )
@@ -1205,6 +1330,7 @@ final class SyncEngine: ObservableObject {
         if !snap.profiles.isEmpty {
             self.profiles = snap.profiles
         }
+        self.userscripts = snap.userscripts ?? []
         self.pendingTombstones = snap.pendingTombstones ?? []
         self.lastPushedHashes = snap.lastPushedHashes ?? [:]
     }
